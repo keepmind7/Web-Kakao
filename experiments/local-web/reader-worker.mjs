@@ -32,7 +32,7 @@ process.on('message',async message=>{
       const sdk=await import('../../local-only/spikes/modern/src/kakao/forge-protocol.ts');
       const guard=Client=>guardReaderClient(Client,diagnostic);
       const Booking=guard(sdk.BookingClient),Ticket=guard(sdk.TicketClient),Carriage=guard(sdk.CarriageClient);
-      session=createReaderSession(credential,{booking:()=>new Booking(),ticket:()=>new Ticket(),carriage:()=>new Carriage(),toLong:sdk.toLong},event=>{
+      session=createReaderSession(credential,{booking:()=>new Booking(),ticket:()=>new Ticket(),carriage:()=>new Carriage(),toLong:sdk.toLong,gapProbe:message.gapProbe===true,observeHistory:details=>diagnostic.note('history-page',details)},event=>{
         send(event);
       });
       await session.start();clearTimeout(operationTimer);operationBusy=false;

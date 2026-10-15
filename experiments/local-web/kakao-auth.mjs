@@ -78,6 +78,8 @@ export function createAuthLab({ transport, encodeQr, mode = 'live', now = Date.n
   const logicalDeviceUUID = createHash('sha256').update(`dkljleskljfeisflssljeif ${randomUUID()}-${now()}`).digest('hex');
   let abort = new AbortController();
   const counts = { allowlist: 0, generate: 0, poll: 0 };
+  const authEvents=[];
+  let qrIssuedAt=null;
   const forget = () => { credentials = null; deviceUUID = null; qrId = null; delete view.grid; delete view.passcode; delete view.expiresAt;
     if (view.roomProbe?.phase === 'running') view.roomProbe = {phase:'failed',stage:'cancelled',connectionVerified:false}; };
   const stopTimer = () => { if (timer !== null) clear(timer); if (deadlineTimer !== null) clear(deadlineTimer); timer = null; deadlineTimer = null; };
@@ -94,7 +96,15 @@ export function createAuthLab({ transport, encodeQr, mode = 'live', now = Date.n
     }
     return true;
   }
-  async function call(stage, payload) { counts[stage]++; return transport(stage, payload, abort.signal); }
+  async function call(stage, payload) {
+    counts[stage]++;
+    const result=await transport(stage,payload,abort.signal),body=result?.body;
+    // Structural evidence only: never retain response text, QR, confirmation
+    // codes, identifiers or credentials in the diagnostics.
+    authEvents.push({attempt:attempts,operation:stage,httpStatus:Number.isInteger(result?.httpStatus)?result.httpStatus:null,status:Number.isInteger(body?.status)?body.status:null,qrAgeMs:qrIssuedAt===null?null:Math.max(0,now()-qrIssuedAt),hasPasscode:typeof body?.passcode==='string',hasAccessToken:typeof body?.accessToken==='string',nextIntervalSeconds:Number.isInteger(body?.nextRequestIntervalInSeconds)?body.nextRequestIntervalInSeconds:null});
+    if(authEvents.length>40)authEvents.shift();
+    return result;
+  }
   async function poll(run) {
     if (run !== epoch) return;
     if (now() >= view.expiresAt) { terminal('expired', 'QR 인증 시간이 만료되었습니다.'); return; }
@@ -121,7 +131,7 @@ export function createAuthLab({ transport, encodeQr, mode = 'live', now = Date.n
       // generation, before any phone scan. It is admitted only with a valid
       // server poll interval; protection/unknown codes still stop the flow.
       if (![-150, -100].includes(body.status)) {
-        terminal('blocked', `인증이 거부되었거나 지원하지 않는 응답입니다. (상태 ${body.status})`); return;
+        terminal('blocked', `지원하지 않는 인증 응답을 받아 중단했습니다. (상태 ${body.status})`); return;
       }
       const interval = body.nextRequestIntervalInSeconds;
       if (!Number.isInteger(interval) || interval < 1 || interval > 30) {
@@ -144,11 +154,12 @@ export function createAuthLab({ transport, encodeQr, mode = 'live', now = Date.n
     snapshot() {
       return { ...view, mode, profile: PROFILE, credentialInMemory: credentials !== null,
         canStart: canStart(), sessionBlocked:locked, canProbe: !locked && view.phase === 'authenticated' && credentials !== null && !probeAttempted,
-        attempts, actualChatConnected: view.roomProbe?.connectionVerified === true, actualMessageSent: false, requests: { ...counts } };
+        attempts, actualChatConnected: view.roomProbe?.connectionVerified === true, actualMessageSent: false, requests: { ...counts },authEvents:authEvents.map(event=>({...event})) };
     },
     async start() {
       if (!canStart()) return false;
       attempts++; probeAttempted = false; abort = new AbortController(); const run = ++epoch;
+      qrIssuedAt=null;
       view = { phase: 'checking', message: '등록 프로필의 서버 허용 여부를 확인하고 있습니다.', stage: 'allowlist' };
       try {
         const allow = await call('allowlist');
@@ -172,6 +183,7 @@ export function createAuthLab({ transport, encodeQr, mode = 'live', now = Date.n
         qrId = match ? match[1] : body.url;
         try { qrId = decodeURIComponent(qrId); } catch { /* upstream preserves non-URI payloads */ }
         view.qrIssued = true;
+        qrIssuedAt=now();
         view.grid = encodeQr(body.url); view.expiresAt = now() + body.remainingSeconds * 1000;
         view.phase = 'waiting'; view.message = '휴대폰 카카오톡의 QR 스캐너로 아래 코드를 스캔해 주세요.';
         deadlineTimer = later(() => { if (run === epoch) terminal('expired', 'QR 인증 시간이 만료되었습니다.'); }, body.remainingSeconds * 1000);

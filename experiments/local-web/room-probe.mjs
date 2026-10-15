@@ -3,6 +3,7 @@ import { lookup } from 'node:dns/promises';
 import { fork } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { PROFILE, checkPinnedSource } from './kakao-auth.mjs';
+import { responseStatus } from './reader-response.mjs';
 
 const METHODS = new Set(['GETCONF', 'CHECKIN', 'LOGINLIST']);
 export function allowedReadOnlyMethod(method) { return METHODS.has(method); }
@@ -50,7 +51,7 @@ export async function probeRoomCount(credential, factory, onConnected) {
   try {
     const booking = track(factory.booking()); await booking.connect(); stage = 'getconf';
     const conf = await booking.request('GETCONF', { userId: factory.toLong(credential.userId), mccmnc: '45005', os: PROFILE.os, appVer: PROFILE.appVersion });
-    if (conf.status !== 0) return {ok:false,stage,status:conf.status};
+    if (responseStatus(conf) !== 0) return {ok:false,stage,status:responseStatus(conf)};
     const ticketInfo = conf.body?.ticket ?? conf.body?.ticketInfo ?? {};
     const hosts = [...(Array.isArray(ticketInfo.lsl) ? ticketInfo.lsl : []), ...(Array.isArray(ticketInfo.lsl6) ? ticketInfo.lsl6 : [])];
     const wifi = conf.body?.wifi ?? conf.body?.connInfoForWifi ?? {};
@@ -65,11 +66,11 @@ export async function probeRoomCount(credential, factory, onConnected) {
       const address = await resolveRoute(host,port);
       const ticket = track(factory.ticket()); await ticket.connect(address,port); route = await ticket.checkin(credential.userId);
     } else { route = await booking.checkin(credential.userId); }
-    if (route.status !== 0 || !safeDestination(route.host,route.port)) return {ok:false,stage,status:route.status};
+    if (responseStatus(route) !== 0 || !safeDestination(route.host,route.port)) return {ok:false,stage,status:responseStatus(route)};
     const address = await resolveRoute(route.host,route.port);
     const carriage = track(factory.carriage()); await carriage.connect(address,route.port); stage = 'loginlist';
     const login = await carriage.loginList(credential);
-    if (login.status !== 0) return {ok:false,stage,status:login.status};
+    if (responseStatus(login) !== 0) return {ok:false,stage,status:responseStatus(login)};
     const list = ['chatDatas','chatInfos','chats','chatRooms','chatList'].map(key => login.body?.[key]).find(Array.isArray);
     if (onConnected) {
       // Persistent read-only reader owns only the carriage after login.

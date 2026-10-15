@@ -38,6 +38,18 @@ test('server denial with retry interval is terminal and never auto-retried', asy
   assert.equal(f.lab.snapshot().phase, 'blocked'); assert.equal(f.timers.length, 0); assert.equal(f.lab.snapshot().grid, undefined);
   assert.equal(await f.lab.start(), false); assert.deepEqual(f.calls, ['allowlist','generate','poll']);
 });
+test('unclassified QR status -151 stops without asserting an account ban or permitting retries',async()=>{
+  const f=fixture([ok({allowlisted:true}),qr(),ok({status:-151,nextRequestIntervalInSeconds:1})]);
+  await f.lab.start();await f.tick();
+  const state=f.lab.snapshot();assert.equal(state.phase,'blocked');assert.equal(state.apiStatus,-151);
+  assert.equal(state.message,'지원하지 않는 인증 응답을 받아 중단했습니다. (상태 -151)');
+  assert.equal(state.credentialInMemory,false);assert.equal(state.canStart,false);assert.equal(state.canProbe,false);
+  assert.equal(state.grid,undefined);assert.equal(state.passcode,undefined);assert.equal(f.timers.length,0);
+  assert.equal(await f.lab.start(),false);assert.deepEqual(f.calls,['allowlist','generate','poll']);
+  assert.deepEqual(state.authEvents.map(event=>event.operation),['allowlist','generate','poll']);
+  assert.equal(state.authEvents.at(-1).status,-151);assert.equal(state.authEvents.at(-1).qrAgeMs,0);
+  assert.equal(JSON.stringify(state.authEvents).includes('synthetic-test-only'),false);
+});
 test('success keeps credentials private; cancel destroys local auth memory', async () => {
   const f = fixture([ok({allowlisted:true}), qr(), ok({status:0,user:{userId:'246810'},accessToken:'FAKE_PRIVATE_ACCESS',refreshToken:'FAKE_PRIVATE_REFRESH'})]);
   await f.lab.start(); await f.tick();

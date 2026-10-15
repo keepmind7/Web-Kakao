@@ -59,46 +59,67 @@ export function createReaderStore(body, ownUserId, salt=randomBytes(32)) {
   if (!rows) throw new Error('room_list_missing');
   const sourceRoomCount=rows.length;
   const rooms=new Map(),byServerId=new Map(),cache=new Map(),aliases=new Map();
-  let duplicates=0,invalidMessages=0;
+  let duplicates=0,invalidMessages=0,aliasCount=0;
   const opaque=(prefix,id)=>prefix+createHmac('sha256',salt).update(id).digest('hex').slice(0,24);
   for (const row of rows.slice(0,ROOM_LIMIT)) {
     const serverRoomId=idOfRoom(row);if(!serverRoomId || byServerId.has(serverRoomId))continue;
-    const key=opaque('r_',serverRoomId),name=title(row),last=lastLog(row);
-    rooms.set(key,{key,serverRoomId,title:name || `이름 없는 대화방 ${rooms.size+1}`,titleKnown:Boolean(name),preview:text(last).slice(0,160),lastAt:timestamp(last?.sendAt ?? last?.createdAt ?? row?.updatedAt)});
+    const key=opaque('r_',serverRoomId),name=title(row),candidate=lastLog(row);
+    const attached=serverId(candidate?.chatId ?? candidate?.roomId ?? candidate?.c);
+    const last=attached && attached!==serverRoomId?null:candidate;
+    const historyEnd=[row?.ll,row?.lastLogId,row?.lastChatLogId,last?.logId,last?.msgId].map(serverId).filter(Boolean).sort((a,b)=>BigInt(a)>BigInt(b)?-1:BigInt(a)<BigInt(b)?1:0)[0] ?? null;
+    const seedId=serverId(last?.logId ?? last?.msgId);
+    const seed=seedId?{logId:seedId,chatId:serverRoomId,authorId:serverId(last?.authorId ?? last?.senderId),msg:text(last),sendAt:timestamp(last?.sendAt ?? last?.createdAt),senderName:clean(last?.senderName ?? last?.authorName,80)}:null;
+    const names=new Map();
+    if(Array.isArray(row?.i) && Array.isArray(row?.k))for(let n=0;n<Math.min(row.i.length,row.k.length,500);n++){const id=serverId(row.i[n]),name=clean(row.k[n],80);if(id && name)names.set(id,name);}
+    rooms.set(key,{key,serverRoomId,historyEnd,seed,names,title:name || `이름 없는 대화방 ${rooms.size+1}`,titleKnown:Boolean(name),preview:text(last).slice(0,160),lastAt:timestamp(last?.sendAt ?? last?.createdAt ?? row?.updatedAt)});
     byServerId.set(serverRoomId,key);
   }
-  function merge(key,logs) {
+  function merge(key,logs,requireRoomId=false) {
     const room=rooms.get(key);if(!room)return null;
     const messages=cache.get(key) ?? new Map();
     cache.delete(key);cache.set(key,messages);
-    while(cache.size>CACHE_LIMIT){const removed=cache.keys().next().value;cache.delete(removed);for(const alias of aliases.keys())if(alias.startsWith(removed+':'))aliases.delete(alias);}
+    while(cache.size>CACHE_LIMIT){const removed=cache.keys().next().value;cache.delete(removed);aliasCount-=aliases.get(removed)?.size ?? 0;aliases.delete(removed);}
+    let roomAliases=aliases.get(key);
     let acceptedCount=0,rejectedCount=0;
     for(const log of logs.slice(0,200)) {
       if(!object(log)){rejectedCount++;invalidMessages++;continue;}
       const id=serverId(log.logId ?? log.msgId ?? log.id);
       const attachedRoom=serverId(log.chatId ?? log.roomId ?? log.c);
-      if(!id || (attachedRoom && attachedRoom!==room.serverRoomId)){invalidMessages++;rejectedCount++;continue;}
+      if(!id || (requireRoomId && attachedRoom!==room.serverRoomId) || (attachedRoom && attachedRoom!==room.serverRoomId)){invalidMessages++;rejectedCount++;continue;}
       acceptedCount++;
       const sender=serverId(log.authorId ?? log.senderId ?? log.userId ?? log.writerId ?? log.sender?.userId);
       const mine=Boolean(sender && sender===ownUserId);
-      const authorKey=key+':'+sender;
-      if(sender && !aliases.has(authorKey) && aliases.size<5000)aliases.set(authorKey,`참여자 ${[...aliases.keys()].filter(value=>value.startsWith(key+':')).length+1}`);
-      const name=clean(log.senderName ?? log.authorName ?? log.nickname ?? log.sender?.nickname,80);
+      if(sender && !roomAliases?.has(sender) && aliasCount<5000){
+        if(!roomAliases){roomAliases=new Map();aliases.set(key,roomAliases);}
+        roomAliases.set(sender,`참여자 ${roomAliases.size+1}`);aliasCount++;
+      }
+      const name=clean(log.senderName ?? log.authorName ?? log.nickname ?? log.sender?.nickname,80) || room.names.get(sender);
       if(messages.has(id))duplicates++;
-      messages.set(id,{key:opaque('m_',room.serverRoomId+':'+id),text:text(log),sender:mine?'나':name || aliases.get(authorKey) || '작성자 미확인',mine,at:timestamp(log.sendAt ?? log.createdAt ?? log.created_at)});
+      messages.set(id,{key:opaque('m_',room.serverRoomId+':'+id),text:text(log),sender:mine?'나':name || roomAliases?.get(sender) || '작성자 미확인',mine,at:timestamp(log.sendAt ?? log.createdAt ?? log.created_at)});
     }
     const ordered=[...messages.keys()].sort((a,b)=>BigInt(a)<BigInt(b)?-1:BigInt(a)>BigInt(b)?1:0);
     for(const id of ordered.slice(0,Math.max(0,ordered.length-MESSAGE_LIMIT)))messages.delete(id);
-    return {messages:[...messages.entries()].sort(([a],[b])=>BigInt(a)<BigInt(b)?-1:BigInt(a)>BigInt(b)?1:0).map(([,value])=>value),acceptedCount,rejectedCount};
+    return {messages:ordered.slice(-MESSAGE_LIMIT).map(id=>messages.get(id)),acceptedCount,rejectedCount};
   }
   return {
-    rooms(){return [...rooms.values()].map(({serverRoomId,last,...view})=>view).sort((a,b)=>(b.lastAt ?? 0)-(a.lastAt ?? 0));},
+    rooms(){return [...rooms.values()].map(({serverRoomId,historyEnd,seed,names,last,...view})=>({...view,historyAvailable:Boolean(historyEnd)})).sort((a,b)=>(b.lastAt ?? 0)-(a.lastAt ?? 0));},
     has:key=>rooms.has(key),
     serverRoomId:key=>rooms.get(key)?.serverRoomId,
-    history(key,response) {
+    historyEnd:key=>rooms.get(key)?.historyEnd,
+    seedAtEnd:key=>Boolean(rooms.get(key)?.seed?.logId && rooms.get(key).seed.logId===rooms.get(key).historyEnd),
+    recent(key){const seed=rooms.get(key)?.seed;return merge(key,seed?[seed]:[]);},
+    historyCursor(key,response,{requireRoomId=false}={}){
+      const room=rooms.get(key);if(!room)return null;
+      const ids=(logArray(response) ?? []).slice(0,200).filter(log=>{
+        const attached=serverId(log?.chatId ?? log?.roomId ?? log?.c);
+        return requireRoomId?attached===room.serverRoomId:!attached || attached===room.serverRoomId;
+      }).map(log=>serverId(log?.logId ?? log?.msgId ?? log?.id)).filter(id=>id && (!room.historyEnd || BigInt(id)<=BigInt(room.historyEnd)));
+      return ids.sort((a,b)=>BigInt(a)>BigInt(b)?-1:BigInt(a)<BigInt(b)?1:0)[0] ?? null;
+    },
+    history(key,response,{requireRoomId=false}={}) {
       if(!rooms.has(key))throw new Error('unknown_room');
       const logs=logArray(response);
-      return {key,...merge(key,logs ?? []),fieldPresent:Array.isArray(logs),receivedCount:logs?.length ?? 0};
+      return {key,...merge(key,logs ?? [],requireRoomId),fieldPresent:Array.isArray(logs),receivedCount:logs?.length ?? 0};
     },
     push(body) {
       const logs=logArray(body) ?? (object(body) && serverId(body.logId) ? [body] : []);
@@ -108,6 +129,8 @@ export function createReaderStore(body, ownUserId, salt=randomBytes(32)) {
         const key=byServerId.get(serverRoomId);if(!key)continue;
         const room=rooms.get(key);const merged=merge(key,[log]);
         if(!merged?.acceptedCount)continue;
+        const logId=serverId(log.logId ?? log.msgId ?? log.id);
+        if(logId && (!room.historyEnd || BigInt(logId)>BigInt(room.historyEnd)))room.historyEnd=logId;
         const at=timestamp(log.sendAt ?? log.createdAt);
         if(at && (!room.lastAt || at>=room.lastAt)){room.lastAt=at;room.preview=text(log).slice(0,160);}
         updates.set(key,{key,messages:merged.messages});
@@ -115,6 +138,6 @@ export function createReaderStore(body, ownUserId, salt=randomBytes(32)) {
       return [...updates.values()];
     },
     stats:()=>({sourceRoomCount,roomCount:rooms.size,truncated:sourceRoomCount>ROOM_LIMIT,duplicates,invalidMessages}),
-    clear(){rooms.clear();byServerId.clear();cache.clear();aliases.clear();},
+    clear(){rooms.clear();byServerId.clear();cache.clear();aliases.clear();aliasCount=0;},
   };
 }

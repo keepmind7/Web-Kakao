@@ -1,5 +1,6 @@
 import { allowedReadOnlyMethod, probeRoomCount } from './room-probe.mjs';
 import { checkPinnedSource } from './kakao-auth.mjs';
+import { normalizedResponse } from './reader-response.mjs';
 
 process.env.KAKAO_DEBUG_LOCO = '0';
 if (process.argv.includes('--self-check')) {
@@ -27,9 +28,9 @@ process.on('message', async message => {
     checkPinnedSource({workingCopy:true});
     const sdk = await import('../../local-only/spikes/modern/src/kakao/forge-protocol.ts');
     const guard = Client => class extends Client {
-      request(method,...args) {
+      async request(method,...args) {
         if (!allowedReadOnlyMethod(method)) return Promise.reject(new Error('read_only_operation_required'));
-        return super.request(method,...args);
+        return normalizedResponse(await super.request(method,...args));
       }
     };
     const Booking = guard(sdk.BookingClient), Ticket = guard(sdk.TicketClient), Carriage = guard(sdk.CarriageClient);

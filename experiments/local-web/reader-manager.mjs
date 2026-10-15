@@ -9,7 +9,7 @@ const at=value=>Number.isFinite(value) && value>0 && value<=4102444800000?value:
 export function safeRooms(rows){
   if(!Array.isArray(rows))return [];
   const unique=new Map();
-  for(const row of rows.slice(0,ROOM_LIMIT))if(roomKeyValid(row?.key))unique.set(row.key,{key:row.key,title:text(row.title,120),titleKnown:row.titleKnown===true,preview:text(row.preview,160),lastAt:at(row.lastAt)});
+  for(const row of rows.slice(0,ROOM_LIMIT))if(roomKeyValid(row?.key))unique.set(row.key,{key:row.key,title:text(row.title,120),titleKnown:row.titleKnown===true,...(typeof row.historyAvailable==='boolean'?{historyAvailable:row.historyAvailable}:{}),preview:text(row.preview,160),lastAt:at(row.lastAt)});
   return [...unique.values()];
 }
 export function safeMessages(rows){
@@ -18,7 +18,7 @@ export function safeMessages(rows){
   for(const row of rows.slice(-MESSAGE_LIMIT))if(typeof row?.key==='string' && /^m_[a-f0-9]{24}$/.test(row.key))unique.set(row.key,{key:row.key,text:text(row.text,4000),sender:text(row.sender,80),mine:row.mine===true,at:at(row.at)});
   return [...unique.values()];
 }
-export function createReadOnlyReader({spawn=fork,now=Date.now,onBlocked=()=>{}}={}){
+export function createReadOnlyReader({spawn=fork,now=Date.now,onBlocked=()=>{},gapProbe=false}={}){
   let child=null,signal=null,abortHandler=null,deadline=null,phase='idle',stage=null,status=null,attempts=0,rooms=[],pages=new Map(),request=0,pending=null,revision=0,connectedAt=null;
   let historyRequests=0,historySuccesses=0,pushBatches=0,duplicates=0,sourceRoomCount=0,truncated=false;
   function terminate(){
@@ -57,7 +57,7 @@ export function createReadOnlyReader({spawn=fork,now=Date.now,onBlocked=()=>{}}=
         worker.on('exit',()=>{if(child===worker)fail('disconnected');});
         worker.on('message',message=>{
           if(child!==worker)return;
-          if(message?.type==='reader-ready' && !credentialSent){credentialSent=true;send({type:'reader-start',credential:{userId:credential.userId,deviceUUID:credential.deviceUUID,accessToken:credential.accessToken}});}
+          if(message?.type==='reader-ready' && !credentialSent){credentialSent=true;send({type:'reader-start',gapProbe:gapProbe===true,credential:{userId:credential.userId,deviceUUID:credential.deviceUUID,accessToken:credential.accessToken}});}
           else if(message?.type==='reader-failed')fail(['booking','getconf','checkin','loginlist','history','ping','push','transport','decode','disconnected','worker'].includes(message.stage)?message.stage:'worker',message.status);
           else if(message?.type==='reader-rooms' && ['loginlist','push'].includes(message.source)){
             rooms=safeRooms(message.rooms);sourceRoomCount=integer(message.stats?.sourceRoomCount);truncated=message.stats?.truncated===true;duplicates=integer(message.stats?.duplicates);
@@ -66,8 +66,8 @@ export function createReadOnlyReader({spawn=fork,now=Date.now,onBlocked=()=>{}}=
           }else if(message?.type==='reader-messages' && roomKeyValid(message.key) && rooms.some(row=>row.key===message.key)){
             if(message.source==='history' && (!pending || pending.requestId!==message.requestId || pending.key!==message.key))return;
             if(!['push','history'].includes(message.source))return;
-            const validHistory=message.fieldPresent===true && (message.receivedCount===0 || integer(message.acceptedCount)>0);
-            const previous=pages.get(message.key);const history=message.source==='history'?{phase:validHistory?'loaded':'unrecognized',receivedCount:integer(message.receivedCount),acceptedCount:integer(message.acceptedCount),rejectedCount:integer(message.rejectedCount),at:now()}:previous?.history ?? {phase:'idle'};
+            const validHistory=message.unavailable!==true && message.fieldPresent===true && (message.receivedCount===0 || integer(message.acceptedCount)>0);
+            const previous=pages.get(message.key);const history=message.source==='history'?{phase:message.unavailable===true?'unavailable':validHistory?'loaded':'unrecognized',hasMore:message.hasMore===true,gap:message.gap===true,receivedCount:integer(message.receivedCount),acceptedCount:integer(message.acceptedCount),rejectedCount:integer(message.rejectedCount),at:now()}:previous?.history ?? {phase:'idle'};
             pages.delete(message.key);pages.set(message.key,{key:message.key,messages:safeMessages(message.messages),history,revision:++revision});
             while(pages.size>CACHE_LIMIT)pages.delete(pages.keys().next().value);
             if(message.source==='history'){clearTimeout(deadline);deadline=null;pending=null;if(validHistory)historySuccesses++;}

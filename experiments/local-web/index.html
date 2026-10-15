@@ -1,21 +1,31 @@
 <!doctype html>
-<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>카카오톡 연결 실험</title><link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script></head>
-<body><main>
-<div class="eyebrow">WEB-KAKAO · PHASE 2</div><h1>내 카카오톡 대화</h1>
-<p class="lead">이 노트북에서 QR 인증을 시도합니다. 휴대폰 카카오톡으로 스캔하고 연결 기기를 확인해 주세요.</p>
-<div id="mode" class="badge">상태 확인 중</div>
-<p class="muted">등록 요청 프로필: Android 태블릿 · SM-T733</p>
-<section class="panel" aria-live="polite"><h2 id="title">로그인 준비</h2><p id="message">로컬 서버에 연결하고 있습니다.</p>
-<canvas id="qr" hidden aria-label="카카오톡 로그인 QR 코드"></canvas>
-<div id="passcode" hidden><p>휴대폰에서 확인할 코드</p><strong id="code"></strong></div>
-<p id="expiry" class="muted"></p><p id="diagnostic" class="muted"></p>
-<div class="actions"><button id="start" disabled>QR 로그인 시작</button><button id="cancel" class="secondary" disabled>로컬 세션 지우기</button></div>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Web Kakao · 대화</title><link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script></head>
+<body><main class="app-shell">
+<aside class="sidebar" aria-label="대화 목록">
+  <header class="sidebar-header"><div class="brand-mark" aria-hidden="true">W</div><div><h1>Web Kakao</h1><span class="muted">Phase 2 · 읽기 전용</span></div><button id="account-toggle" class="icon-button" aria-label="계정 및 연결 설정" aria-expanded="true" aria-controls="account-panel">⚙</button></header>
+  <div class="search-wrap"><label for="room-search" class="sr-only">대화방 검색</label><span aria-hidden="true">⌕</span><input id="room-search" type="search" placeholder="대화방 검색" autocomplete="off" maxlength="120"></div>
+  <div id="connection-label" class="connection-label" role="status">연결 상태 확인 중</div>
+  <div id="reader-status" class="sidebar-status" aria-live="polite"></div>
+  <nav id="reader-workspace" class="room-scroll" aria-label="대화방" hidden><div id="room-list"></div></nav>
+  <div id="sidebar-empty" class="sidebar-empty">계정을 연결하면<br>대화 목록이 여기에 표시됩니다.</div>
+  <footer class="sidebar-footer">이 노트북의 메모리에만 보관</footer>
+</aside>
+<section class="chat-pane" aria-label="선택한 대화방">
+  <header class="chat-header"><div class="avatar chat-avatar" id="chat-avatar" aria-hidden="true">W</div><div class="chat-heading"><h2 id="chat-title">대화방을 선택해 주세요</h2><p id="chat-subtitle">카카오톡 계정 연결 실험 · 읽기 전용</p></div><button id="history-load" class="secondary" disabled>메시지 조회</button></header>
+  <div id="history-note" class="history-note" role="status">대화 목록에서 방을 선택해 주세요.</div>
+  <div class="chat-scroll"><div id="message-list" class="message-list" aria-live="polite"></div><div id="welcome" class="welcome"><div class="welcome-symbol" aria-hidden="true">W</div><h2>브라우저에서 이어지는 대화</h2><p>계정을 연결하고 왼쪽에서 대화방을 선택하세요.</p><span>현재는 조회와 수신을 확인하는 단계입니다.</span></div></div>
+  <footer class="composer"><span class="composer-lock" aria-hidden="true">◌</span><p>읽기 전용 · 메시지 전송은 아직 지원하지 않습니다.</p></footer>
+  <section id="account-panel" class="account-panel" aria-label="계정 및 연결 설정">
+    <div class="account-heading"><span class="eyebrow">계정 연결</span><button id="account-close" class="icon-button" aria-label="연결 설정 닫기">×</button></div>
+    <div id="mode" class="badge">상태 확인 중</div>
+    <h2 id="title">로그인 준비</h2><p id="message">로컬 서버에 연결하고 있습니다.</p>
+    <canvas id="qr" hidden aria-label="카카오톡 로그인 QR 코드"></canvas>
+    <div id="passcode" hidden><p>휴대폰에 입력할 확인 코드</p><strong id="code"></strong></div>
+    <p id="expiry" class="muted"></p><p id="diagnostic" class="muted"></p>
+    <div class="actions"><button id="start" disabled>QR 로그인 시작</button><button id="cancel" class="secondary" disabled>로컬 세션 지우기</button></div>
+    <section id="reader-panel" hidden><div class="actions"><button id="reader-connect" disabled>대화방 불러오기</button><button id="reader-disconnect" class="secondary" disabled>연결 끊기</button></div></section>
+    <section id="room-panel" hidden><p id="room-result"></p><button id="room-check" class="secondary" disabled>읽기 전용 연결 확인</button></section>
+    <details><summary>연결 정보와 저장 범위</summary><p>등록 요청 프로필은 Android 태블릿 SM-T733입니다. 프로그램은 이 노트북에서 실행됩니다. 휴대폰 카카오톡으로 QR을 스캔하고 연결 기기를 확인해 주세요.</p><p>인증 정보와 대화는 서버·브라우저 메모리에만 보관합니다. 실험의 인증 보관 한도는 1시간이며 서버가 알려준 실제 만료 시간은 아닙니다. 로컬 세션 삭제는 원격 로그아웃을 뜻하지 않습니다.</p><p>현재 방 이름은 서버가 제공한 제목 또는 참가자 이름입니다. 모바일에서 직접 설정한 이름과 다를 수 있습니다. 휴대폰 OFF 연결·조회 유지는 2분 범위에서 확인했습니다. 전체 과거 이력, 장시간 유지와 재접속 후 누락 복구는 아직 검증하지 않았습니다.</p><p>비공식 연결 실험입니다. 서버가 등록을 거부하면 중단합니다. 사진·파일 다운로드, 발송과 읽음 전송은 지원하지 않습니다.</p></details>
+  </section>
 </section>
-<section id="reader-panel" class="panel" hidden><h2>대화방</h2><p id="reader-status" aria-live="polite">인증 후 대화방을 불러올 수 있습니다.</p><div class="actions"><button id="reader-connect" disabled>대화방 불러오기</button><button id="reader-disconnect" class="secondary" disabled>연결 끊기</button></div>
-<div id="reader-workspace" class="reader-workspace" hidden><nav class="rooms" aria-label="대화방 목록"><p class="muted">제목을 받지 못한 방은 이름 없음으로 표시합니다.</p><div id="room-list"></div></nav><section class="conversation" aria-label="선택한 대화방"><h2 id="chat-title">대화방을 선택해 주세요</h2><p id="history-note" class="muted" aria-live="polite"></p><button id="history-load" class="secondary" disabled>메시지 조회</button><div id="message-list" aria-live="polite"></div></section></div>
-<p class="muted">메시지는 이 화면의 메모리에만 표시합니다. 조회한 묶음의 전체 이력 여부와 재접속 시 누락 복구는 아직 검증하지 않았습니다. 발송·읽음 전송 기능은 없습니다.</p></section>
-<section id="room-panel" class="panel" hidden><h2>대화 서버 연결 확인</h2><p>기존 방 목록 응답의 개수만 확인하고 연결을 종료합니다. 메시지를 보내거나 내용을 저장하지 않습니다.</p><p id="room-result" aria-live="polite"></p><button id="room-check" class="secondary" disabled>읽기 전용 연결 확인</button></section>
-<p class="notice">비공식 연결 실험입니다. 계정 이용이 제한될 가능성이 있습니다. 서버에서 등록을 거부하면 중단합니다.</p>
-<p class="muted">취소·만료 후 수동 QR 재발급은 서버를 실행한 동안 최대 3회입니다. 거부·오류가 발생하면 추가 시도를 중단합니다.</p>
-<details><summary>연결 프로필과 저장 범위</summary><p>등록 요청 프로필은 Android 태블릿 SM-T733입니다. 이 프로그램은 노트북에서 실행됩니다.</p><p>인증 정보와 대화는 서버·브라우저 메모리에만 보관합니다. 실험용 인증 보관 한도는1시간이며 서버 토큰의 실제 만료 시간이 아닙니다. 로컬 세션 삭제나 서버 종료는 원격 로그아웃을 뜻하지 않습니다.</p><p>대화방과 메시지는 읽기 전용입니다. 사진·파일 다운로드와 메시지 발송은 지원하지 않습니다.</p></details>
 </main></body></html>

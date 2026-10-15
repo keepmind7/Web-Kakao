@@ -22,11 +22,11 @@ const assets = new Map([
   ['/app.js', ['app.js', 'text/javascript; charset=utf-8']],
   ['/style.css', ['style.css', 'text/css; charset=utf-8']],
 ]);
-export function createLocalServer({ transport, mode = 'mock', encode = encodeQr, probe = runRoomProbe, readerFactory = createReadOnlyReader } = {}) {
+export function createLocalServer({ transport, mode = 'mock', encode = encodeQr, probe = runRoomProbe, readerFactory = createReadOnlyReader, gapProbe=false } = {}) {
   const lab = createAuthLab({ transport: transport ?? (mode === 'live' ? createTransport() : mockTransport()), encodeQr: encode, mode, credentialRetentionMs:60*60*1000 });
-  const newReader=()=>readerFactory({onBlocked:()=>{reader.close();lab.blockConnection();}});
+  const newReader=()=>readerFactory({gapProbe,onBlocked:()=>{reader.close();lab.blockConnection();}});
   let reader=newReader();
-  const snapshot=()=>{const auth=lab.snapshot(),reading=reader.snapshot();return {build:2,...auth,actualChatConnected:auth.actualChatConnected || Number.isFinite(reading.connectedAt),chatConnectionActive:reading.phase==='connected',reader:reading,canOpenReader:mode==='live' && !auth.sessionBlocked && auth.credentialInMemory && auth.phase==='authenticated' && reading.canConnect};};
+  const snapshot=()=>{const auth=lab.snapshot(),reading=reader.snapshot();return {build:3,gapProbe:gapProbe===true,...auth,actualChatConnected:auth.actualChatConnected || Number.isFinite(reading.connectedAt),chatConnectionActive:reading.phase==='connected',reader:reading,canOpenReader:mode==='live' && !auth.sessionBlocked && auth.credentialInMemory && auth.phase==='authenticated' && reading.canConnect};};
   const cookie = randomBytes(32).toString('hex');
   const csrf = randomBytes(32).toString('hex');
   let origin;
@@ -117,7 +117,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   const index = process.argv.indexOf('--port');
   const port = index < 0 ? 8787 : Number(process.argv[index + 1]);
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error('invalid_port');
-  const app = createLocalServer({ mode });
+  const app = createLocalServer({ mode,gapProbe:process.argv.includes('--gap-probe') });
   const url = await app.listen(port);
   const folder = fileURLToPath(new URL('../../local-only/web-auth/', import.meta.url));
   mkdirSync(folder, { recursive: true });

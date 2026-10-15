@@ -68,14 +68,13 @@ test('message display is bounded and media contents are not fetched or rendered 
   assert.equal(result.messages.length,50);assert.equal(result.messages.at(-1).text,'[사진]');assert.equal(result.messages[0].text.length,4000);
   store.clear();assert.equal(store.rooms().length,0);
 });
-function factory({historyStatus=0,pingStatus=0}={}){
+function factory({historyStatus=0,pingStatus=0,bodyStatus}={}){
   const calls=[],closed=[];let heartbeat;
   const client=name=>Object.assign(new EventEmitter(),{
     async connect(){calls.push(name+':connect');},
-    async request(method){calls.push(method);return {status:method==='PING'?pingStatus:0,body:{ticket:{lsl:['ticket.kakao.com']},wifi:{ports:[443]}}};},
+    async request(method,params){calls.push(method);if(method==='SYNCMSG'){assert.deepEqual(params,{chatId:'9007199254740993',cur:'0',cnt:50,max:'12'});return {status:historyStatus,body:{...(bodyStatus===undefined?{}:{status:bodyStatus}),chatLogs:[{logId:'30',msg:'예시 조회 메시지'}]}};}return {status:method==='PING'?pingStatus:0,body:{ticket:{lsl:['ticket.kakao.com']},wifi:{ports:[443]}}};},
     async checkin(){calls.push('CHECKIN');return {status:0,host:'carriage.kakao.com',port:443};},
     async loginList(){calls.push('LOGINLIST');return {status:0,body};},
-    async syncMsg(room,cur,count){calls.push('SYNCMSG');assert.equal(room,'9007199254740993');assert.equal(cur,0);assert.equal(count,50);return {status:historyStatus,body:{chatLogs:[{logId:'30',msg:'예시 조회 메시지'}]}};},
     stopPing(){},disconnect(){closed.push(name);},
   });
   const carriage=client('carriage');
@@ -108,6 +107,86 @@ test('history rejection closes the session without inventing cached history succ
   await session.start();assert.equal(await session.history(events[0].rooms[0].key,1),false);
   assert.equal(events.at(-1).type,'reader-failed');assert.equal(events.at(-1).status,-997);session.close();
 });
+test('a successful header with body -203 never produces a history success event',async()=>{
+  const f=factory({bodyStatus:-203}),events=[],session=createReaderSession(credential,f.sdk,event=>events.push(event));
+  await session.start();assert.equal(await session.history(events[0].rooms[0].key,1),false);
+  assert.equal(events.at(-1).status,-203);assert.equal(events.some(event=>event.source==='history'),false);session.close();
+});
+test('a room without a server history bound does not send a guessed SYNCMSG request',async()=>{
+  const f=factory(),events=[],session=createReaderSession(credential,f.sdk,event=>events.push(event));
+  await session.start();assert.equal(await session.history(events[0].rooms[1].key,1),true);
+  assert.equal(events.at(-1).unavailable,true);assert.equal(events.some(event=>event.type==='reader-failed'),false);
+  assert.equal(f.calls.includes('SYNCMSG'),false);session.close();
+});
+test('history preserves the latest LOGINLIST message while advancing and resuming bounded pages',async()=>{
+  const f=factory(),events=[],positions=[],progress=[];let log=0;
+  f.sdk.observeHistory=details=>progress.push(details);
+  f.sdk.delay=async()=>{};
+  f.carriage.request=async(method,params)=>{
+    assert.equal(method,'SYNCMSG');positions.push(params.cur);
+    log++;return {status:0,body:{status:0,isOK:log>=12,chatLogs:[{logId:String(log),msg:'모의 과거 '+log}]}};
+  };
+  const session=createReaderSession(credential,f.sdk,event=>events.push(event));await session.start();const key=events[0].rooms[0].key;
+  await session.history(key,1);
+  assert.equal(positions.length,8);assert.deepEqual(positions,['0','1','2','3','4','5','6','7']);
+  assert.equal(events.at(-1).hasMore,true);assert.equal(events.at(-1).messages.at(-1).text,'예시 미리보기');
+  assert.equal(progress.length,8);assert.equal(progress[0].cursorAdvanced,true);
+  assert.equal(JSON.stringify(progress).includes('9007199254740993'),false);assert.equal(progress[0].seedAtEnd,true);
+  await session.history(key,2);assert.equal(positions[8],'8');assert.equal(positions.length,12);
+  assert.equal(events.at(-1).hasMore,false);session.close();
+});
+test('a repeated cursor terminates paging without an unbounded retry loop',async()=>{
+  const f=factory(),events=[];let count=0;f.sdk.delay=async()=>{};
+  f.carriage.request=async()=>{count++;return {status:0,body:{isOK:false,chatLogs:[{logId:'1',msg:'예시'}]}};};
+  const session=createReaderSession(credential,f.sdk,event=>events.push(event));await session.start();
+  await session.history(events[0].rooms[0].key,1);assert.equal(count,2);assert.equal(events.at(-1).hasMore,true);session.close();
+});
+test('an explicit isOK completion without chatLogs preserves earlier pages as a valid result',async()=>{
+  const f=factory(),events=[];let count=0;f.sdk.delay=async()=>{};
+  f.carriage.request=async()=>++count===1?{status:0,body:{isOK:false,chatLogs:[{logId:'1',msg:'예시 과거'}]}}:{status:0,body:{isOK:true}};
+  const session=createReaderSession(credential,f.sdk,event=>events.push(event));await session.start();
+  await session.history(events[0].rooms[0].key,1);
+  assert.equal(events.at(-1).fieldPresent,true);assert.equal(events.at(-1).receivedCount,1);
+  assert.equal(events.at(-1).hasMore,false);assert.equal(events.at(-1).gap,true);assert.equal(events.at(-1).messages.length,2);assert.equal(count,2);session.close();
+});
+test('opt-in gap probe performs one read-only MCHATLOGS with a server-derived cursor',async()=>{
+  const f=factory(),events=[],calls=[];f.sdk.delay=async()=>{};f.sdk.gapProbe=true;
+  f.carriage.request=async(method,params)=>{
+    calls.push(method);
+    if(method==='MCHATLOGS'){assert.deepEqual(params,{chatIds:['9007199254740993'],sinces:['1']});return {status:0,body:{status:0,chatLogs:[{chatId:'9007199254740993',logId:'2',msg:'중간'},{chatId:'9007199254740993',logId:'12',msg:'최근'}]}};}
+    return calls.length===1?{status:0,body:{isOK:false,chatLogs:[{logId:'1',msg:'과거'}]}}:{status:0,body:{isOK:true}};
+  };
+  const session=createReaderSession(credential,f.sdk,event=>events.push(event));await session.start();
+  await session.history(events[0].rooms[0].key,1);
+  assert.deepEqual(calls,['SYNCMSG','SYNCMSG','MCHATLOGS']);assert.equal(events.at(-1).gap,false);
+  assert.deepEqual(events.at(-1).messages.map(row=>row.text),['과거','중간','최근']);session.close();
+});
+test('a gap probe body denial stops immediately and never retries another method',async()=>{
+  const f=factory(),events=[],calls=[];f.sdk.gapProbe=true;
+  f.carriage.request=async(method)=>{calls.push(method);return method==='MCHATLOGS'?{status:0,body:{status:-203}}:{status:0,body:{isOK:true}};};
+  const session=createReaderSession(credential,f.sdk,event=>events.push(event));await session.start();
+  assert.equal(await session.history(events[0].rooms[0].key,1),false);
+  assert.deepEqual(calls,['SYNCMSG','MCHATLOGS']);assert.equal(events.at(-1).status,-203);session.close();
+});
+test('multi-room history requires an explicit matching room ID for both display and cursor',()=>{
+  const store=createReaderStore(body,credential.userId),key=store.rooms()[0].key;
+  const response={chatLogs:[{logId:'2',msg:'방 번호 없음'},{chatId:'999',logId:'3',msg:'다른 방'},{chatId:Number('9007199254740993'),logId:'4',msg:'정밀도 손실'}]};
+  const result=store.history(key,response,{requireRoomId:true});
+  assert.equal(result.acceptedCount,0);assert.equal(result.rejectedCount,3);assert.equal(result.messages.length,0);
+  assert.equal(store.historyCursor(key,response,{requireRoomId:true}),null);
+});
+test('an empty gap probe is not repeated for the same room and cursor',async()=>{
+  const f=factory(),events=[],calls=[];f.sdk.gapProbe=true;
+  f.carriage.request=async(method)=>{calls.push(method);return {status:0,body:method==='MCHATLOGS'?{chatLogs:[]}:{isOK:true}};};
+  const session=createReaderSession(credential,f.sdk,event=>events.push(event));await session.start();const key=events[0].rooms[0].key;
+  await session.history(key,1);await session.history(key,2);
+  assert.equal(calls.filter(method=>method==='MCHATLOGS').length,1);assert.equal(events.at(-1).gap,true);session.close();
+});
+test('a cross-room LOGINLIST last log cannot be relabelled as a local seed or preview',()=>{
+  const store=createReaderStore({chatDatas:[{c:'123',l:{chatId:'999',logId:'42',msg:'다른 방',sendAt:1800000000}}]},'456');
+  const room=store.rooms()[0];assert.equal(room.preview,'');assert.equal(store.historyEnd(room.key),null);
+  assert.deepEqual(store.recent(room.key).messages,[]);
+});
 function fakeWorker(){
   const sent=[];let killed=false;
   const child=Object.assign(new EventEmitter(),{send(message,callback){sent.push({message,callback});},kill(){killed=true;return true;}});
@@ -116,9 +195,10 @@ function fakeWorker(){
 function ready(worker){worker.child.emit('message',{type:'reader-ready'});worker.child.emit('message',{type:'reader-rooms',source:'loginlist',rooms:[{key:'r_'+'a'.repeat(24),title:'예시 방',preview:'예시',lastAt:null,rawToken:'FAKE_PRIVATE_TOKEN'}],stats:{sourceRoomCount:1}});}
 test('manager sends minimum credentials through private IPC and exposes summary only',()=>{
   const w=fakeWorker();let options;
-  const reader=createReadOnlyReader({spawn:(entry,args,opts)=>{options=opts;return w.child;}});
+  const reader=createReadOnlyReader({gapProbe:true,spawn:(entry,args,opts)=>{options=opts;return w.child;}});
   assert.equal(reader.connect(credential),true);ready(w);
   assert.equal(w.sent[0].message.credential.refreshToken,undefined);assert.equal(w.sent[0].message.credential.accessToken,credential.accessToken);
+  assert.equal(w.sent[0].message.gapProbe,true);
   assert.deepEqual(options.stdio,['ignore','ignore','ignore','ipc']);assert.equal(options.env.KAKAO_DEBUG_LOCO,'0');assert.equal(options.env.GITHUB_TOKEN,undefined);
   assert.equal(reader.snapshot().phase,'connected');assert.equal(JSON.stringify(reader.rooms()).includes('FAKE_PRIVATE_TOKEN'),false);assert.equal(JSON.stringify(reader.snapshot()).includes('예시 방'),false);reader.close();
 });

@@ -39,6 +39,11 @@ test('DNS results are checked and the selected literal address is used without a
   assert.equal(await resolvePublicDestination('route.kakao.com',443,async()=>[{address:'10.0.0.1'},{address:'1.2.3.4'}]),'1.2.3.4');
   assert.equal(await resolvePublicDestination('1.2.3.4',443,async()=>{throw new Error('no DNS for IP');}),'1.2.3.4');
 });
+test('count probe rejects body status errors despite a successful header',async()=>{
+  const fixture=clients({body:{status:-997,chatDatas:[]}});
+  const result=await probeRoomCount(credential,fixture.factory);
+  assert.equal(result.ok,false);assert.equal(result.status,-997);assert.equal(sanitizeProbe(result).connectionVerified,false);
+});
 
 test('a valid advertised non-443 ticket port is retained',async()=>{
   const f=clients(); let port;
