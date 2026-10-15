@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>카카오톡 연결 실험</title><link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script></head>
+<body><main>
+<div class="eyebrow">WEB-KAKAO · PHASE 1</div><h1>내 계정 연결 확인</h1>
+<p class="lead">이 노트북에서 QR 인증을 시도합니다. 휴대폰 카카오톡으로 스캔하고 연결 기기를 확인해 주세요.</p>
+<div id="mode" class="badge">상태 확인 중</div>
+<p class="muted">등록 요청 프로필: Android 태블릿 · SM-T733</p>
+<section class="panel" aria-live="polite"><h2 id="title">로그인 준비</h2><p id="message">로컬 서버에 연결하고 있습니다.</p>
+<canvas id="qr" hidden aria-label="카카오톡 로그인 QR 코드"></canvas>
+<div id="passcode" hidden><p>휴대폰에서 확인할 코드</p><strong id="code"></strong></div>
+<p id="expiry" class="muted"></p><p id="diagnostic" class="muted"></p>
+<div class="actions"><button id="start" disabled>QR 로그인 시작</button><button id="cancel" class="secondary" disabled>로컬 세션 지우기</button></div>
+</section>
+<section id="room-panel" class="panel" hidden><h2>대화 서버 연결 확인</h2><p>기존 방 목록 응답의 개수만 확인하고 연결을 종료합니다. 메시지를 보내거나 내용을 저장하지 않습니다.</p><p id="room-result" aria-live="polite"></p><button id="room-check" class="secondary" disabled>읽기 전용 연결 확인</button></section>
+<p class="notice">비공식 연결 실험입니다. 계정 이용이 제한될 가능성이 있습니다. 서버에서 등록을 거부하면 중단합니다.</p>
+<p class="muted">취소·만료 후 수동 QR 재발급은 서버를 실행한 동안 최대 3회입니다. 거부·오류가 발생하면 추가 시도를 중단합니다.</p>
+<details><summary>연결 프로필과 저장 범위</summary><p>등록 요청 프로필은 Android 태블릿 SM-T733입니다. 이 프로그램은 노트북에서 실행됩니다.</p><p>인증 정보는 이 로컬 서버의 메모리에만 보관합니다. 로컬 세션 삭제나 서버 종료는 원격 로그아웃을 뜻하지 않습니다. 승인 후에는 휴대폰의 기기 연결 관리에서도 해당 연결을 확인해 주세요.</p><p>이번 화면은 인증과 읽기 전용 연결 확인용입니다. 실제 메시지 내역 표시와 발송은 아직 연결하지 않았습니다.</p></details>
+</main></body></html>

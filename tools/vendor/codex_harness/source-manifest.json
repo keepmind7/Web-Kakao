@@ -1,0 +1,80 @@
+{
+  "repository": "https://github.com/revfactory/codex-harness",
+  "commit": "80f8217b5b6d3f220a31f05f9c0adaf09dac40f4",
+  "files": [
+    {
+      "path": "LICENSE",
+      "sha256": "bae1caa988a742c5a756faa45e33b6c72f21f9873b8e7f1e0ce87fcf0a4c747b"
+    },
+    {
+      "path": "skills/harness/SKILL.md",
+      "sha256": "9540fa75718507cc8bdbcfa80217369e95dd3f4970a28076e6f4fb6e69b30334"
+    },
+    {
+      "path": "skills/harness/scripts/common.py",
+      "sha256": "58cdc69d562ec2f9729392b4bf0d6deb1c685929a65ea96383e3ca59d99e17c2"
+    },
+    {
+      "path": "skills/harness/scripts/communication.py",
+      "sha256": "c15a49e8eb5689fc5b4712f55d68b5b79a478efbf60acbd19bebd88a9c6f6a50"
+    },
+    {
+      "path": "skills/harness/scripts/create_agent.py",
+      "sha256": "4ed587d6d0733ca964e397c19417ddf46e0e91b1c2d1f67f69bd7506755f162e"
+    },
+    {
+      "path": "skills/harness/scripts/run.py",
+      "sha256": "eaa02ba1a966c4801b3e8affdaa1a5a7badbadaf2d1c1947126be61e9a5063ac"
+    },
+    {
+      "path": "skills/harness/scripts/run_checks.py",
+      "sha256": "a02011ab3a54ea9c507950e8c8050ffe40bfed9149835777836af61f86d3068b"
+    },
+    {
+      "path": "skills/harness/scripts/run_state.py",
+      "sha256": "168b0ffe0300c52ab5486f5b2d11a1fb1cfcec644414297ec6c564fd918f6e55",
+      "upstream_sha256": "502b82539fedd23eff95abcddd50afb9e77fa72ec865074c85be7fd7a128074b",
+      "local_change": "Windows dependency path normalized with as_posix; evidence/harness-windows-path-fix.patch"
+    },
+    {
+      "path": "skills/harness/scripts/run_support.py",
+      "sha256": "a87a35218a7cb70084498f9e880bcf1aa9370089fe08af39dfef005fc14580be"
+    },
+    {
+      "path": "skills/harness/scripts/validate.py",
+      "sha256": "6bf3b040cf0d153e487fd2eb2907fc3398646eaca631e3ad98b80eed48cb6208"
+    },
+    {
+      "path": "skills/harness/references/agent-design-patterns.md",
+      "sha256": "ffd609c963623ed7fd3591d86600f19908a5ed09bcc80dc0fb512d5212bd7b42"
+    },
+    {
+      "path": "skills/harness/references/orchestrator-template.md",
+      "sha256": "0ebc64cedb6b0fe0a1800c4519327607561352a01f231c6235d5d217708e400c"
+    },
+    {
+      "path": "skills/harness/references/qa-agent-guide.md",
+      "sha256": "50f8c44d578b542c12b247b1db6e6b6ad5f4f4d9bd5d7cab6d823efc7dd7558b"
+    },
+    {
+      "path": "skills/harness/references/runtime-guide.md",
+      "sha256": "4a570550bbd4be55d42dc85e1b6e7710f8337c75c07e7bb4864382cfed66e4f0"
+    },
+    {
+      "path": "skills/harness/references/skill-testing-guide.md",
+      "sha256": "e721a9527bfa6190a8638d19f17b5f740fc7867a84544682d27cf7615782cf3e"
+    },
+    {
+      "path": "skills/harness/references/skill-writing-guide.md",
+      "sha256": "4f7ff1a1db603aad1de0e9778b3334cf8b8968a0dce00c0b43c8fa5c70ac3ede"
+    },
+    {
+      "path": "skills/harness/references/team-examples.md",
+      "sha256": "dd1bde475f501a4f71055acacaa293d013e9419ca1d6711dcc4ecf0121372f90"
+    },
+    {
+      "path": "skills/harness/scripts/run_state.py.upstream",
+      "sha256": "502b82539fedd23eff95abcddd50afb9e77fa72ec865074c85be7fd7a128074b"
+    }
+  ]
+}

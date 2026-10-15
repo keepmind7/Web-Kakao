@@ -1,0 +1,60 @@
+# --- 민감정보: 절대 커밋하지 않음 ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+credentials*
+*token*.json
+*session*.json
+auth.json
+.device-uuid
+*.cookie
+cookies.txt
+
+# 실험 중 생성되는 원본 캡처·대화 데이터 (실제 대화 내용 유출 방지)
+captures/
+*.pcap
+*.pcapng
+*.har
+dumps/
+raw-data/
+local-only/
+
+# 분석 대상 바이너리 (라이선스·용량 문제로 저장소에 올리지 않고 버전·해시만 기록)
+*.apk
+*.xapk
+*.ipa
+*.exe
+*.dmg
+*.msi
+
+# 빌드·의존성
+node_modules/
+dist/
+build/
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 에디터·OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
+
+# 하네스 실행 잠금은 내용 없는 런타임 파일이며 Git에 보관하지 않음
+.harness/runs/**/.state.lock
+_workspace/communications/*.lock
+
+# github에 올라가지 않았으면 하는것들
+_workspace/
+.codex/
+.harness/
+docs/
+evidence/
