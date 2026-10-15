@@ -58,3 +58,6 @@ _workspace/
 .harness/
 docs/
 evidence/
+
+# 실험 중 임시 응답 파일 (서버 응답 원문 유출 방지)
+*.tmp
