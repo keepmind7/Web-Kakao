@@ -40,7 +40,7 @@ export function sanitizeProbe(result) {
 
 // Injectable low-level factory permits offline verification without importing
 // the original SDK or performing any real account operation in tests.
-export async function probeRoomCount(credential, factory) {
+export async function probeRoomCount(credential, factory, onConnected) {
   const clients = []; let stage = 'booking';
   const track = client => {
     clients.push(client);
@@ -71,6 +71,11 @@ export async function probeRoomCount(credential, factory) {
     const login = await carriage.loginList(credential);
     if (login.status !== 0) return {ok:false,stage,status:login.status};
     const list = ['chatDatas','chatInfos','chats','chatRooms','chatList'].map(key => login.body?.[key]).find(Array.isArray);
+    if (onConnected) {
+      // Persistent read-only reader owns only the carriage after login.
+      for (const client of clients.slice(0,-1)) client.disconnect();
+      await onConnected(carriage,login.body);
+    }
     // Count only. No room identifiers, names, last-message text or sender data
     // leave this worker. Missing list is distinct from a valid empty list.
     return {ok:true,stage,status:0,roomListPresent:Array.isArray(list),roomCount:list?.length ?? null};

@@ -70,7 +70,8 @@ export function createTransport() {
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const seconds = value => Number.isFinite(value) && value > 0 && value <= 300;
 const positiveId = value => (typeof value === 'string' && /^[1-9]\d{0,30}$/.test(value)) || (Number.isSafeInteger(value) && value > 0);
-export function createAuthLab({ transport, encodeQr, mode = 'live', now = Date.now, later = setTimeout, clear = clearTimeout }) {
+export function createAuthLab({ transport, encodeQr, mode = 'live', now = Date.now, later = setTimeout, clear = clearTimeout, credentialRetentionMs = 15*60*1000 }) {
+  if (!Number.isInteger(credentialRetentionMs) || credentialRetentionMs<1000 || credentialRetentionMs>60*60*1000) throw new Error('invalid_retention');
   let view = { phase: 'idle', message: 'QR 로그인 시작을 누르면 서버 허용 여부부터 확인합니다.', stage: null };
   let credentials = null, deviceUUID = null, qrId = null, timer = null, deadlineTimer = null, epoch = 0, attempts = 0, locked = false;
   let probeAttempted = false;
@@ -110,7 +111,7 @@ export function createAuthLab({ transport, encodeQr, mode = 'live', now = Date.n
           refreshToken: typeof body.refreshToken === 'string' ? body.refreshToken : '' };
         qrId = null; delete view.grid; delete view.passcode; delete view.expiresAt;
         view = { ...view, phase: 'authenticated', message: 'QR 인증 응답과 토큰을 받았습니다. 대화 서버 연결은 아직 검증하지 않았습니다.' };
-        schedule(() => terminal('expired', '인증 확인용 메모리를 지웠습니다. 휴대폰에서 등록 기기도 확인해 주세요.'), 15 * 60 * 1000);
+        schedule(() => terminal('expired', '실험용 인증 메모리를 지웠습니다. 다시 연결하려면 QR 인증이 필요합니다.'), credentialRetentionMs);
         return;
       }
       // Do not interpret an arbitrary error plus retry interval as permission to retry.
@@ -142,7 +143,7 @@ export function createAuthLab({ transport, encodeQr, mode = 'live', now = Date.n
   return {
     snapshot() {
       return { ...view, mode, profile: PROFILE, credentialInMemory: credentials !== null,
-        canStart: canStart(), canProbe: view.phase === 'authenticated' && credentials !== null && !probeAttempted,
+        canStart: canStart(), sessionBlocked:locked, canProbe: !locked && view.phase === 'authenticated' && credentials !== null && !probeAttempted,
         attempts, actualChatConnected: view.roomProbe?.connectionVerified === true, actualMessageSent: false, requests: { ...counts } };
     },
     async start() {
@@ -188,11 +189,16 @@ export function createAuthLab({ transport, encodeQr, mode = 'live', now = Date.n
         if (run === epoch) {
           view.roomProbe = result;
           if (result.connectionVerified) view.message = '대화 서버의 로그인 응답을 확인했습니다. 이번 검사 연결은 종료했으며 상시 수신은 아직 검증하지 않았습니다.';
-          if (result.phase !== 'completed') locked = true;
+          if (result.phase !== 'completed') terminal('blocked','대화 서버 검사가 중단돼 이번 실행의 추가 연결을 막았습니다.');
         }
-      } catch { if (run === epoch) { view.roomProbe = {phase:'failed',stage:'worker',connectionVerified:false}; locked = true; } }
+      } catch { if (run === epoch) { view.roomProbe = {phase:'failed',stage:'worker',connectionVerified:false}; terminal('blocked','대화 서버 검사가 중단됐습니다.'); } }
       return true;
     },
+    withCredential(consumer) {
+      if(locked || view.phase!=='authenticated' || !credentials)return false;
+      return consumer({userId:credentials.userId,deviceUUID:credentials.deviceUUID,accessToken:credentials.accessToken},{signal:abort.signal});
+    },
+    blockConnection(){terminal('blocked','서버에서 연결을 거부해 이번 실행의 추가 인증과 연결을 중단했습니다.');},
     cancel() { ++epoch; terminal('cancelled', '로컬 인증 작업과 메모리를 지웠습니다. 원격 기기 로그아웃은 휴대폰에서 확인해 주세요.'); },
   };
 }

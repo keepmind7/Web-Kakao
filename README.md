@@ -2,6 +2,12 @@
 
 기존 카카오톡 계정의 대화방과 메시지를 브라우저에서 조회하고 실시간으로 수신·답장하는 독립 웹 클라이언트를 연구한다. 공식 앱의 상시 실행이나 원격 데스크톱 대신 `브라우저 ↔ 자체 서버 ↔ 카카오톡 서버` 구조를 검토한다.
 
+## Phase 2 진행 중
+
+최소 읽기 전용 화면을 구현했다. QR 인증 뒤 대화방 불러오기 → 방 선택 → 메시지 조회를 지원한다. 같은 연결의 MSG 수신을 표시하고 서버 메시지 ID로 중복·순서를 처리하는 코드를 추가했다. 인증과 대화는 메모리에만 보관하며 실험용 인증 보관 한도는1시간이다. 서버 거부 응답에서는 인증·연결을 함께 정리하고 추가 시도를 막는다.
+
+**현재 검증 범위:** 모의 데이터로 동작·브라우저 화면을 확인했다. Phase 2의 실제 계정 메시지 조회·실시간 수신·휴대폰 OFF·재연결은 아직 검증하지 않았다. 과거 페이지 이동, 누락 복구, 토큰 갱신, 메시지 발송은 미구현이다. 아래 Phase 1 표는 종료 당시 결과다.
+
 ## Phase 1 종료
 
 **2026-10-15 (Asia/Seoul), 최종 판단: 조건부 진행.** 가능성 조사와 최초 실연결 검증을 마감했다. 핵심 기능 전체 통과나 실사용 서비스 완료를 뜻하지 않는다.
@@ -44,9 +50,9 @@ python tools/prepare_spikes.py --install-dependencies
 python tools/local_web.py start
 ```
 
-브라우저에서 `http://127.0.0.1:8787`을 열고 QR 로그인 → 휴대폰 스캔·승인 → **읽기 전용 연결 확인** 순서로 진행한다. 연결 검사 버튼은 방 개수만 표시하고 종료한다. 현재 방 이름과 메시지를 보여주는 채팅 화면은 없다.
+브라우저에서 `http://127.0.0.1:8787`을 열고 QR 로그인 → 휴대폰 스캔·승인 → **대화방 불러오기** → 방 선택 → **메시지 조회** 순서로 진행한다. 서버가 제공한 제목·표시 이름이 없는 방은 이름 없음으로 표시한다. 조회 응답이 전체 과거 이력인지 아직 확인하지 않았으며 마지막 메시지 미리보기와 실제 조회 결과를 구분한다.
 
-실험 프로필은 Android 태블릿 SM-T733/Android14/앱26.1.2다. 비공식 연결 실험이며 서버가 등록·인증을 거부하면 중단한다. 인증 정보는 서버 메모리에만 두고15분 뒤 정리한다. 이 한도는 카카오 서버의 토큰 만료 시간이 아니다. 로컬 세션 삭제·서버 종료는 원격 로그아웃을 뜻하지 않는다.
+실험 프로필은 Android 태블릿 SM-T733/Android14/앱26.1.2다. 비공식 연결 실험이며 서버가 등록·인증을 거부하면 중단한다. Phase 2의 인증·대화는 메모리에만 두고 인증 후1시간 뒤 정리한다. 이 한도는 카카오 서버의 토큰 만료 시간이 아니다. 로컬 세션 삭제·서버 종료는 원격 로그아웃을 뜻하지 않는다. 진행 중인 인증·대화 연결이 있으면 stop은 거부하므로 먼저 웹에서 로컬 세션을 지운다.
 
 브라우저는 loopback HTTP를 사용하고, QR 인증의 카카오 서버 통신은 인증서 검증 HTTPS를 사용한다. 대화 서버 Booking은 TLS, 이후 Ticket/Carriage는 고정 소스의 V2SL 암호화 TCP를 사용한다. 외부 공개·터널·실제 메시지 발송 기능은 연결하지 않았다.
 
@@ -59,11 +65,12 @@ python tools/local_web.py stop
 
 ## 검증
 
-Phase 1 종료 시 Python16개와 Node30개 검사가 통과했다. 모의 테스트 통과와 실제 계정 결과는 구분한다. 아래 Node 검사는 위 소스·의존성 준비가 필요하다.
+Phase 1 종료 시 Python16개와 Node30개 검사가 통과했다. Phase 2의 추가 검사는 아래 명령에 포함했다. 모의 테스트 통과와 실제 계정 결과는 구분한다. Node 검사는 위 소스·의존성 준비가 필요하며 브라우저 검사는 로컬 Chrome을 별도 프로필로 실행한다.
 
 ```powershell
 python -m unittest discover -s tests -v
-& ./local-only/runtime/node-v24.21.0-win-x64/node.exe --test tests/local-web.test.mjs tests/room-probe.test.mjs
+& ./local-only/runtime/node-v24.21.0-win-x64/node.exe --test tests/local-web.test.mjs tests/room-probe.test.mjs tests/reader.test.mjs
+& ./local-only/runtime/node-v24.21.0-win-x64/node.exe tests/reader-browser-smoke.mjs
 ```
 
 QR 인증·연결 검사의 기반 소스는 [tyeom/kakao-cli](https://github.com/tyeom/kakao-cli/tree/8dbbd4f7ed6b42542982252250622fa351af00e9)의 고정 commit이다. 원본의 일반 API 서버나 평문 계정 저장 기능을 실행하지 않고 제한한 실험 경로를 사용한다. `experiments/auth_preflight.py`는 초기 진단 기록용이며 현재 QR 실행기의 gate가 아니다.

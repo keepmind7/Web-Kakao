@@ -25,7 +25,7 @@ hash_count = 0
 for base, manifest in [
     (ROOT, ROOT / "evidence/experiment-source-manifest.json"),
     (ROOT / "tools/vendor/codex_harness", ROOT / "tools/vendor/codex_harness/source-manifest.json"),
-    (ROOT, ROOT / "evidence/local-web/source-manifest.json"),
+    (ROOT, ROOT / ("evidence/phase2/source-manifest.json" if (ROOT / "evidence/phase2/source-manifest.json").exists() else "evidence/local-web/source-manifest.json")),
 ]:
     data = json.loads(manifest.read_text(encoding="utf-8"))
     for entry in data["files"]:

@@ -6,6 +6,8 @@ import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
 import { createAuthLab, createTransport, mockTransport } from './kakao-auth.mjs';
 import { runRoomProbe } from './room-probe.mjs';
+import { createReadOnlyReader } from './reader-manager.mjs';
+import { roomKeyValid } from './reader-data.mjs';
 
 const APP = 'web-kakao-auth-lab-v1';
 export function encodeQr(text) {
@@ -20,8 +22,11 @@ const assets = new Map([
   ['/app.js', ['app.js', 'text/javascript; charset=utf-8']],
   ['/style.css', ['style.css', 'text/css; charset=utf-8']],
 ]);
-export function createLocalServer({ transport, mode = 'mock', encode = encodeQr, probe = runRoomProbe } = {}) {
-  const lab = createAuthLab({ transport: transport ?? (mode === 'live' ? createTransport() : mockTransport()), encodeQr: encode, mode });
+export function createLocalServer({ transport, mode = 'mock', encode = encodeQr, probe = runRoomProbe, readerFactory = createReadOnlyReader } = {}) {
+  const lab = createAuthLab({ transport: transport ?? (mode === 'live' ? createTransport() : mockTransport()), encodeQr: encode, mode, credentialRetentionMs:60*60*1000 });
+  const newReader=()=>readerFactory({onBlocked:()=>{reader.close();lab.blockConnection();}});
+  let reader=newReader();
+  const snapshot=()=>{const auth=lab.snapshot(),reading=reader.snapshot();return {build:2,...auth,actualChatConnected:auth.actualChatConnected || Number.isFinite(reading.connectedAt),chatConnectionActive:reading.phase==='connected',reader:reading,canOpenReader:mode==='live' && !auth.sessionBlocked && auth.credentialInMemory && auth.phase==='authenticated' && reading.canConnect};};
   const cookie = randomBytes(32).toString('hex');
   const csrf = randomBytes(32).toString('hex');
   let origin;
@@ -44,33 +49,59 @@ export function createLocalServer({ transport, mode = 'mock', encode = encodeQr,
     }
     const authenticated = (req.headers.cookie ?? '').split(';').some(item => item.trim() === `local_auth=${cookie}`);
     if (!authenticated) return reply(403, { error: 'local_session_required' });
-    if (req.method === 'GET' && req.url === '/api/status') return reply(200, { app: APP, csrf, ...lab.snapshot() });
-    if (req.method !== 'POST' || !['/api/start', '/api/cancel', '/api/shutdown', '/api/room-probe'].includes(req.url)) return reply(404, { error: 'not_found' });
+    if (req.method === 'GET' && req.url === '/api/status') return reply(200, { app: APP, csrf, ...snapshot() });
+    let requestUrl;try{requestUrl=new URL(req.url,origin);}catch{return reply(400,{error:'invalid_url'});}
+    if(req.method==='GET' && ['/api/reader/rooms','/api/reader/messages'].includes(requestUrl.pathname)){
+      if(!lab.snapshot().credentialInMemory)return reply(409,{error:'authentication_required'});
+      if(requestUrl.pathname==='/api/reader/rooms')return reply(200,reader.rooms());
+      const key=requestUrl.searchParams.get('room');
+      if(!roomKeyValid(key) || [...requestUrl.searchParams.keys()].length!==1)return reply(400,{error:'room_required'});
+      const page=reader.messages(key);return page?reply(200,page):reply(404,{error:'unknown_room'});
+    }
+    if (req.method !== 'POST' || !['/api/start', '/api/cancel', '/api/shutdown', '/api/room-probe','/api/reader/connect','/api/reader/disconnect','/api/reader/history'].includes(req.url)) return reply(404, { error: 'not_found' });
     const provided = req.headers['x-csrf-token'];
     if (req.headers.origin !== origin || typeof provided !== 'string' || !/^[a-f0-9]{64}$/.test(provided) || !timingSafeEqual(Buffer.from(provided), Buffer.from(csrf))) return reply(403, { error: 'same_origin_required' });
     if (!/^application\/json(?:;|$)/i.test(req.headers['content-type'] ?? '')) return reply(415, { error: 'json_required' });
+    let body;
     try {
       let bytes = 0; const chunks = [];
       for await (const chunk of req) { bytes += chunk.length; if (bytes > 1024) { reply(413, { error: 'body_limit' }); return; } chunks.push(chunk); }
-      const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-      if (!body || Array.isArray(body) || typeof body !== 'object' || Object.keys(body).length) return reply(400, { error: 'empty_object_required' });
+      body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      if(!body || Array.isArray(body) || typeof body!=='object')return reply(400,{error:'invalid_object'});
+      if(req.url==='/api/reader/history'){
+        if(Object.keys(body).length!==1 || !roomKeyValid(body.room))return reply(400,{error:'room_required'});
+      }else if(Object.keys(body).length)return reply(400,{error:'empty_object_required'});
     } catch { return reply(400, { error: 'invalid_json' }); }
     if (req.url === '/api/start') {
       if (!lab.snapshot().canStart) return reply(409, { app: APP, ...lab.snapshot() });
+      reader.close();reader=newReader();
       void lab.start();
       return reply(202, { app: APP, ...lab.snapshot() });
     }
     if (req.url === '/api/room-probe') {
+      if(['connecting','connected'].includes(reader.snapshot().phase))return reply(409,{app:APP,...snapshot()});
       if (!lab.snapshot().canProbe || mode !== 'live') return reply(409, {app:APP,...lab.snapshot()});
       void lab.connectReadOnly(probe);
       return reply(202, {app:APP,...lab.snapshot()});
     }
+    if(req.url==='/api/reader/connect'){
+      if(!snapshot().canOpenReader || lab.snapshot().roomProbe?.phase==='running')return reply(409,{app:APP,...snapshot()});
+      lab.withCredential((credential,options)=>reader.connect(credential,options));
+      return reply(202,{app:APP,...snapshot()});
+    }
+    if(req.url==='/api/reader/disconnect'){reader.disconnect();return reply(200,{app:APP,...snapshot()});}
+    if(req.url==='/api/reader/history'){
+      if(!lab.snapshot().credentialInMemory || !reader.history(body.room))return reply(409,{error:'reader_not_ready'});
+      return reply(202,{accepted:true});
+    }
+    if(req.url==='/api/shutdown' && (['checking','generating','waiting','approval','authenticated'].includes(lab.snapshot().phase) || ['connecting','connected'].includes(reader.snapshot().phase)))return reply(409,{error:'active_session_cancel_first'});
+    reader.close();
     lab.cancel();
     reply(200, { app: APP, ...lab.snapshot() });
     if (req.url === '/api/shutdown') { server.close(); server.closeIdleConnections(); }
   });
   server.headersTimeout = 10000; server.requestTimeout = 15000;
-  server.on('close', () => lab.cancel());
+  server.on('close', () => {reader.close();lab.cancel();});
   return {
     server, lab,
     async listen(port = 8787) {

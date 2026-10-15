@@ -8,6 +8,7 @@ import sys
 import time
 from pathlib import Path
 from urllib import request
+from urllib.error import HTTPError
 from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -34,7 +35,7 @@ def connect():
 
 def public_status(url, state):
     # Allowlist only: never serialize QR grid, passcode, cookies, CSRF or credentials.
-    return {"url": url, **{key: state[key] for key in ["mode", "phase", "stage", "httpStatus", "apiStatus", "qrIssued", "credentialInMemory", "actualChatConnected", "actualMessageSent", "requests", "roomProbe"] if key in state}}
+    return {"url": url, **{key: state[key] for key in ["build", "mode", "phase", "stage", "httpStatus", "apiStatus", "qrIssued", "credentialInMemory", "actualChatConnected", "chatConnectionActive", "actualMessageSent", "requests", "roomProbe", "reader"] if key in state}}
 
 
 def main():
@@ -83,8 +84,14 @@ def main():
     if args.action in {"stop", "attempt", "probe"}:
         path = {"stop":"/api/shutdown", "attempt":"/api/start", "probe":"/api/room-probe"}[args.action]
         req = request.Request(url + path, data=b"{}", method="POST", headers={"Origin": url, "Content-Type": "application/json", "X-CSRF-Token": state["csrf"]})
-        with client.open(req, timeout=5) as response:
-            state = json.load(response)
+        try:
+            with client.open(req, timeout=5) as response:
+                state = json.load(response)
+        except HTTPError as error:
+            if error.code == 409:
+                print("진행 중인 인증·연결이 있거나 요청할 수 없는 상태입니다. 종료하려면 웹에서 로컬 세션을 먼저 지워 주세요.")
+                return 2
+            raise
     print(json.dumps(public_status(url, state), ensure_ascii=False, indent=2))
     return 0
 
