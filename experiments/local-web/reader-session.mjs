@@ -54,7 +54,7 @@ export function createReaderSession(credential,factory,emit) {
         reportFailure=fail;
         void probeRoomCount(credential,factory,async(client,body)=>{
           if(closed)return;
-          carriage=client;store=createReaderStore(body,credential.userId,factory.sessionSalt,factory.settingsSecret);
+          carriage=client;store=createReaderStore(body,credential.userId,factory.sessionSalt,factory.settingsSecret,{onCacheEvicted:key=>{cursors.delete(key);gapProbes.delete(key);}});
           carriage.on('disconnected',()=>fail('disconnected'));
           carriage.on('error',()=>fail('transport'));
           carriage.on('push',packet=>{
@@ -108,6 +108,7 @@ export function createReaderSession(credential,factory,emit) {
       // supplied by LOGINLIST/MSG; do not guess an ID or issue another command.
       const end=store.historyEnd(key);
       store.recent(key);
+      const cacheEpoch=store.cacheEpoch(key);let cacheInvalidated=false;
       if(!end){
         emit({type:'reader-messages',...store.history(key,{}),requestId,source:'history',unavailable:true});
         return true;
@@ -121,6 +122,7 @@ export function createReaderSession(credential,factory,emit) {
           const response=await carriage.request('SYNCMSG',{chatId:factory.toLong(store.serverRoomId(key)),cur:factory.toLong(cur),cnt:50,max:factory.toLong(end)});
           if(closed)return false;
           if(responseStatus(response)!==0){emit({type:'reader-failed',stage:'history',status:responseStatus(response)});close();return false;}
+          cacheInvalidated ||= store.cacheEpoch(key)!==cacheEpoch;
           const pageBody=response.body?.isOK===true && !logArray(response.body)?{...response.body,chatLogs:[]}:response.body;
           result=store.history(key,pageBody);receivedCount+=result.receivedCount;acceptedCount+=result.acceptedCount;rejectedCount+=result.rejectedCount;
           fieldPresent ||= result.fieldPresent;
@@ -128,6 +130,7 @@ export function createReaderSession(credential,factory,emit) {
           complete=response.body?.isOK===true;
           const next=store.historyCursor(key,response.body);
           factory.observeHistory?.({page:pages+1,receivedCount:result.receivedCount,acceptedCount:result.acceptedCount,rejectedCount:result.rejectedCount,fieldPresent:result.fieldPresent,hasMore,cursorAdvanced:Boolean(next && BigInt(next)>BigInt(cur)),reachedBound:Boolean(next && BigInt(next)>=BigInt(end)),seedAtEnd:store.seedAtEnd(key)});
+          if(cacheInvalidated)break;
           if(next && BigInt(next)>BigInt(cur)){cur=next;cursors.set(key,cur);}else break;
           if(!hasMore || !result.fieldPresent || !result.receivedCount || BigInt(cur)>=BigInt(end))break;
           await (factory.delay ?? (ms=>new Promise(resolve=>setTimeout(resolve,ms))))(100);
@@ -137,19 +140,22 @@ export function createReaderSession(credential,factory,emit) {
         // Experimental, opt-in server mode: one alternative read for a range
         // which SYNCMSG declared complete before the known room end.
         const gapRange=cur+':'+end;
-        if(gap && factory.gapProbe===true && gapProbes.get(key)!==gapRange){
+        if(!cacheInvalidated && gap && factory.gapProbe===true && gapProbes.get(key)!==gapRange){
           gapProbes.set(key,gapRange);
           const response=await carriage.request('MCHATLOGS',{chatIds:[factory.toLong(store.serverRoomId(key))],sinces:[factory.toLong(cur)]});
           if(closed)return false;
           if(responseStatus(response)!==0){emit({type:'reader-failed',stage:'history',status:responseStatus(response)});close();return false;}
+          cacheInvalidated ||= store.cacheEpoch(key)!==cacheEpoch;
           result=store.history(key,response.body,{requireRoomId:true});receivedCount+=result.receivedCount;acceptedCount+=result.acceptedCount;rejectedCount+=result.rejectedCount;fieldPresent ||= result.fieldPresent;
           const next=store.historyCursor(key,response.body,{requireRoomId:true});
           const advanced=Boolean(next && BigInt(next)>BigInt(cur));
-          if(advanced){cur=next;cursors.set(key,cur);}
+          if(advanced && !cacheInvalidated){cur=next;cursors.set(key,cur);}
           gap=BigInt(cur)<BigInt(end);
           factory.observeHistory?.({method:'MCHATLOGS',receivedCount:result.receivedCount,acceptedCount:result.acceptedCount,rejectedCount:result.rejectedCount,fieldPresent:result.fieldPresent,cursorAdvanced:advanced,reachedBound:!gap,seedAtEnd:store.seedAtEnd(key)});
         }
-        emit({type:'reader-messages',...result,fieldPresent,receivedCount,acceptedCount,rejectedCount,hasMore,gap,requestId,source:'history'});return true;
+        cacheInvalidated ||= store.cacheEpoch(key)!==cacheEpoch;
+        if(cacheInvalidated){cursors.delete(key);gapProbes.delete(key);}
+        emit({type:'reader-messages',...result,...(cacheInvalidated?{latestVisible:false}:{}),fieldPresent,receivedCount,acceptedCount,rejectedCount,hasMore:cacheInvalidated || hasMore,gap:cacheInvalidated || gap,requestId,source:'history'});return true;
       } catch {if(!closed){emit({type:'reader-failed',stage:'history',status:null});close();}return false;}
       finally{busy=false;scheduleDiscovery();}
     },
@@ -165,6 +171,7 @@ export function createReaderSession(credential,factory,emit) {
       const watermark=readTarget?.logId;
       if(action==='read' && !watermark)return false;
       busy=true;
+      const contextVersion=action==='context'?store.receiptVersion(key):null;
       const result=(phase,status=null,messageKey)=>emit({type:'reader-action',key,requestId,action,phase,status,...(messageKey?{messageKey}:{})});
       try{
         const chatId=factory.toLong(store.serverRoomId(key));
@@ -181,24 +188,25 @@ export function createReaderSession(credential,factory,emit) {
           if(closed)return false;
           let update=null;
           if(outcome.phase==='accepted' && outcome.chatLog){update=store.writeAccepted(key,{chatLog:outcome.chatLog},'[사진]',{type:2});if(update)publish(update,'sent');}
-          result(outcome.phase,outcome.status,update?.messageKey);
+          result(outcome.phase==='accepted' && !update?'unknown':outcome.phase,outcome.status,update?.messageKey);
           if(Number.isInteger(outcome.status) && outcome.status!==0){emit({type:'reader-failed',stage:'photo',status:outcome.status});close();}
           return true;
         }
+        const expectedMessageId=action==='send'?++nextMessageId:null;
         const response=action==='send'
-          ?await carriage.request('WRITE',{chatId,msgId:++nextMessageId,type:extra?26:1,noSeen:true,msg:payload.text,...(extra?{extra}:{})},20000)
+          ?await carriage.request('WRITE',{chatId,msgId:expectedMessageId,type:extra?26:1,noSeen:true,msg:payload.text,...(extra?{extra}:{})},20000)
           :action==='context'?await carriage.request('CHATONROOM',{chatId,token:factory.toLong('0'),opt:factory.toLong('0')})
           :await carriage.request('NOTIREAD',{chatId,watermark:factory.toLong(watermark)});
         if(closed)return false;
         const status=responseStatus(response);
         if(status!==0){result(action==='send' && status===null?'unknown':'failed',status);emit({type:'reader-failed',stage:action,status});close();return true;}
         if(action==='send'){
-          if(response.body?.msgId!==undefined && String(response.body.msgId)!==String(nextMessageId))throw new Error('write_correlation');
+          if(response.body?.msgId!==undefined && String(response.body.msgId)!==String(expectedMessageId))throw new Error('write_correlation');
           const update=store.writeAccepted(key,response.body,payload.text,{type:extra?26:1,attachment:extra});
           if(update)publish(update,'sent');
-          result('accepted',0,update?.messageKey);
+          result(update?'accepted':'unknown',0,update?.messageKey);
         }else if(action==='context'){
-          const ready=store.receiptSnapshot(key,response.body);
+          const ready=store.receiptSnapshot(key,response.body,contextVersion);
           store.recent(key);publish(store.current(key),'receipt');result(ready?'accepted':'unavailable',0);
         }else{
           // status0 acknowledges the request, not the peer's displayed unread count.

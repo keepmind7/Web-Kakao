@@ -15,6 +15,18 @@ auth.json
 *.cookie
 cookies.txt
 
+# 프로젝트 설정과 에이전트 정의만 공유
+/.codex/*
+!/.codex/config.toml
+!/.codex/agents/
+/.codex/agents/*
+!/.codex/agents/*.toml
+
+# 운영 문서만 공유
+/.harness/*
+!/.harness/OPERATING.md
+!/.harness/FOLLOWUP.md
+
 # 실험 중 생성되는 원본 캡처·대화 데이터 (실제 대화 내용 유출 방지)
 captures/
 *.pcap
@@ -54,8 +66,6 @@ _workspace/communications/*.lock
 
 # github에 올라가지 않았으면 하는것들
 _workspace/
-.codex/
-.harness/
 docs/
 evidence/
 

@@ -97,6 +97,7 @@ python tools/local_web.py stop
 - 받은 사진은 허용한 카카오 CDN에서 메모리 프록시로 표시한다. 사진당10MiB·동시4개·캐시30MiB로 제한하며 원본 주소를 브라우저 메시지 응답에 넣지 않는다.
 - 알림은 본문 없이 무음으로 표시한다. 차단됐다면 Chrome 사이트 설정 → 알림 → 허용 후 새로고침한다. [Chrome 공식 안내](https://support.google.com/chrome/answer/3220216?hl=ko)
 - 결과 불명인 전송은 자동 재시도하지 않는다. 재발송 전에 실제 도착 여부를 확인한다.
+- 미읽음 숫자는 이 실행에서 관찰한 수신 기준이다. 읽은 항목을 회수해 새 수신 용량을 확보하며 중복 기록도 유한하게 유지한다. 드문 중복 판별 오탐·한도·재접속으로 범위가 불완전하면 partial 상태다. 장시간의 모든 수신을 빠짐없이 세는 보장은 없다.
 
 ## 다음 조사: 다른 PC의 Android 에뮬레이터
 
@@ -115,7 +116,7 @@ python tools/build_apk_export_kit.py
 
 `local-only/apk-export-kit.zip`을 다른 PC에서 전부 풀고 `run.cmd`를 실행한다. ADB 설정·대상 선택·결과 ZIP 전달은 [APK 추출 안내](tools/apk_export/README.ko.md)를 따른다. 합성 검사5개와 공식 ADB 준비 검사는 통과했으며 실제 추출 성공을 뜻하지 않는다.
 
-REA6.5.0·JDK·JADX를 로컬에 준비해 CLI·별도 MCP·공개 시험 APK의 패키지/메서드/참조 분석을 검증했다. **카카오톡 APK 분석은 미실행**이다. 부모 세션의 REA 전용 MCP 직접 연결이나 REA·codex-harness의 전용 연동을 가정하지 않는다. 하네스 helper는 역할·파일 소유권·인수인계 정리에 참고하며 Claude에서 그대로 실행된다고 보고하지 않는다.
+REA6.5.0·JDK·JADX를 로컬에 준비해 CLI·별도 MCP·공개 시험 APK의 패키지/메서드/참조 분석을 검증했다. **카카오톡 APK 분석은 미실행**이다. 부모 세션의 REA 전용 MCP 직접 연결이나 REA·codex-harness의 전용 연동을 가정하지 않는다. 과거 `tools/vendor/codex_harness/`는 참고용 helper로 보존하며, 현재 사용하는 프로젝트 하네스는 아래 구성을 따른다.
 
 웹 실행과 별도로 분석 환경을 준비하려면 다음을 사용한다. JDK·JADX 다운로드도 `local-only/`에 보관하며 APK는 외부 분석 서비스로 올리지 않는다.
 
@@ -128,7 +129,11 @@ python tools/rea_local.py doctor --label android-doctor
 
 ## 검증
 
-최근 코드의 전체 Node132개·Python23개가 통과했다. Chrome 합성 검사도 통과했으며 이번 README 정리에서는 화면 코드를 바꾸지 않아 재실행하지 않았다. Chrome은 개인 프로필과 분리한 임시 프로필·합성 메시지로 실행해 마우스/우클릭 메뉴, 화면 경계, 580픽셀 폭의 시간 비중첩, 기존 답장·복사를 검사했다. 자동 검사 통과는 실제 읽음·사진 전송 성공을 의미하지 않는다.
+2026-10-16 내부 결함 보완에서 최종 Node168개(신규 회귀36개)가 통과했다. 격리 Chrome29개 검사 분류와 Python23개도 이번 수정 과정에서 실제 통과했으며, 이후 전송 응답 코드만 보완한 최종 검사에서는 변경 없는 Chrome·Python 범위의 이전 결과를 명시적으로 재사용했다. Chrome은 개인 프로필과 분리한 임시 프로필·합성 메시지로 실행했다. 자동 검사 통과는 실제 읽음·사진 전송 성공을 의미하지 않는다.
+
+이번에는 캐시 퇴출 뒤 이력 커서, 참가자 변경 뒤 읽음 컨텍스트·인원수, 오래된 전송 응답의 성공 오인, 읽은 이벤트 누적 후 미읽음 집계 중단, 모달 뒤 읽음 처리, 재접속 뒤 사진 초안을 보완했다. 추가 QA에서 찾은 연속 재접속의 이력 자동 복원 누락과 독립 검수에서 찾은 전송 응답 번호 충돌도 수정했다. 재접속만으로 읽음 자격을 부여하지 않으며 사진을 자동 재전송하지 않는다. 최초 실패와 보완 후 결과를 구분해 보존했다.
+
+이번 작업에서는 사용 중인 서버를 재시작하거나 실계정에 재접속하지 않았다. 실행 중인 서버에 백엔드 변경을 적용하려면 재시작이 필요하며, 메모리 인증이 종료되므로 QR 승인을 다시 받아야 한다.
 
 ```powershell
 python -m unittest discover -s tests -v
@@ -139,6 +144,32 @@ $nodeTests = @(Get-ChildItem .\tests -Filter '*.test.mjs' | ForEach-Object { $_.
 ```
 
 Windows의 테스트 자식 프로세스·임시 폴더 ACL·Chrome 실행 권한이 필요하다. 계정 인증·실제 발송은 자동 테스트에 포함하지 않는다.
+
+## 프로젝트 전용 하네스
+
+설치된 `codex-harness` 플러그인0.1.0에서 스킬 번들을 복사하고 원본 LICENSE·NOTICE를 보존했다. 과거 vendor 사본과 실제 파일 해시를 비교해 구분했으며 같은 기능이라고 가정하지 않는다. 이후 Windows 의존 작업의 결과 경로를 처리하도록 프로젝트 로컬 helper의 경로 표현1곳을 수정했다. 플러그인 캐시·전역 설정은 바꾸지 않았다. 진입점은 `AGENTS.md`다.
+
+- 역할: `harness_explorer`, `kakao_rea_analyst`, `harness_architect`, `harness_worker`, `harness_reviewer`, `harness_qa`. 기존 Phase1 역할2개도 보존했다. 부모 세션이 계획·통합·계정/엔진 사용권·판정을 맡는다.
+- 스킬: 기존 `harness`와 `kakao-android-analysis`, `kakao-protocol-change`, `kakao-web-interaction`, `kakao-verification`을 `.agents/skills/`에서 사용한다.
+- 자식 최대3개, 부모 모델·추론 상속, 재귀 위임 기본 금지. 역할의 읽기 전용·쓰기 소유권은 행위 제약이며 실제 부모 권한을 상속한다. 역할 TOML만으로 OS 격리나 MCP 접근을 보장하지 않는다.
+- 최초 구성에서는 자식3개를 생성·재사용해 조사·설계·독립 검토·합성 QA·REA doctor·APK 미준비 사례를 점검했다. 당시 커스텀 역할이 활성 세션에 없어 빌트인 explorer/default로 대체했다. 후속 진단·수정 차수에서는 실제 커스텀 조사·설계·구현·QA·독립 검수 역할을 실행했다. 최초 구성 결과와 후속 실행을 구분해 기록한다.
+- REA 자식의 기본 권한 doctor는 `spawn EPERM`으로 실패했다. 명시적으로 권한을 높인 제한된 재점검에서 CLI/JADX 범위와 별도 MCP(도구207개·프롬프트6개)가 통과했다. 현재 세션의 직접 REA MCP 연결·카카오톡 APK 분석과 구분한다.
+- 최초 구성 시 Python23개·Node132개·계정 없는 Chrome 합성 검사23개 분류와 문서/원본 해시 검사가 통과했다. 해당 구성 차수에는 제품을 수정하지 않았다. 후속 내부 결함 수정은 별도 검증 기록을 따르며, 위 네 실제 미해결 문제는 해결로 판정하지 않는다.
+
+[운영 문서](.harness/OPERATING.md)에 배정·소유권·자원 lease·상태·인수인계 계약, [후속 계획](.harness/FOLLOWUP.md)에 **읽음1 → 사진 발송 → 방 이름 → 오픈채팅** 순서와 공개 인수인계 요약을 기록한다. 읽음1은 APK 분석 → 별도 승인된 공식 앱 비교 → 최소 수정 → 합성/로컬 검사 → 별도 승인된 상대방 화면 확인까지 계획한다. APK 추출 키트가 이미 있으면 다른 PC에서 재사용하며, 합성/시험 APK를 카카오톡 입력으로 쓰지 않는다.
+
+다른 Codex 세션에서 재개할 때는 `AGENTS.md`와 로컬 운영·후속 계획을 읽고 실제 역할·도구 가용성을 다시 확인한다. 프로젝트 설정은 `.codex/config.toml`에만 두며 사용자 전역 설정과 플러그인 캐시는 변경하지 않는다.
+
+다른 PC에서 정의를 복원할 수 있도록 `AGENTS.md`, `.agents/skills/` 전체(참조·스크립트·라이선스 포함), `.codex/config.toml`, `.codex/agents/*.toml`, `.harness/OPERATING.md`, `.harness/FOLLOWUP.md`만 공유한다. `.codex/`의 그 외 파일과 `.harness/`의 실행 장부·개별 보고서, `_workspace/` 통신 기록은 계속 제외한다.
+
+clone 후 저장소 루트에서 다음 구조 검사를 실행하고, 해당 디렉터리에서 새 Codex 세션을 연다.
+
+```powershell
+python -B -X utf8 .agents/skills/harness/scripts/validate.py --project .
+codex -C (Get-Location).Path
+```
+
+새 세션에는 `README.md`, `AGENTS.md`, 운영 문서와 후속 계획을 읽고 현재 역할·스킬·도구 가용성을 확인하도록 요청한다. 구조 검사와 Git clone만으로 역할 로딩·네이티브 실행·REA 연결이 검증되지는 않는다. Codex와 필요한 실행 도구는 각 PC에 준비해야 하며 전역 플러그인 캐시·로그인·기존 에이전트 대화·실행 중 세션은 복원되지 않는다. 과거 run을 공유하지 않으므로 새 plan/run을 만들며, 현재 하네스는 Web-Kakao 전용이다. 다른 프로젝트에서는 도메인 규칙과 파일 소유권을 조정한다. 현재 제품 준비 도구와 Chrome fixture는 Windows 기준이다.
 
 ## 파일 구성과 공개 제외 범위
 
@@ -152,7 +183,7 @@ Windows의 테스트 자식 프로세스·임시 폴더 ACL·Chrome 실행 권�
 | `docs/`, `evidence/` | 비공개 로컬 상세 보고서·실행 근거·manifest. Git에는 포함하지 않음 |
 | `local-only/` | 런타임·소스 복사본·개인 설정·분석 대상·진단·추출 ZIP. Git에는 포함하지 않음 |
 
-기존 `.gitignore`에 따라 `.env`, 자격증명·키·세션·원본 캡처·APK 및 `docs/`, `evidence/`, `.codex/`, `.harness/`, `_workspace/`, `local-only/`를 제외한다. GitHub의 README는 제외된 로컬 문서에 의존하지 않고 현재 상태와 실행 방법을 설명한다.
+`.gitignore`는 `.env`, 자격증명·키·세션·원본 캡처·APK 및 `docs/`, `evidence/`, `_workspace/`, `local-only/`를 제외한다. `.codex/`와 `.harness/`는 위에 명시한 정의·운영 문서만 선택적으로 포함한다. 공개 안내는 제외된 로컬 보고서·실행 기록에 의존하지 않는다.
 
 준비 도구는 새 환경에서도 필요한 `evidence/` manifest를 생성한다. 당시 package-lock은 공개하지 않으므로 전이 의존성까지 완전히 고정한 재현을 보장하지 않는다. `tools/verify_artifacts.py`는 비공개 문서·근거가 있는 작업 복사본에서 사용하는 로컬 검증 도구다.
 

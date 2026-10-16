@@ -1,0 +1,4 @@
+# Project scope only. Model, reasoning, permissions and MCP inherit from the parent.
+[agents]
+enabled = true
+max_concurrent_threads_per_session = 3

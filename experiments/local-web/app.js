@@ -43,6 +43,15 @@ function scheduleMessageMenuClose(){clearTimeout(messageMenuTimer);messageMenuTi
 function preferenceReady(){return lastState?.preferences===true && personalSettings!==null;}
 function roomNow(){return roomsCache.find(room=>room.key===selectedRoom);}
 function nearBottom(){const scroll=document.querySelector('.chat-scroll');return scroll.scrollHeight-scroll.clientHeight-scroll.scrollTop<=48;}
+function messageViewCovered(){return !el('account-panel').hidden || Boolean(document.querySelector('dialog[open]'));}
+function imageContextReady(room=selectedRoom,generation=readerGeneration){
+  return hasAccount && generation===readerGeneration && room===selectedRoom && roomNow()?.canSend===true
+    && lastState?.messaging===true && lastState?.build>=6 && lastState?.reader?.phase==='connected';
+}
+function imageSendReady(image=imageDraft){
+  return Boolean(image && imageContextReady(image.room,image.generation) && !busy && !ackInFlight && !pendingSend && !uncertainPhoto
+    && !imagePreparing && lastState.reader.operationBusy!==true);
+}
 async function postLocal(path,body){
   if(!csrf)return false;
   const response=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify(body)});
@@ -65,8 +74,8 @@ function renderComposer(){
   for(const filter of ['all','unread','pinned']){el('filter-'+filter).disabled=!hasAccount;el('filter-'+filter).setAttribute('aria-pressed',String(roomFilter===filter));}
   el('read-sync').disabled=lastState?.messaging!==true;
   el('compose-text').disabled=!writable || Boolean(pendingSend);
-  el('attach-image').disabled=!writable || lastState?.build<6 || Boolean(pendingSend) || Boolean(uncertainPhoto) || imagePreparing;
-  el('image-send').disabled=!writable || busy || ackInFlight || Boolean(pendingSend) || Boolean(uncertainPhoto) || lastState?.reader?.operationBusy===true || imagePreparing;
+  el('attach-image').disabled=!imageContextReady() || Boolean(pendingSend) || Boolean(uncertainPhoto) || imagePreparing;
+  el('image-send').disabled=!imageSendReady();
   const reply=replyDrafts.get(selectedRoom);el('reply-preview').hidden=!reply;
   el('reply-author').textContent=reply?reply.sender+'에게 답장':'';el('reply-text').textContent=reply?.text || '';
   el('reply-cancel').disabled=false;
@@ -112,7 +121,7 @@ async function refreshPendingSend(){
 }
 async function maybeSeen(){
   const room=roomNow(),page=currentPage;
-  if(ackInFlight || busy || settingsBusy || pendingSend || messageQuery || !userSelected || document.hidden || !document.hasFocus() || !nearBottom()
+  if(ackInFlight || busy || settingsBusy || pendingSend || messageQuery || messageViewCovered() || !userSelected || document.hidden || !document.hasFocus() || !nearBottom()
     || !hasAccount || lastState?.reader?.phase!=='connected' || lastState.reader.operationBusy
     || page?.key!==selectedRoom || !page.latestVisible || !page.seenToken || ['loading','failed','unrecognized'].includes(page.history?.phase))return;
   const lastMessage=page.messages?.at(-1)?.key;
@@ -143,7 +152,7 @@ async function flushSelection(){
   pendingSelection=null;
   if(roomsCache.find(room=>room.key===pending.key)?.historyAvailable!==false)await act('/api/reader/history',{room:pending.key});
 }
-function showAccount(show){el('account-panel').hidden=!show;el('account-toggle').setAttribute('aria-expanded',String(show));}
+function showAccount(show){el('account-panel').hidden=!show;el('account-toggle').setAttribute('aria-expanded',String(show));if(!show)requestAnimationFrame(()=>void maybeSeen());}
 function renderChatHeading(){
   const room=roomsCache.find(row=>row.key===selectedRoom);
   el('chat-title').textContent=room?.title || '대화방을 선택해 주세요';
@@ -155,16 +164,19 @@ const labels = { idle:'로그인 준비', checking:'등록 허용 확인', gener
 function render(state) {
   lastState=state;
   const nextAttempt=Number.isInteger(state.reader?.attempts)?state.reader.attempts:null;
-  if(state.credentialInMemory && hasAccount && selectedRoom && userSelected
+  if(state.credentialInMemory && hasAccount && selectedRoom && selectedRoom===reconnectRoom
     && (nextAttempt!==readerAttempt || ['connecting','disconnected'].includes(state.reader?.phase))){reconnectRoom=selectedRoom;drafts.set(selectedRoom,el('compose-text').value);}
   if(!state.credentialInMemory || (nextAttempt!==null && nextAttempt!==readerAttempt)){
     closeMessageMenu();
     if(!state.credentialInMemory)reconnectRoom=null;
     if(hasAccount || nextAttempt!==readerAttempt)readerGeneration++;
+    const staleImageRoom=imageDraft?.room || (imagePreparing?selectedRoom:null);
+    if(staleImageRoom && state.credentialInMemory)sendNotes.set(staleImageRoom,'연결이 바뀌어 사진 선택을 취소했습니다. ＋에서 다시 선택해 주세요.');
+    clearImageDraft();
     selectedRoom=null;roomsCache=[];readerRevision=-1;
     userSelected=false;currentPage=null;
     resetMessageSearch(true);
-    if(!state.credentialInMemory){drafts.clear();replyDrafts.clear();clearImageDraft();sendNotes.clear();pinnedRooms.clear();roomFilter='all';pendingSend=null;uncertainPhoto=null;personalSettings=null;settingsRevision=-1;settingsEpoch++;for(const notice of shownNotifications.values())notice.close();shownNotifications.clear();el('browser-notifications').checked=false;el('persist-preferences').checked=false;el('notification-status').textContent='';el('preferences-status').textContent='';if(el('photo-dialog').open)el('photo-dialog').close();clearTimeout(copyStatusTimer);el('message-action-status').hidden=true;document.title='Web Kakao · 대화';el('compose-text').value='';el('read-sync').checked=false;if(el('rename-dialog').open)el('rename-dialog').close();}
+    if(!state.credentialInMemory){drafts.clear();replyDrafts.clear();sendNotes.clear();pinnedRooms.clear();roomFilter='all';pendingSend=null;uncertainPhoto=null;personalSettings=null;settingsRevision=-1;settingsEpoch++;for(const notice of shownNotifications.values())notice.close();shownNotifications.clear();el('browser-notifications').checked=false;el('persist-preferences').checked=false;el('notification-status').textContent='';el('preferences-status').textContent='';if(el('photo-dialog').open)el('photo-dialog').close();clearTimeout(copyStatusTimer);el('message-action-status').hidden=true;document.title='Web Kakao · 대화';el('compose-text').value='';el('read-sync').checked=false;if(el('rename-dialog').open)el('rename-dialog').close();}
     pendingSelection=null;
     renderedRooms=null;renderedMessages=null;renderedMessageRoom=null;
     el('room-list').replaceChildren();el('message-list').replaceChildren();el('reader-workspace').hidden=true;
@@ -259,7 +271,7 @@ async function selectRoom(key){
   pendingSelection=null;
   if(selectedRoom)drafts.set(selectedRoom,el('compose-text').value);
   if(key!==selectedRoom){if(!pendingSend)clearImageDraft();resetMessageSearch(false);renderedMessages=null;renderedMessageRoom=null;el('message-list').replaceChildren();}
-  selectedRoom=key;userSelected=true;currentPage=null;el('compose-text').value=drafts.get(key) || '';renderRooms();el('history-note').textContent='메시지 표시를 준비하고 있습니다.';
+  selectedRoom=key;reconnectRoom=key;userSelected=true;currentPage=null;el('compose-text').value=drafts.get(key) || '';renderRooms();el('history-note').textContent='메시지 표시를 준비하고 있습니다.';
   renderChatHeading();showAccount(false);
   if(lastState)render(lastState);
   const page=await refreshMessages(key,generation);
@@ -409,13 +421,13 @@ async function refreshReader(state){
   if(!hasAccount || generation!==readerGeneration || epoch!==actionEpoch || state!==lastState)return;
   roomsCache=data.rooms || [];readerRevision=state.reader.revision;
   if(preferenceReady()){pinnedRooms.clear();for(const row of [...roomsCache].filter(row=>Number.isInteger(row.pinOrder)).sort((a,b)=>a.pinOrder-b.pinOrder))pinnedRooms.add(row.key);}
+  if(state.reader.phase==='connected' && reconnectRoom && !roomsCache.some(room=>room.key===reconnectRoom))reconnectRoom=null;
   if(!roomsCache.some(room=>room.key===selectedRoom)){
     const restore=state.reader.phase==='connected' && roomsCache.some(room=>room.key===reconnectRoom)?reconnectRoom:null;
     selectedRoom=restore || roomsCache[0]?.key || null;userSelected=false;currentPage=null;el('compose-text').value=drafts.get(selectedRoom) || '';renderedMessages=null;renderedMessageRoom=null;el('message-list').replaceChildren();el('history-note').textContent='메시지 표시를 준비하고 있습니다.';
-    // Restore only the previously opened room. Fetching it is separate from
-    // acknowledging it: a reconnect must not send a read receipt by itself.
+    // Keep the explicitly opened room as the target across repeated reconnects.
+    // Restoring its history never grants userSelected/read eligibility.
     if(restore)pendingSelection={key:restore,generation};
-    if(state.reader.phase==='connected')reconnectRoom=null;
   }
   el('reader-workspace').hidden=!roomsCache.length;renderRooms();
   renderChatHeading();
@@ -509,21 +521,27 @@ document.addEventListener('pointerdown',event=>{if(messageMenuTarget && !el('mes
 window.addEventListener('resize',()=>closeMessageMenu());
 function clearImageDraft(){imageEpoch++;if(imageDraft?.url)URL.revokeObjectURL(imageDraft.url);imageDraft=null;imagePreparing=false;el('image-preview').removeAttribute('src');el('image-file').value='';if(el('image-send-dialog').open)el('image-send-dialog').close();}
 async function prepareImage(file){
-  if(!file || imagePreparing || pendingSend || el('attach-image').disabled)return;
+  if(!file || imagePreparing || pendingSend || uncertainPhoto || !imageContextReady())return;
   clearImageDraft();const epoch=imageEpoch,key=selectedRoom,generation=readerGeneration;imagePreparing=true;renderComposer();let bitmap;
   try{
     if(!['image/jpeg','image/png','image/webp'].includes(file.type) || file.size>20*1024*1024 || !file.size)throw new Error();
-    bitmap=await createImageBitmap(file);if(bitmap.width*bitmap.height>40000000)throw new Error();
+    bitmap=await createImageBitmap(file);if(epoch!==imageEpoch || !imageContextReady(key,generation))return;if(bitmap.width*bitmap.height>40000000)throw new Error();
     const scale=Math.min(1,4096/Math.max(bitmap.width,bitmap.height)),canvas=document.createElement('canvas');canvas.width=Math.max(1,Math.round(bitmap.width*scale));canvas.height=Math.max(1,Math.round(bitmap.height*scale));canvas.getContext('2d').drawImage(bitmap,0,0,canvas.width,canvas.height);
     const mime=file.type==='image/jpeg'?'image/jpeg':'image/png';const blob=await new Promise(resolve=>canvas.toBlob(resolve,mime,.9));
+    if(epoch!==imageEpoch || !imageContextReady(key,generation))return;
     if(!blob || blob.size>10*1024*1024)throw new Error();
     const image=await new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(reader.result.split(',')[1]);reader.onerror=reject;reader.readAsDataURL(blob);});
-    if(epoch!==imageEpoch || generation!==readerGeneration || !hasAccount || key!==selectedRoom)return;
+    if(epoch!==imageEpoch || !imageContextReady(key,generation))return;
     imageDraft={room:key,generation,image,url:URL.createObjectURL(blob)};el('image-preview').src=imageDraft.url;el('image-recipient').textContent=(roomNow()?.title || '선택한 대화방')+'에 보냅니다.';el('image-send-dialog').showModal();
   }catch{if(epoch===imageEpoch && hasAccount){sendNotes.set(key,'사진을 준비하지 못했습니다. JPEG·PNG·WebP 20MiB 이하 파일을 선택해 주세요. 변환 후에는 10MiB 이하만 보낼 수 있습니다.');}}
   finally{bitmap?.close();if(epoch===imageEpoch){imagePreparing=false;if(!imageDraft)el('image-file').value='';renderComposer();}}
 }
-el('attach-image').addEventListener('click',()=>{if(imageDraft?.room===selectedRoom){el('image-send-dialog').showModal();return;}el('image-file').click();});
+el('attach-image').addEventListener('click',()=>{
+  if(el('attach-image').disabled || !imageContextReady())return;
+  if(imageDraft && imageContextReady(imageDraft.room,imageDraft.generation)){el('image-send-dialog').showModal();renderComposer();return;}
+  if(imageDraft)clearImageDraft();
+  el('image-file').click();
+});
 el('image-file').addEventListener('change',()=>void prepareImage(el('image-file').files[0]));
 el('compose-text').addEventListener('paste',event=>{
   const images=[...(event.clipboardData?.items || [])].filter(item=>item.kind==='file' && item.type.startsWith('image/'));
@@ -532,11 +550,11 @@ el('compose-text').addEventListener('paste',event=>{
   if(el('attach-image').disabled || pendingSend)return;
   const file=images[0].getAsFile();if(file)void prepareImage(file);
 });
-el('image-cancel').addEventListener('click',()=>clearImageDraft());
-el('image-send-dialog').addEventListener('cancel',()=>clearImageDraft());
+el('image-cancel').addEventListener('click',()=>{clearImageDraft();renderComposer();});
+el('image-send-dialog').addEventListener('cancel',()=>{clearImageDraft();renderComposer();});
 el('image-send').addEventListener('click',async()=>{
-  const image=imageDraft,room=roomNow();
-  if(!image || image.room!==selectedRoom || image.generation!==readerGeneration || !hasAccount || pendingSend || uncertainPhoto || busy || ackInFlight || !room?.canSend || lastState?.reader?.phase!=='connected' || lastState.reader.operationBusy)return;
+  const image=imageDraft;
+  if(!imageSendReady(image)){renderComposer();return;}
   const pending={room:image.room,kind:'photo',clientId:crypto.randomUUID(),phase:'sending',focusInput:true};pendingSend=pending;el('image-send-dialog').close();renderComposer();
   try{const accepted=await postLocal('/api/reader/photo',{room:image.room,image:image.image,clientId:pending.clientId});if(pendingSend!==pending || !hasAccount)return;if(!accepted){pendingSend=null;sendNotes.set(image.room,'사진을 보내지 못했습니다. ＋에서 미리보기를 다시 확인할 수 있습니다.');}readerRevision=-1;await refresh();}
   catch{markSendUnknown(pending);}
@@ -571,6 +589,7 @@ el('browser-notifications').addEventListener('change',async()=>{
 });
 el('photo-close').addEventListener('click',()=>el('photo-dialog').close());
 el('photo-dialog').addEventListener('close',()=>el('photo-full').removeAttribute('src'));
+for(const dialog of document.querySelectorAll('dialog'))dialog.addEventListener('close',()=>requestAnimationFrame(()=>void maybeSeen()));
 el('photo-full').addEventListener('error',()=>{el('photo-error').hidden=false;});
 el('new-messages').addEventListener('click',()=>{const scroll=document.querySelector('.chat-scroll');scroll.scrollTop=scroll.scrollHeight;requestAnimationFrame(()=>void maybeSeen());});
 document.querySelector('.chat-scroll').addEventListener('scroll',()=>{closeMessageMenu();renderComposer();void maybeSeen();},{passive:true});

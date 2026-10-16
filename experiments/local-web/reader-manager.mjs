@@ -131,6 +131,10 @@ export function createReadOnlyReader({spawn=fork,now=Date.now,onBlocked=()=>{},g
           }else if(message?.type==='reader-messages' && roomKeyValid(message.key) && rooms.some(row=>row.key===message.key)){
             if(message.source==='history' && (!pending || pending.requestId!==message.requestId || pending.key!==message.key))return;
             if(!['push','history','receipt','sent'].includes(message.source))return;
+            if(message.source==='receipt' && message.receiptInvalidated===true){
+              contexts.delete(message.key);
+              if(pending?.action==='context' && pending.key===message.key)pending.invalidated=true;
+            }
             if(message.source==='push')roomState.receive(message.key,message.arrivals);
             const validHistory=message.unavailable!==true && message.fieldPresent===true && (message.receivedCount===0 || integer(message.acceptedCount)>0);
             const previous=pages.get(message.key);const history=message.source==='history'?{phase:message.unavailable===true?'unavailable':validHistory?'loaded':'unrecognized',hasMore:message.hasMore===true,gap:message.gap===true,receivedCount:integer(message.receivedCount),acceptedCount:integer(message.acceptedCount),rejectedCount:integer(message.rejectedCount),at:now()}:previous?.history ?? {phase:'idle'};
@@ -143,7 +147,10 @@ export function createReadOnlyReader({spawn=fork,now=Date.now,onBlocked=()=>{},g
             if(['send','photo'].includes(kind)){
               const entry=outbox.get(pending.clientId);
               if(entry){entry.phase=['accepted','failed','unknown'].includes(message.phase)?message.phase:'unknown';entry.status=Number.isInteger(message.status)?message.status:null;if(/^m_[a-f0-9]{24}$/.test(message.messageKey))entry.messageKey=message.messageKey;}
-            }else if(kind==='context')contexts.set(message.key,message.phase==='accepted'?'ready':'unavailable');
+            }else if(kind==='context'){
+              if(pending.invalidated)contexts.delete(message.key);
+              else contexts.set(message.key,message.phase==='accepted'?'ready':'unavailable');
+            }
             else if(kind==='read'){
               const accepted=message.phase==='accepted' && message.status===0;
               readStates.set(message.key,{phase:accepted?'accepted':message.phase==='failed'?'failed':'unknown',messageKey:pending.message});

@@ -73,7 +73,7 @@ function text(log) {
 
 // Raw account/server identifiers stay inside the worker. Browser keys are
 // session-scoped opaque handles; data is never serialized to disk or a log.
-export function createReaderStore(body, ownUserId, salt=randomBytes(32),settingsSecret=null) {
+export function createReaderStore(body, ownUserId, salt=randomBytes(32),settingsSecret=null,{onCacheEvicted=()=>{}}={}) {
   const rows=roomArray(body);
   if (!rows) throw new Error('room_list_missing');
   let sourceRoomCount=rows.length;
@@ -91,7 +91,7 @@ export function createReaderStore(body, ownUserId, salt=randomBytes(32),settings
     const seed=seedId?{logId:seedId,chatId:serverRoomId,authorId:serverId(last?.authorId ?? last?.senderId),type:last?.type ?? last?.t,attachment:last?.attachment,msg:text(last),sendAt:timestamp(last?.sendAt ?? last?.createdAt),senderName:clean(last?.senderName ?? last?.authorName,80)}:null;
     const names=new Map();
     if(Array.isArray(row?.i) && Array.isArray(row?.k))for(let n=0;n<Math.min(row.i.length,row.k.length,500);n++){const id=serverId(row.i[n]),name=clean(row.k[n],80);if(id && name)names.set(id,name);}
-    rooms.set(key,{key,serverRoomId,historyEnd,baseline:discovered?'0':historyEnd,seed,names,kind,expectedMembers:Number.isSafeInteger(row.a ?? row.activeMembersCount)?(row.a ?? row.activeMembersCount):null,members:null,watermarks:new Map(),receiptReady:false,
+    rooms.set(key,{key,serverRoomId,historyEnd,baseline:discovered?'0':historyEnd,seed,names,kind,cacheEpoch:0,receiptVersion:0,membershipDirty:false,expectedMembers:Number.isSafeInteger(row.a ?? row.activeMembersCount)?(row.a ?? row.activeMembersCount):null,members:null,watermarks:new Map(),receiptReady:false,
       title:name || `이름 없는 대화방 ${rooms.size+1}`,titleKnown:Boolean(name),preview:text(last).slice(0,160),lastAt:timestamp(last?.sendAt ?? last?.createdAt ?? row?.updatedAt)});
     byServerId.set(serverRoomId,key);
     return key;
@@ -101,7 +101,11 @@ export function createReaderStore(body, ownUserId, salt=randomBytes(32),settings
     const room=rooms.get(key);if(!room)return null;
     const messages=cache.get(key) ?? new Map();
     cache.delete(key);cache.set(key,messages);
-    while(cache.size>CACHE_LIMIT){const removed=cache.keys().next().value;cache.delete(removed);aliasCount-=aliases.get(removed)?.size ?? 0;aliases.delete(removed);}
+    while(cache.size>CACHE_LIMIT){
+      const removed=cache.keys().next().value;cache.delete(removed);aliasCount-=aliases.get(removed)?.size ?? 0;aliases.delete(removed);
+      const evicted=rooms.get(removed);if(evicted)evicted.cacheEpoch++;
+      onCacheEvicted(removed);
+    }
     let roomAliases=aliases.get(key);
     let acceptedCount=0,rejectedCount=0;
     for(const log of logs.slice(0,200)) {
@@ -149,6 +153,8 @@ export function createReaderStore(body, ownUserId, salt=randomBytes(32),settings
     has:key=>rooms.has(key),
     serverRoomId:key=>rooms.get(key)?.serverRoomId,
     historyEnd:key=>rooms.get(key)?.historyEnd,
+    cacheEpoch:key=>rooms.get(key)?.cacheEpoch,
+    receiptVersion:key=>rooms.get(key)?.receiptVersion,
     canSend:key=>rooms.has(key) && rooms.get(key).kind!=='unknown',
     unknownRooms(body){
       if(rooms.size>=ROOM_LIMIT)return [];
@@ -178,22 +184,29 @@ export function createReaderStore(body, ownUserId, salt=randomBytes(32),settings
       return {logId:target[0],mine:target[1].mine,requestedIsOwn:requested[1].mine};
     },
     replyForMessage(key,messageKey){const item=[...(cache.get(key)?.values() ?? [])].find(message=>message.key===messageKey);return item?.canReply?replyExtra(item.replyTarget):null;},
-    receiptSnapshot(key,body){
-      const room=rooms.get(key);if(!room)return false;room.receiptReady=false;
-      if(serverId(body?.c ?? body?.chatId)!==room.serverRoomId)return false;
+    receiptSnapshot(key,body,version){
+      const room=rooms.get(key);if(!room || version!==undefined && version!==room.receiptVersion)return false;room.receiptReady=false;
+      const attached=[body?.c,body?.chatId].filter(value=>value!==undefined);
+      if(!attached.length || attached.some(value=>serverId(value)!==room.serverRoomId))return false;
       const ids=Array.isArray(body.mi)?body.mi:Array.isArray(body.m)?body.m.map(member=>member?.userId):null;
-      if(!ids || ids.length>100 || !Array.isArray(body.a) || !Array.isArray(body.w) || body.a.length!==body.w.length){room.receiptReady=false;return false;}
-      const members=ids.map(serverId);if(members.some(id=>!id) || (room.kind!=='MemoChat' && !members.some(id=>id!==ownUserId))){room.receiptReady=false;return false;}
+      if(!ids || ids.length>100 || !Array.isArray(body.a) || !Array.isArray(body.w) || body.a.length>100 || body.a.length!==body.w.length)return false;
+      const members=ids.map(serverId);if(members.some(id=>!id) || new Set(members).size!==members.length || (room.kind!=='MemoChat' && !members.some(id=>id!==ownUserId)))return false;
+      const memberSet=new Set([...members,ownUserId]);
       const marks=new Map();
-      for(let i=0;i<body.a.length;i++){const id=serverId(body.a[i]),value=watermark(body.w[i]);if(id && value)marks.set(id,value);}
-      room.members=new Set([...members,ownUserId]);room.watermarks=marks;
-      if(room.expectedMembers!==null && room.expectedMembers!==room.members.size){room.receiptReady=false;return false;}
-      room.receiptReady=[...room.members].filter(id=>id!==ownUserId).every(id=>marks.has(id));
-      return room.receiptReady;
+      for(let i=0;i<body.a.length;i++){
+        const id=serverId(body.a[i]),value=watermark(body.w[i]);
+        if(!id || !value || !memberSet.has(id) || marks.has(id))return false;
+        marks.set(id,value);
+      }
+      if(![...memberSet].filter(id=>id!==ownUserId).every(id=>marks.has(id)))return false;
+      if(!room.membershipDirty && room.expectedMembers!==null && room.expectedMembers!==memberSet.size)return false;
+      room.members=memberSet;room.watermarks=marks;room.expectedMembers=memberSet.size;room.membershipDirty=false;room.receiptReady=true;
+      return true;
     },
     invalidateReceipts(body){
       const key=byServerId.get(serverId(body?.chatId ?? body?.c ?? body?.chatLog?.chatId)),room=rooms.get(key);
-      if(!room)return null;room.receiptReady=false;return {key,...view(key)};
+      if(!room)return null;room.receiptReady=false;room.membershipDirty=true;room.receiptVersion++;
+      return {key,...view(key),receiptInvalidated:true};
     },
     readUpdate(body){
       const key=byServerId.get(serverId(body?.chatId ?? body?.c)),room=rooms.get(key);
@@ -208,8 +221,8 @@ export function createReaderStore(body, ownUserId, salt=randomBytes(32),settings
       const original=body?.chatLog ?? body?.log;
       const id=serverId(original?.logId ?? body?.logId);
       if(!id)return null;
-      const attached=serverId(original?.chatId ?? body?.chatId);
-      if(attached && attached!==room.serverRoomId)return null;
+      const attached=[original?.chatId,original?.roomId,original?.c,body?.chatId,body?.roomId,body?.c].filter(value=>value!==undefined);
+      if(attached.some(value=>serverId(value)!==room.serverRoomId))return null;
       const update=this.push({chatId:room.serverRoomId,chatLog:{...original,chatId:room.serverRoomId,logId:id,authorId:ownUserId,type,msg:message,attachment:original?.attachment ?? attachment,sendAt:original?.sendAt ?? body?.sendAt}})[0];
       return update?{...update,messageKey:opaque('m_',room.serverRoomId+':'+id)}:null;
     },

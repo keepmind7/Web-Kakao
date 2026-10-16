@@ -14,8 +14,9 @@ let connected=false,attempts=0,revision=0,historyBusy=false,rejectNextQr=false,a
 const historyRooms=[],historyPhases=new Map(),messagesByRoom=new Map(),qrGrid=[[true]];
 const localTitles=new Map(),unread=new Map(),contexts=new Map(),outcomes=new Map(),seenCalls=[],sendCalls=[];
 const readStates=new Map(),historyGaps=new Map(),latestMissing=new Set();
-let unknownSend=false,unknownPhoto=false;
+let unknownSend=false,unknownPhoto=false,rejectPhoto=false;
 const offlineMessages=new Map();
+const removedRooms=new Set();
 let enableSettings=false;
 const defaultSettings=()=>({persist:false,notifications:false,readSync:false,roomFilter:'all',storageAvailable:true,storageError:false});
 let settings=defaultSettings();const roomSettings=new Map(),notificationQueue=[];
@@ -23,9 +24,9 @@ const photoMessage='m_'+'9'.repeat(24),syntheticPhoto=Buffer.from('R0lGODlhAQABA
 const syntheticPng=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=','base64');
 const makeMessages=room=>Array.from({length:40},(_,i)=>({key:'m_'+(i+1).toString(16).padStart(24,'0'),text:i===0?payload:('모의 메시지 '+(i+1)+' ').repeat(50),sender:'모의 사용자',mine:i%2===0,canReply:true,at:1800000000000+i*1000}));
 const app=createLocalServer({mode:'live',messaging:true,photoFetcher:async()=>({data:syntheticPhoto,type:'image/gif'}),encode:()=>qrGrid,transport:async op=>op==='allowlist'?{httpStatus:200,body:{allowlisted:true}}:op==='generate'?{httpStatus:200,body:{status:0,url:'OFFLINE-NOT-FOR-LOGIN',remainingSeconds:60}}:rejectNextQr?{httpStatus:200,body:{status:-151}}:allowAuth?{httpStatus:200,body:{status:0,user:{userId:'246810'},accessToken:'FAKE_OFFLINE_TOKEN'}}:{httpStatus:200,body:{status:-150,nextRequestIntervalInSeconds:1}},readerFactory:()=>({
-  snapshot:()=>({phase:connected?'connected':attempts?'disconnected':'idle',attempts,canConnect:!connected,roomCount:connected?2:0,revision,historyBusy,pushBatches:0,connectedAt:connected?Date.now():null}),
+  snapshot:()=>({phase:connected?'connected':attempts?'disconnected':'idle',attempts,canConnect:!connected,roomCount:connected?2-removedRooms.size:0,revision,historyBusy,pushBatches:0,connectedAt:connected?Date.now():null}),
   connect(){if(attempts++) {historyPhases.clear();messagesByRoom.clear();contexts.clear();readStates.clear();}connected=true;revision++;return true;},
-  rooms:()=>({revision,rooms:connected?[{key,title:'모의 대화방 A',preview:'예시 미리보기'},{key:second,title:'모의 대화방 B',preview:otherPreview}].map(row=>({...row,baseTitle:row.title,title:localTitles.get(row.key) || row.title,localTitle:localTitles.get(row.key) || null,pinOrder:roomSettings.get(row.key)?.pinOrder ?? null,muted:roomSettings.get(row.key)?.muted===true,canSend:true,kind:'DirectChat',unreadLocalCount:unread.get(row.key) || 0,unreadCoverage:'observed'})):[]}),
+  rooms:()=>({revision,rooms:connected?[{key,title:'모의 대화방 A',preview:'예시 미리보기'},{key:second,title:'모의 대화방 B',preview:otherPreview}].filter(row=>!removedRooms.has(row.key)).map(row=>({...row,baseTitle:row.title,title:localTitles.get(row.key) || row.title,localTitle:localTitles.get(row.key) || null,pinOrder:roomSettings.get(row.key)?.pinOrder ?? null,muted:roomSettings.get(row.key)?.muted===true,canSend:true,kind:'DirectChat',unreadLocalCount:unread.get(row.key) || 0,unreadCoverage:'observed'})):[]}),
   messages:room=>({key:room,messages:messagesByRoom.get(room) || [],latestVisible:!latestMissing.has(room),seenToken:'c'.repeat(48),receiptPhase:contexts.get(room) || 'idle',readSync:readStates.get(room) || {phase:'idle'},outbox:[...outcomes.values()].filter(row=>row.key===room),history:{phase:historyPhases.get(room) || 'idle',gap:historyGaps.get(room)===true,receivedCount:messagesByRoom.get(room)?.length || 0,acceptedCount:messagesByRoom.get(room)?.length || 0}}),
   rename(room,title){if(title===null)localTitles.delete(room);else localTitles.set(room,title);revision++;return true;},
   settingsSnapshot:()=>enableSettings?settings:null,
@@ -37,7 +38,7 @@ const app=createLocalServer({mode:'live',messaging:true,photoFetcher:async()=>({
   openRoom(room){contexts.set(room,'ready');revision++;return true;},
   seen(room,token,notify){seenCalls.push({room,token,notify});if(notify)readStates.set(room,{phase:'accepted',messageKey:messagesByRoom.get(room).at(-1).key});unread.set(room,0);revision++;return true;},
   sendText(room,text,clientId,replyTo){if(outcomes.has(clientId))return true;sendCalls.push({room,text,clientId,replyTo});outcomes.set(clientId,{key:room,clientId,phase:'sending'});revision++;setTimeout(()=>{outcomes.set(clientId,{key:room,clientId,phase:unknownSend?'unknown':'accepted'});if(!unknownSend)messagesByRoom.get(room).push({key:'m_'+(5000+sendCalls.length).toString(16).padStart(24,'0'),text,sender:'나',mine:true,at:1800000100000,unreadCount:1,...(replyTo?{reply:{text:messagesByRoom.get(room).find(row=>row.key===replyTo)?.text,sender:'모의 사용자'}}:{})});revision++;},150).unref();return true;},
-  sendPhoto(room,image,clientId){sendCalls.push({kind:'photo',room,clientId,byteLength:Buffer.from(image,'base64').length});outcomes.set(clientId,{key:room,clientId,phase:unknownPhoto?'unknown':'accepted'});revision++;return true;},
+  sendPhoto(room,image,clientId){if(rejectPhoto)return false;sendCalls.push({kind:'photo',room,clientId,byteLength:Buffer.from(image,'base64').length});outcomes.set(clientId,{key:room,clientId,phase:unknownPhoto?'unknown':'accepted'});revision++;return true;},
   history(room){if(historyBusy)return false;historyRooms.push(room);historyPhases.set(room,'loading');historyBusy=true;revision++;setTimeout(()=>{if(connected){historyPhases.set(room,'loaded');if(!messagesByRoom.has(room))messagesByRoom.set(room,[...makeMessages(room),...(offlineMessages.get(room) || [])]);historyBusy=false;revision++;}},500).unref();return true;},disconnect(){connected=false;revision++;},close(){connected=false;attempts=0;historyBusy=false;historyPhases.clear();messagesByRoom.clear();localTitles.clear();unread.clear();contexts.clear();outcomes.clear();revision++;},
 })});
 app.server.on('request',req=>{if(req.url==='/api/status')statusRequests++;});
@@ -74,6 +75,16 @@ try{
   await until("document.querySelectorAll('.room-item').length===2");
   assert.equal(await evaluate("document.getElementById('title').textContent"),'대화 서버 연결됨');
   assert.equal(await evaluate("getComputedStyle(document.querySelector('.app-shell')).display"),'grid');
+  // An initial default highlight is not an explicitly opened room or read intent.
+  assert.equal(historyRooms.length,0);assert.equal(await evaluate('!userSelected && reconnectRoom===null'),true);
+  for(let i=0;i<2;i++){
+    const defaultSeen=seenCalls.length,defaultSends=sendCalls.length;
+    await evaluate("document.getElementById('reader-disconnect').click()");await until("lastState.reader.phase==='disconnected' && !busy");
+    await evaluate("document.getElementById('reader-connect').click()");
+    await until("lastState.reader.phase==='connected' && document.querySelectorAll('.room-item').length===2 && !refreshing && !busy");
+    assert.equal(await evaluate('!userSelected && reconnectRoom===null && currentPage.messages.length===0'),true);
+    assert.equal(historyRooms.length,0);assert.equal(seenCalls.length,defaultSeen);assert.equal(sendCalls.length,defaultSends);
+  }
   await evaluate("document.getElementById('room-search').value='대화방 B';document.getElementById('room-search').dispatchEvent(new Event('input'))");
   assert.equal(await evaluate("document.querySelectorAll('.room-item').length"),1);
   await evaluate("document.getElementById('room-search').value='';document.getElementById('room-search').dispatchEvent(new Event('input'))");
@@ -198,6 +209,26 @@ try{
   const readsAfterAck=seenCalls.filter(row=>row.notify).length;
   await refreshUi();await refreshUi();assert.equal(seenCalls.filter(row=>row.notify).length,readsAfterAck);
   historyGaps.delete(key);revision++;
+  // Every modal and the account overlay blocks both local seen and remote read.
+  // Closing restores the ordinary foreground/latest eligibility without sends.
+  let coveredSequence=0;
+  for(const target of ['photo-dialog','rename-dialog','image-send-dialog','account-panel']){
+    for(const notify of [false,true]){
+      await until('!busy && !refreshing && !ackInFlight');
+      await evaluate(`(()=>{document.getElementById('read-sync').checked=${notify};const target=document.getElementById('${target}');if('${target}'==='account-panel')showAccount(true);else target.showModal();})()`);
+      const beforeCovered=seenCalls.length,beforeCoveredSend=sendCalls.length;
+      const newKey='m_'+(6000+coveredSequence++).toString(16).padStart(24,'0');
+      messagesByRoom.get(key).push({key:newKey,text:'모달 뒤 합성 새 메시지',sender:'모의 사용자',mine:false,at:1800000080000+coveredSequence});unread.set(key,1);revision++;
+      await refreshUi();await refreshUi();await sleep(150);
+      assert.equal(seenCalls.length,beforeCovered,`${target} readSync=${notify} must block seen`);
+      assert.equal(unread.get(key),1);assert.equal(sendCalls.length,beforeCoveredSend);
+      await evaluate(`document.getElementById('${target==='account-panel'?'account-close':target}').${target==='account-panel'?'click()':'close()'}`);
+      await refreshUi();
+      const resumeDeadline=Date.now()+4000;while(seenCalls.length===beforeCovered){if(Date.now()>resumeDeadline)throw new Error('read did not resume after '+target);await sleep(50);}
+      assert.equal(seenCalls.length,beforeCovered+1);assert.equal(seenCalls.at(-1).notify,notify);assert.equal(unread.get(key),0);assert.equal(sendCalls.length,beforeCoveredSend);
+    }
+  }
+  await refreshUi();
   await evaluate("document.getElementById('compose-text').focus();document.getElementById('compose-text').value='한글 모의 전송';document.getElementById('compose-text').dispatchEvent(new Event('input'));document.getElementById('compose-text').dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',isComposing:true,bubbles:true,cancelable:true}))");
   assert.equal(sendCalls.length,0);
   await until("!document.getElementById('send-message').disabled");
@@ -261,11 +292,46 @@ try{
   await evaluate("globalThis.confirm=()=>true;document.getElementById('send-reset').click()");
   assert.equal(await evaluate("uncertainPhoto===null && imageDraft===null && document.getElementById('send-reset').hidden && !document.getElementById('attach-image').disabled"),true);
   unknownPhoto=false;
+  // A failed local enqueue retains a draft. Reconnect must invalidate its scope.
+  await until('!busy && !refreshing && !ackInFlight && !document.getElementById("attach-image").disabled');
+  rejectPhoto=true;
+  await evaluate(`prepareImage(new File([Uint8Array.from(atob('${syntheticPng.toString('base64')}'),c=>c.charCodeAt(0))],'synthetic-rejected.png',{type:'image/png'}))`);
+  await until("document.getElementById('image-send-dialog').open && !document.getElementById('image-send').disabled");
+  const beforeDraftReconnectPhotos=sendCalls.filter(row=>row.kind==='photo').length;
+  await evaluate("globalThis.rejectedDraftGeneration=imageDraft.generation;document.getElementById('image-send').click()");
+  await until("pendingSend===null && imageDraft!==null && !document.getElementById('image-send-dialog').open && !busy && !refreshing && !ackInFlight");
+  rejectPhoto=false;
+  const beforeDraftReconnectSeen=seenCalls.length;
+  await evaluate("document.getElementById('reader-disconnect').click()");await until("lastState.reader.phase==='disconnected' && !busy");
+  await evaluate("document.getElementById('reader-connect').click()");
+  await until("lastState.reader.phase==='connected' && currentPage?.key===selectedRoom && currentPage.messages.length===40 && !busy && !refreshing && !ackInFlight");
+  assert.equal(await evaluate("readerGeneration>globalThis.rejectedDraftGeneration && imageDraft===null && !document.getElementById('image-preview').hasAttribute('src') && document.getElementById('image-send').disabled"),true);
+  assert.equal(await evaluate('!userSelected && reconnectRoom===selectedRoom'),true);assert.equal(seenCalls.length,beforeDraftReconnectSeen);
+  await evaluate("globalThis.pickerCalls=0;globalThis.originalPickerClick=document.getElementById('image-file').click;document.getElementById('image-file').click=()=>{globalThis.pickerCalls++;};document.getElementById('attach-image').click()");
+  assert.equal(await evaluate("globalThis.pickerCalls===1 && !document.getElementById('image-send-dialog').open"),true);
+  await evaluate("document.getElementById('image-file').click=globalThis.originalPickerClick");
+  assert.equal(sendCalls.filter(row=>row.kind==='photo').length,beforeDraftReconnectPhotos);
+  // Hold bitmap decoding across another reconnect. Old work must close cleanly.
+  await evaluate("globalThis.originalBitmapDecoder=createImageBitmap;globalThis.heldBitmap=null;globalThis.releaseBitmap=null;globalThis.createImageBitmap=async file=>{const bitmap=await globalThis.originalBitmapDecoder(file);globalThis.heldBitmap=bitmap;await new Promise(resolve=>{globalThis.releaseBitmap=resolve;});return bitmap;}");
+  await evaluate(`void prepareImage(new File([Uint8Array.from(atob('${syntheticPng.toString('base64')}'),c=>c.charCodeAt(0))],'synthetic-delayed.png',{type:'image/png'}))`);
+  await until("imagePreparing && typeof globalThis.releaseBitmap==='function'");
+  await evaluate("document.getElementById('reader-disconnect').click()");await until("lastState.reader.phase==='disconnected' && !busy");
+  await evaluate("document.getElementById('reader-connect').click()");
+  await until("lastState.reader.phase==='connected' && currentPage?.messages?.length===40 && !busy && !refreshing && !ackInFlight");
+  assert.equal(await evaluate('!userSelected && reconnectRoom===selectedRoom'),true);assert.equal(seenCalls.length,beforeDraftReconnectSeen);
+  await evaluate("globalThis.releaseBitmap();globalThis.createImageBitmap=globalThis.originalBitmapDecoder");
+  await until("globalThis.heldBitmap.width===0 && !imagePreparing");
+  assert.equal(await evaluate("imageDraft===null && !document.getElementById('image-send-dialog').open && document.getElementById('image-send').disabled"),true);
+  assert.equal(sendCalls.filter(row=>row.kind==='photo').length,beforeDraftReconnectPhotos);
+  await evaluate(`prepareImage(new File([Uint8Array.from(atob('${syntheticPng.toString('base64')}'),c=>c.charCodeAt(0))],'synthetic-fresh.png',{type:'image/png'}))`);
+  await until("document.getElementById('image-send-dialog').open && !document.getElementById('image-send').disabled");
+  assert.equal(await evaluate('imageDraft.generation===readerGeneration'),true);
+  await evaluate("document.getElementById('image-cancel').click()");assert.equal(await evaluate("imageDraft===null && document.getElementById('image-send').disabled"),true);
   await evaluate("document.getElementById('compose-text').value='';document.getElementById('compose-text').dispatchEvent(new Event('input'))");
   messagesByRoom.get(key).push({key:photoMessage,text:'[사진]',sender:'모의 사용자',mine:false,at:1800000300000,photos:[{src:`/api/photo?room=${key}&message=${photoMessage}&index=0`,width:1,height:1}]});revision++;await refreshUi();
   await until("document.querySelector('.photo-open img')?.naturalWidth===1");
   await evaluate("document.querySelector('.photo-open').click()");await until("document.getElementById('photo-dialog').open && document.getElementById('photo-full').naturalWidth===1");
-  await evaluate("document.getElementById('photo-close').click()");assert.equal(await evaluate("!document.getElementById('photo-dialog').open && !document.getElementById('photo-full').hasAttribute('src')"),true);
+  await evaluate("document.getElementById('photo-close').click()");await until("!document.getElementById('photo-dialog').open && !document.getElementById('photo-full').hasAttribute('src')");
   const image=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true});writeFileSync(resolve(folder,'synthetic-reader.png'),Buffer.from(image.data,'base64'));
   await call('Emulation.setDeviceMetricsOverride',{width:580,height:900,deviceScaleFactor:1,mobile:false});
   await evaluate("document.querySelectorAll('#message-list article.mine').item(document.querySelectorAll('#message-list article.mine').length-1).scrollIntoView({block:'center'})");await sleep(200);
@@ -289,6 +355,25 @@ try{
   assert.equal(await evaluate("document.getElementById('compose-text').value"),'재접속 초안');
   assert.equal(await evaluate("document.getElementById('pin-room').getAttribute('aria-pressed')==='true' && document.querySelector('.room-item strong').textContent.startsWith('모의 대화방 B')"),true);
   await refreshUi();assert.equal(historyRooms.length,beforeReconnectHistory+1);assert.equal(seenCalls.length,beforeReconnectSeen);
+  assert.equal(await evaluate('reconnectRoom===selectedRoom && !userSelected'),true);
+  const repeatHistory=historyRooms.length,repeatSeen=seenCalls.length,repeatSends=sendCalls.length;
+  await evaluate("document.getElementById('reader-disconnect').click()");await until("lastState.reader.phase==='disconnected' && !busy");
+  await evaluate("document.getElementById('reader-connect').click()");
+  await until("document.getElementById('chat-title').textContent==='모의 대화방 B' && document.getElementById('message-list').textContent.includes('offline-C') && !refreshing");
+  assert.deepEqual(historyRooms.slice(repeatHistory),[second]);assert.equal(seenCalls.length,repeatSeen);assert.equal(sendCalls.length,repeatSends);
+  assert.equal(await evaluate('!userSelected && reconnectRoom===selectedRoom'),true);
+  // A removed explicit target is cleared; neither the fallback nor its return
+  // silently becomes a target. A later real room click may select it again.
+  removedRooms.add(second);revision++;await refreshUi();
+  assert.equal(await evaluate('reconnectRoom===null && !userSelected && document.querySelectorAll(".room-item").length===1'),true);
+  const missingHistory=historyRooms.length,missingSeen=seenCalls.length,missingSends=sendCalls.length;
+  await evaluate("document.getElementById('reader-disconnect').click()");await until("lastState.reader.phase==='disconnected' && !busy");
+  await evaluate("document.getElementById('reader-connect').click()");
+  await until("lastState.reader.phase==='connected' && document.querySelectorAll('.room-item').length===1 && !refreshing && !busy");
+  assert.equal(historyRooms.length,missingHistory);assert.equal(seenCalls.length,missingSeen);assert.equal(sendCalls.length,missingSends);
+  removedRooms.delete(second);revision++;await refreshUi();assert.equal(await evaluate('reconnectRoom===null && !userSelected'),true);
+  await evaluate("[...document.querySelectorAll('.room-item')].find(node=>node.querySelector('strong').textContent.startsWith('모의 대화방 B')).click()");
+  await until("document.getElementById('chat-title').textContent==='모의 대화방 B' && currentPage?.messages?.length===43 && !refreshing && !busy");
   enableSettings=true;revision++;
   await evaluate("globalThis.notifications=[];globalThis.permissionRequests=0;globalThis.Notification=class{static permission='default';static async requestPermission(){globalThis.permissionRequests++;this.permission='granted';return this.permission;}get silent(){return this.options.silent;}constructor(title,options){this.title=title;this.options=options;this.closed=false;globalThis.notifications.push(this);}close(){this.closed=true;}};");
   await refreshUi();assert.equal(await evaluate('globalThis.permissionRequests'),0);
@@ -312,13 +397,18 @@ try{
   await evaluate("document.getElementById('cancel').click()");await until("document.getElementById('reader-panel').hidden && document.getElementById('message-list').childElementCount===0");
   assert.equal(await evaluate("document.getElementById('chat-title').textContent"),'대화방을 선택해 주세요');
   assert.equal(await evaluate("pinnedRooms.size===0 && roomFilter==='all' && messageQuery==='' && document.getElementById('message-search-bar').hidden && document.getElementById('message-action-status').hidden"),true);
+  assert.equal(await evaluate('reconnectRoom===null && selectedRoom===null && !userSelected && imageDraft===null && !imagePreparing'),true);
   rejectNextQr=true;
   await until("!document.getElementById('start').disabled");await evaluate("document.getElementById('start').click()");
   await until("document.getElementById('diagnostic').textContent.includes('-151')");
   assert.equal(await evaluate("document.getElementById('message').textContent.includes('지원하지 않는 인증 응답')"),true);
   assert.equal(await evaluate("document.getElementById('reader-status').textContent"),'인증이 완료되지 않았습니다.');
   assert.equal(await evaluate("document.getElementById('start').disabled && document.getElementById('qr').hidden"),true);
-  console.log(JSON.stringify({passed:true,scope:'synthetic offline browser only',checks:['QR caching','room selection queue','DOM and scroll retention','hidden polling','text-only rendering','unread badge and total','local rename and reset','receipt count disappears on read','hidden/unfocused/scrolled room is not acknowledged','visible latest message acknowledgement','optional server read sync','IME Enter does not send','double-click sends once','unknown send preserves draft without retry','room pin ordering and filters retain selection and drafts','literal message search and result navigation','search does not acknowledge incoming messages','clipboard success and denial without OS clipboard access','pins survive transport reconnect and clear on account close','reconnect restores selected room and draft','offline messages fetched once without load button or read notification','cancel purges account data','QR -151 neutral message'],visibleRequests,hiddenRequests,screenshot:folder+'/synthetic-reader.png',actualAccountUsed:false}));
+  console.log(JSON.stringify({passed:true,scope:'synthetic offline browser only',checks:['QR caching','room selection queue','DOM and scroll retention','hidden polling','text-only rendering','unread badge and total','local rename and reset','receipt count disappears on read','hidden/unfocused/scrolled room is not acknowledged','visible latest message acknowledgement','optional server read sync','IME Enter does not send','double-click sends once','unknown send preserves draft without retry','room pin ordering and filters retain selection and drafts','literal message search and result navigation','search does not acknowledge incoming messages','clipboard success and denial without OS clipboard access','pins survive transport reconnect and clear on account close','reconnect restores selected room and draft','offline messages fetched once without load button or read notification','cancel purges account data','QR -151 neutral message','all dialogs and account overlay block read and closing resumes eligible read','rejected photo draft is invalidated on reconnect','in-flight image preparation is canceled on reconnect and fresh selection remains usable','default automatic room does not become a reconnect target','changed and removed room targets stay isolated across reconnects','account close clears reconnect intent'],visibleRequests,hiddenRequests,screenshot:folder+'/synthetic-reader.png',actualAccountUsed:false}));
 }finally{
-  ws?.close();browser?.kill();app.lab.cancel();app.server.close();app.server.closeAllConnections();
+  ws?.close();
+  let chromeExitObserved=Boolean(browser && (browser.exitCode!==null || browser.signalCode!==null));
+  if(browser && !chromeExitObserved){const exited=new Promise(resolve=>browser.once('exit',()=>{chromeExitObserved=true;resolve();}));browser.kill();await Promise.race([exited,sleep(3000)]);}
+  app.lab.cancel();app.server.closeAllConnections();await new Promise(resolve=>app.server.close(resolve));
+  writeFileSync(resolve(folder,'synthetic-cleanup.json'),JSON.stringify({actualAccountUsed:false,chromePid:browser?.pid ?? null,chromeExitObserved,chromeExitCode:browser?.exitCode ?? null,chromeSignalCode:browser?.signalCode ?? null,serverListening:app.server.listening,profile:resolve(folder,'profile')}));
 }
