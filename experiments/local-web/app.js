@@ -12,6 +12,36 @@ let personalSettings=null,settingsRevision=-1,settingsBusy=false,settingsEpoch=0
 const shownNotifications=new Map();
 const replyDrafts=new Map();let imageDraft=null,imagePreparing=false,imageEpoch=0;
 let messageMenuTarget=null,messageMenuTimer=null;
+let freshness='checking',resumeEpoch=0,localFailureVersion=0,messageRequestId=0;
+let refreshPending=false,queuedRefreshTimer=null,pollTimer=null,lastPollAt=Date.now(),wasHidden=document.hidden;
+function requestStamp(){return {generation:readerGeneration,action:actionEpoch,resume:resumeEpoch};}
+function stampCurrent(stamp){return stamp.generation===readerGeneration && stamp.action===actionEpoch && stamp.resume===resumeEpoch;}
+function staleResult(){const error=new Error('Stale local response');error.name='StaleLocalResult';return error;}
+function unavailable(){localFailureVersion++;freshness='unavailable';readerRevision=-1;renderComposer();}
+function requestDeadline(path){
+  if(path==='/api/reader/photo')return 80000;
+  if(['/api/reader/history','/api/reader/connect','/api/reader/send','/api/room-probe'].includes(path))return 30000;
+  return 12000;
+}
+async function localRequest(path,options={},bodyType='json',isCurrent=()=>true){
+  const stamp=requestStamp(),controller=new AbortController();let timer;
+  // Abort alone does not release a lock when a transport/body reader ignores it.
+  // Race covers both response headers and the complete response body.
+  const deadline=new Promise((resolve,reject)=>{timer=setTimeout(()=>{const error=new Error('Local request timed out');error.name='TimeoutError';controller.abort();reject(error);},requestDeadline(path));});
+  try{const result=await Promise.race([(async()=>{const response=await fetch(path,{cache:'no-store',...options,signal:controller.signal});const data=bodyType==='text'?await response.text():await response.json();return {response,data};})(),deadline]);if(!stampCurrent(stamp) || !isCurrent())throw staleResult();return result;}
+  catch(error){if(!stampCurrent(stamp) || !isCurrent())throw staleResult();if(error.name!=='StaleLocalResult')unavailable();throw error;}
+  finally{clearTimeout(timer);}
+}
+function scheduleQueuedRefresh(){
+  if(!refreshPending || busy || refreshing || queuedRefreshTimer!==null)return;
+  queuedRefreshTimer=setTimeout(()=>{queuedRefreshTimer=null;void refresh();},0);
+}
+function queueRefresh(resume=false){
+  const now=Date.now(),gap=now-lastPollAt;lastPollAt=now;
+  if(gap>=30000 || gap<0)resume=true;
+  if(resume){resumeEpoch++;userSelected=false;freshness='checking';readerRevision=-1;closeMessageMenu();renderComposer();}
+  refreshPending=true;scheduleQueuedRefresh();
+}
 function closeMessageMenu(restoreFocus=false){
   clearTimeout(messageMenuTimer);messageMenuTimer=null;
   const previous=messageMenuTarget;messageMenuTarget=null;el('message-menu').hidden=true;
@@ -45,7 +75,7 @@ function roomNow(){return roomsCache.find(room=>room.key===selectedRoom);}
 function nearBottom(){const scroll=document.querySelector('.chat-scroll');return scroll.scrollHeight-scroll.clientHeight-scroll.scrollTop<=48;}
 function messageViewCovered(){return !el('account-panel').hidden || Boolean(document.querySelector('dialog[open]'));}
 function imageContextReady(room=selectedRoom,generation=readerGeneration){
-  return hasAccount && generation===readerGeneration && room===selectedRoom && roomNow()?.canSend===true
+  return freshness==='fresh' && hasAccount && generation===readerGeneration && room===selectedRoom && roomNow()?.canSend===true
     && lastState?.messaging===true && lastState?.build>=6 && lastState?.reader?.phase==='connected';
 }
 function imageSendReady(image=imageDraft){
@@ -54,12 +84,12 @@ function imageSendReady(image=imageDraft){
 }
 async function postLocal(path,body){
   if(!csrf)return false;
-  const response=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify(body)});
-  if(!response.ok)return false;
-  await response.json();return true;
+  const {response}=await localRequest(path,{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify(body)});
+  if(!response.ok){unavailable();return false;}
+  return true;
 }
 function renderComposer(){
-  const room=roomNow(),ready=hasAccount && lastState?.reader?.phase==='connected';
+  const room=roomNow(),ready=freshness==='fresh' && hasAccount && lastState?.reader?.phase==='connected';
   const writable=ready && lastState?.messaging===true && room?.canSend===true;
   el('rename-room').disabled=!hasAccount || !room;
   el('pin-room').disabled=!hasAccount || !room || settingsBusy;
@@ -81,7 +111,7 @@ function renderComposer(){
   el('reply-cancel').disabled=false;
   el('send-message').disabled=!writable || busy || ackInFlight || Boolean(pendingSend) || lastState?.reader?.operationBusy===true || !el('compose-text').value.trim();
   el('send-status').textContent=pendingSend?.phase==='unknown'?(pendingSend.kind==='photo'?'사진 전송 결과를 확인할 수 없습니다. 휴대폰에서 도착 여부를 확인해 주세요.':'전송 결과를 확인할 수 없습니다. 대화에서 도착 여부를 확인해 주세요.')
-    :pendingSend?(pendingSend.kind==='photo'?'사진을 보내고 있습니다…':'메시지를 보내고 있습니다…'):uncertainPhoto?'사진 전송 결과는 미확인입니다. 텍스트와 답장은 계속 보낼 수 있습니다.':sendNotes.get(selectedRoom) || (!ready?'계정을 연결하고 대화방을 선택해 주세요.':!writable?'이 방은 현재 읽기 전용입니다.':'');
+    :pendingSend?(pendingSend.kind==='photo'?'사진을 보내고 있습니다…':'메시지를 보내고 있습니다…'):freshness!=='fresh'?(freshness==='checking'?'연결 상태를 확인하고 있습니다…':'로컬 서버 연결을 확인해 주세요. 입력한 내용은 유지됩니다.'):uncertainPhoto?'사진 전송 결과는 미확인입니다. 텍스트와 답장은 계속 보낼 수 있습니다.':sendNotes.get(selectedRoom) || (!ready?'계정을 연결하고 대화방을 선택해 주세요.':!writable?'이 방은 현재 읽기 전용입니다.':'');
   el('send-reset').hidden=pendingSend?.phase!=='unknown' && !uncertainPhoto;
   el('send-reset').textContent=pendingSend?.phase==='unknown'?'전송 결과를 확인했어요':'사진 도착 여부를 확인했어요';
   const count=room?.unreadLocalCount || 0;
@@ -95,10 +125,11 @@ function markSendUnknown(pending){
 }
 async function refreshPendingSend(){
   if(!pendingSend || !hasAccount)return;
-  const pending=pendingSend;
+  const pending=pendingSend,stamp=requestStamp();
   try{
-    const page=await localJson('/api/reader/messages?room='+encodeURIComponent(pending.room));
-    if(pendingSend!==pending || !hasAccount)return;
+    const page=await localJson('/api/reader/messages?room='+encodeURIComponent(pending.room),()=>pendingSend===pending);
+    if(pendingSend!==pending || !hasAccount || !stampCurrent(stamp))return;
+    if(page?.key!==pending.room){unavailable();return;}
     const outcome=page.outbox?.find(entry=>entry.clientId===pending.clientId);
     if(!outcome || outcome.phase==='sending')return;
     if(outcome.phase==='unknown'){markSendUnknown(pending);return;}
@@ -121,7 +152,7 @@ async function refreshPendingSend(){
 }
 async function maybeSeen(){
   const room=roomNow(),page=currentPage;
-  if(ackInFlight || busy || settingsBusy || pendingSend || messageQuery || messageViewCovered() || !userSelected || document.hidden || !document.hasFocus() || !nearBottom()
+  if(freshness!=='fresh' || ackInFlight || busy || settingsBusy || pendingSend || messageQuery || messageViewCovered() || !userSelected || document.hidden || !document.hasFocus() || !nearBottom()
     || !hasAccount || lastState?.reader?.phase!=='connected' || lastState.reader.operationBusy
     || page?.key!==selectedRoom || !page.latestVisible || !page.seenToken || ['loading','failed','unrecognized'].includes(page.history?.phase))return;
   const lastMessage=page.messages?.at(-1)?.key;
@@ -131,16 +162,16 @@ async function maybeSeen(){
   const submitted=page.readSync?.messageKey===lastMessage && ['sending','accepted','unknown','failed'].includes(page.readSync.phase);
   const notify=lastState.messaging===true && room?.canSend===true && el('read-sync').checked && !submitted;
   if(!notify && !room?.unreadLocalCount)return;
-  const key=selectedRoom,generation=readerGeneration;ackInFlight=true;renderComposer();
-  try{if(await postLocal('/api/reader/seen',{room:key,token:page.seenToken,notify}) && generation===readerGeneration)readerRevision=-1;}
+  const key=selectedRoom,stamp=requestStamp();ackInFlight=true;renderComposer();
+  try{if(await postLocal('/api/reader/seen',{room:key,token:page.seenToken,notify}) && stampCurrent(stamp) && key===selectedRoom)readerRevision=-1;}
   catch{/* A failed local acknowledgement must not erase the badge. */}
   finally{ackInFlight=false;renderComposer();}
 }
 async function advanceRoom(){
-  if(ackInFlight || busy || pendingSend || !userSelected || !hasAccount || lastState?.reader?.phase!=='connected' || lastState.reader.operationBusy)return;
+  if(freshness!=='fresh' || ackInFlight || busy || pendingSend || !userSelected || !hasAccount || lastState?.reader?.phase!=='connected' || lastState.reader.operationBusy)return;
   if(lastState.messaging===true && roomNow()?.canSend && currentPage?.key===selectedRoom && currentPage.messages?.length && currentPage.receiptPhase==='idle' && currentPage.history?.phase!=='loading'){
-    ackInFlight=true;renderComposer();
-    try{if(await postLocal('/api/reader/context',{room:selectedRoom}))readerRevision=-1;}finally{ackInFlight=false;renderComposer();}
+    const key=selectedRoom,stamp=requestStamp();ackInFlight=true;renderComposer();
+    try{if(await postLocal('/api/reader/context',{room:key}) && stampCurrent(stamp) && key===selectedRoom)readerRevision=-1;}finally{ackInFlight=false;renderComposer();}
     return;
   }
   await maybeSeen();
@@ -149,6 +180,12 @@ async function flushSelection(){
   const pending=pendingSelection;
   if(!pending || busy || lastState?.reader?.historyBusy || lastState?.reader?.operationBusy)return;
   if(!hasAccount || pending.generation!==readerGeneration || pending.key!==selectedRoom || lastState?.reader?.phase!=='connected'){pendingSelection=null;return;}
+  // Explicit selection waits for the newest accepted page, which may come from
+  // polling instead of its own GET. Reconnect intents still force one catch-up.
+  if(pending.awaitingPage){
+    if(currentPage?.key!==pending.key || !currentPage.history?.phase)return;
+    if(currentPage.history.phase!=='idle'){pendingSelection=null;return;}
+  }
   pendingSelection=null;
   if(roomsCache.find(room=>room.key===pending.key)?.historyAvailable!==false)await act('/api/reader/history',{room:pending.key});
 }
@@ -236,7 +273,12 @@ function render(state) {
   el('history-load').disabled=busy || !selectedRoom || roomsCache.find(room=>room.key===selectedRoom)?.historyAvailable===false || reader?.phase!=='connected' || reader?.historyBusy===true;
   renderComposer();
 }
-async function localJson(path){const response=await fetch(path,{cache:'no-store'});if(!response.ok)throw new Error();return response.json();}
+async function localJson(path,isCurrent=()=>true){
+  const stamp=requestStamp(),{response,data}=await localRequest(path,{},'json',isCurrent);
+  if(!stampCurrent(stamp))throw staleResult();
+  if(!response.ok){unavailable();throw new Error('Local request rejected');}
+  return data;
+}
 const time=value=>value ? new Date(value).toLocaleTimeString('ko-KR',{hour:'2-digit',minute:'2-digit'}) : '';
 function renderRooms(){
   const query=el('room-search').value.trim().toLocaleLowerCase();
@@ -266,25 +308,26 @@ function renderRooms(){
 }
 async function selectRoom(key){
   closeMessageMenu();
-  const generation=readerGeneration;
+  const generation=readerGeneration,stamp=requestStamp();
   if(key===selectedRoom && pendingSelection?.key===key)return;
-  pendingSelection=null;
+  const intent={key,generation,awaitingPage:true};pendingSelection=intent;
   if(selectedRoom)drafts.set(selectedRoom,el('compose-text').value);
   if(key!==selectedRoom){if(!pendingSend)clearImageDraft();resetMessageSearch(false);renderedMessages=null;renderedMessageRoom=null;el('message-list').replaceChildren();}
   selectedRoom=key;reconnectRoom=key;userSelected=true;currentPage=null;el('compose-text').value=drafts.get(key) || '';renderRooms();el('history-note').textContent='메시지 표시를 준비하고 있습니다.';
   renderChatHeading();showAccount(false);
   if(lastState)render(lastState);
-  const page=await refreshMessages(key,generation);
-  if(!hasAccount || generation!==readerGeneration || key!==selectedRoom)return;
+  await refreshMessages(key,generation);
+  if(!hasAccount || !stampCurrent(stamp) || key!==selectedRoom || pendingSelection!==intent)return;
   // Live pushes already update cached rooms. Selecting a loaded room is local;
   // the explicit load button remains available for another server page.
-  if(page?.history?.phase==='idle')pendingSelection={key,generation};
   await flushSelection();
 }
 async function refreshMessages(key,generation){
+  const stamp=requestStamp(),request=++messageRequestId;
   try{
-    const page=await localJson('/api/reader/messages?room='+encodeURIComponent(key));
-    if(!hasAccount || generation!==readerGeneration || key!==selectedRoom)return;
+    const page=await localJson('/api/reader/messages?room='+encodeURIComponent(key),()=>hasAccount && generation===readerGeneration && request===messageRequestId && key===selectedRoom);
+    if(!hasAccount || generation!==readerGeneration || !stampCurrent(stamp) || request!==messageRequestId || key!==selectedRoom)return;
+    if(page?.key!==key){unavailable();return;}
     currentPage=page;
     const history=page.history || {};
     el('history-note').textContent=history.phase==='loaded' ? (history.gap?'이전 대화 일부를 불러오지 못했습니다.':'')
@@ -330,7 +373,7 @@ async function refreshMessages(key,generation){
     if(page.messages?.length)scroll.scrollTop=messageQuery?(changedRoom?0:top):changedRoom || atBottom?scroll.scrollHeight:top;
     updateMessageSearch();
     return page;
-  }catch{if(key===selectedRoom && generation===readerGeneration){el('history-note').hidden=false;el('history-note').textContent='메시지를 표시할 수 없습니다. 연결 상태를 확인해 주세요.';}}
+  }catch(error){if(error.name!=='StaleLocalResult' && key===selectedRoom && stampCurrent(stamp) && request===messageRequestId){el('history-note').hidden=false;el('history-note').textContent='메시지를 표시할 수 없습니다. 연결 상태를 확인해 주세요.';}}
 }
 function resetMessageSearch(close){
   messageQuery='';searchMatches=[];searchIndex=-1;el('message-search').value='';
@@ -376,7 +419,7 @@ async function refreshSettings(state){
   if(!hasAccount || !state.preferences || settingsBusy || settingsRevision===state.reader?.revision)return;
   const generation=readerGeneration,epoch=settingsEpoch;
   try{
-    const data=await localJson('/api/preferences');if(!hasAccount || generation!==readerGeneration || epoch!==settingsEpoch)return;
+    const data=await localJson('/api/preferences',()=>hasAccount && epoch===settingsEpoch && state===lastState);if(!hasAccount || generation!==readerGeneration || epoch!==settingsEpoch || state!==lastState)return;
     personalSettings=data.settings;settingsRevision=state.reader?.revision;
     if(!personalSettings)return;
     roomFilter=personalSettings.roomFilter;el('read-sync').checked=personalSettings.readSync;
@@ -384,14 +427,14 @@ async function refreshSettings(state){
     el('preferences-status').textContent=personalSettings.storageError?'개인 설정을 읽거나 저장하지 못했습니다.':personalSettings.persist?'이 노트북에 개인 설정을 저장합니다.':'현재 계정 연결 동안 설정을 유지합니다.';
     el('notification-status').textContent=!('Notification' in window) || !('silent' in Notification.prototype)?'이 브라우저는 무음 알림을 지원하지 않습니다.':personalSettings.notifications && Notification.permission!=='granted'?'브라우저 사이트 설정에서 알림을 허용해 주세요.':personalSettings.notifications?'웹이 열려 있는 동안 본문 없이 무음으로 알립니다.':'';
     if(!personalSettings.notifications){for(const notice of shownNotifications.values())notice.close();shownNotifications.clear();}
-  }catch{el('preferences-status').textContent='개인 설정을 불러오지 못했습니다.';}
+  }catch(error){if(error.name!=='StaleLocalResult' && hasAccount && generation===readerGeneration && epoch===settingsEpoch)el('preferences-status').textContent='개인 설정을 불러오지 못했습니다.';}
 }
 async function changeSettings(path,body){
   if(!preferenceReady() || settingsBusy)return false;
-  const generation=readerGeneration;settingsBusy=true;settingsEpoch++;renderComposer();
+  const generation=readerGeneration,stamp=requestStamp();settingsBusy=true;settingsEpoch++;renderComposer();
   let success=false;
   try{success=await postLocal(path,body);if(!success)el('preferences-status').textContent='설정을 저장하지 못했습니다. 다시 확인해 주세요.';}
-  catch{el('preferences-status').textContent='설정을 저장하지 못했습니다. 연결 상태를 확인해 주세요.';}
+  catch{if(stampCurrent(stamp))el('preferences-status').textContent='설정을 저장하지 못했습니다. 연결 상태를 확인해 주세요.';}
   finally{settingsBusy=false;if(generation===readerGeneration){settingsRevision=-1;readerRevision=-1;await refresh();renderComposer();}}
   return success;
 }
@@ -399,10 +442,10 @@ async function saveSettings(patch){return changeSettings('/api/preferences',patc
 async function saveRoomSettings(patch){if(!selectedRoom)return false;return changeSettings('/api/preferences/room',{room:selectedRoom,...patch});}
 async function receiveNotifications(){
   if(notificationBusy || settingsBusy || !hasAccount || !personalSettings?.notifications || !('Notification' in window) || Notification.permission!=='granted' || !('silent' in Notification.prototype))return;
-  const generation=readerGeneration;notificationBusy=true;
+  const generation=readerGeneration,stamp=requestStamp();notificationBusy=true;
   try{
-    const response=await fetch('/api/notifications/claim',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:'{}'});
-    if(!response.ok)return;const data=await response.json();if(!hasAccount || generation!==readerGeneration || !personalSettings?.notifications)return;
+    const {response,data}=await localRequest('/api/notifications/claim',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:'{}'});
+    if(!response.ok){unavailable();return;}if(!hasAccount || !stampCurrent(stamp) || !personalSettings?.notifications)return;
     for(const item of (data.notices || []).slice(0,5)){
       const room=roomsCache.find(row=>row.key===item.key);if(!room || room.muted || !/^[a-f0-9]{32}$/.test(item.id))continue;
       if(room.key===selectedRoom && userSelected && !document.hidden && document.hasFocus() && nearBottom() && !messageQuery && currentPage?.latestVisible)continue;
@@ -411,7 +454,7 @@ async function receiveNotifications(){
       while(shownNotifications.size>8){const [key,old]=shownNotifications.entries().next().value;old.close();shownNotifications.delete(key);}
       notice.onclick=()=>{notice.close();if(hasAccount && generation===readerGeneration){window.focus();roomFilter='all';renderRooms();void selectRoom(item.key);}};
     }
-  }catch{el('notification-status').textContent='알림을 표시하지 못했습니다. 브라우저 권한을 확인해 주세요.';}
+  }catch{if(stampCurrent(stamp))el('notification-status').textContent='알림을 표시하지 못했습니다. 브라우저 권한을 확인해 주세요.';}
   finally{notificationBusy=false;}
 }
 async function refreshReader(state){
@@ -435,29 +478,48 @@ async function refreshReader(state){
   if(lastState)render(lastState);
 }
 async function refresh() {
-  if (busy || refreshing) return;
-  refreshing=true;const epoch=actionEpoch;
+  if (busy || refreshing){refreshPending=true;return;}
+  clearTimeout(queuedRefreshTimer);queuedRefreshTimer=null;refreshPending=false;
+  refreshing=true;const epoch=actionEpoch,resume=resumeEpoch,failures=localFailureVersion;
+  if(freshness!=='fresh'){freshness='checking';readerRevision=-1;settingsRevision=-1;renderComposer();}
   try {
-    let response = await fetch('/api/status', {cache:'no-store'});
+    let {response,data:state}=await localRequest('/api/status');
+    if(epoch!==actionEpoch || resume!==resumeEpoch)return;
     if (response.status === 403) {
       // Re-establish only the local browser cookie after an operator restart.
       // This does not start QR generation or reuse an account credential.
-      const page = await fetch('/', {cache:'no-store'}); if (!page.ok) throw new Error();
-      response = await fetch('/api/status', {cache:'no-store'});
+      const {response:page}=await localRequest('/',{},'text');if(!page.ok)throw new Error();
+      if(epoch!==actionEpoch || resume!==resumeEpoch)return;
+      ({response,data:state}=await localRequest('/api/status'));
     }
-    if (!response.ok) throw new Error(); const state=await response.json();if(epoch!==actionEpoch)return;render(state);await refreshSettings(state);await refreshReader(state);await refreshPendingSend();await flushSelection();await advanceRoom();await receiveNotifications();renderComposer();
+    if(epoch!==actionEpoch || resume!==resumeEpoch)return;
+    if(!response.ok)throw new Error();
+    render(state);
+    await refreshSettings(state);
+    if(epoch!==actionEpoch || resume!==resumeEpoch)return;
+    await refreshReader(state);
+    if(epoch!==actionEpoch || resume!==resumeEpoch)return;
+    await refreshPendingSend();
+    if(epoch!==actionEpoch || resume!==resumeEpoch)return;
+    await flushSelection();
+    if(epoch!==actionEpoch || resume!==resumeEpoch)return;
+    await receiveNotifications();
+    if(epoch!==actionEpoch || resume!==resumeEpoch || failures!==localFailureVersion)return;
+    freshness='fresh';renderComposer();await advanceRoom();
   }
-  catch { el('message').textContent = '로컬 서버에 연결할 수 없습니다. 실행 상태를 확인해 주세요.'; el('start').disabled = el('cancel').disabled = el('reader-connect').disabled = el('history-load').disabled = true; }
-  finally{refreshing=false;}
+  catch(error){if(epoch===actionEpoch && resume===resumeEpoch && error.name!=='StaleLocalResult'){unavailable();el('message').textContent='로컬 서버에 연결할 수 없습니다. 실행 상태를 확인해 주세요.';el('start').disabled=el('cancel').disabled=el('reader-connect').disabled=el('history-load').disabled=true;}}
+  finally{refreshing=false;renderComposer();scheduleQueuedRefresh();}
 }
 async function act(path,body={}) {
   if (busy || !csrf) return;
-  busy = true;actionEpoch++; el('start').disabled = el('cancel').disabled = el('history-load').disabled = true;
+  busy=true;actionEpoch++;const epoch=actionEpoch,resume=resumeEpoch;
+  el('start').disabled=el('cancel').disabled=el('history-load').disabled=true;
   try {
-    const response = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json','X-CSRF-Token':csrf}, body:JSON.stringify(body)});
-    if (!response.ok && response.status !== 409) throw new Error();
-    const state = await response.json(); busy = false;if(state.phase)render(state);readerRevision=-1;await refresh();
-  } catch { busy = false; await refresh(); }
+    const {response,data:state}=await localRequest(path,{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify(body)});
+    if(!response.ok && response.status!==409){unavailable();throw new Error();}
+    if(epoch===actionEpoch && resume===resumeEpoch && state.phase)render(state);
+  }catch{/* A timed-out POST may still be running on the server. Do not retry it. */}
+  finally{busy=false;readerRevision=-1;await refresh();scheduleQueuedRefresh();}
 }
 el('start').addEventListener('click', () => act('/api/start'));
 el('cancel').addEventListener('click', () => act('/api/cancel'));
@@ -483,7 +545,7 @@ el('compose-text').addEventListener('keydown',event=>{
 el('compose-form').addEventListener('submit',async event=>{
   event.preventDefault();
   const room=roomNow(),text=el('compose-text').value;
-  if(busy || ackInFlight || pendingSend || !hasAccount || !lastState?.messaging || lastState.reader?.phase!=='connected' || lastState.reader?.operationBusy || !room?.canSend || !text.trim())return;
+  if(freshness!=='fresh' || busy || ackInFlight || pendingSend || !hasAccount || !lastState?.messaging || lastState.reader?.phase!=='connected' || lastState.reader?.operationBusy || !room?.canSend || !text.trim())return;
   if([...text].length>4000){sendNotes.set(selectedRoom,'메시지는 4,000자까지 보낼 수 있습니다.');renderComposer();return;}
   const replyTo=replyDrafts.get(selectedRoom)?.key;
   if(replyTo && !currentPage?.messages?.some(message=>message.key===replyTo && message.canReply)){sendNotes.set(selectedRoom,'원본 메시지를 다시 불러오거나 답장을 취소해 주세요.');renderComposer();return;}
@@ -571,7 +633,7 @@ async function saveRoomTitle(value){
     if(!await postLocal('/api/preferences/room',{room:target.key,title:value===null?null:value.trim()})){el('rename-error').textContent='이름을 변경하지 못했습니다.';return;}
     if(target.generation!==readerGeneration)return;
     el('rename-dialog').close();readerRevision=-1;await refresh();
-  }catch{el('rename-error').textContent='로컬 서버 연결을 확인해 주세요.';}
+  }catch{if(target.generation===readerGeneration && renameTarget===target)el('rename-error').textContent='로컬 서버 연결을 확인해 주세요.';}
 }
 el('rename-form').addEventListener('submit',event=>{event.preventDefault();void saveRoomTitle(el('room-title-input').value);});
 el('rename-reset').addEventListener('click',()=>void saveRoomTitle(null));
@@ -593,15 +655,18 @@ for(const dialog of document.querySelectorAll('dialog'))dialog.addEventListener(
 el('photo-full').addEventListener('error',()=>{el('photo-error').hidden=false;});
 el('new-messages').addEventListener('click',()=>{const scroll=document.querySelector('.chat-scroll');scroll.scrollTop=scroll.scrollHeight;requestAnimationFrame(()=>void maybeSeen());});
 document.querySelector('.chat-scroll').addEventListener('scroll',()=>{closeMessageMenu();renderComposer();void maybeSeen();},{passive:true});
-window.addEventListener('focus',()=>void refresh());
+window.addEventListener('focus',()=>queueRefresh());
+window.addEventListener('online',()=>queueRefresh(true));
+window.addEventListener('offline',()=>{resumeEpoch++;userSelected=false;unavailable();refreshPending=true;scheduleQueuedRefresh();});
+window.addEventListener('pageshow',event=>queueRefresh(event.persisted===true));
 document.addEventListener('keydown',event=>{if(event.key==='Escape' && messageMenuTarget){event.preventDefault();closeMessageMenu(el('message-menu').contains(document.activeElement));}else if(event.key==='Escape' && !el('account-panel').hidden){showAccount(false);el('account-toggle').focus();}});
-let pollTimer=null;
 function scheduleRefresh(){
   clearTimeout(pollTimer);
-  pollTimer=setTimeout(async()=>{await refresh();scheduleRefresh();},document.hidden?10000:1000);
+  pollTimer=setTimeout(async()=>{const now=Date.now(),gap=now-lastPollAt;lastPollAt=now;if(gap>=30000 || gap<0)queueRefresh(true);await refresh();scheduleRefresh();},document.hidden?10000:1000);
 }
 document.addEventListener('visibilitychange',()=>{
-  if(!document.hidden)void refresh();
+  if(!document.hidden)queueRefresh(wasHidden);
+  wasHidden=document.hidden;
   scheduleRefresh();
 });
 void refresh().finally(scheduleRefresh);

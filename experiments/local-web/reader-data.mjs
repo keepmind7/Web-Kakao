@@ -156,6 +156,21 @@ export function createReaderStore(body, ownUserId, salt=randomBytes(32),settings
     cacheEpoch:key=>rooms.get(key)?.cacheEpoch,
     receiptVersion:key=>rooms.get(key)?.receiptVersion,
     canSend:key=>rooms.has(key) && rooms.get(key).kind!=='unknown',
+    unnamedRooms(limit=8){
+      return [...rooms.values()].filter(room=>!room.titleKnown && room.kind!=='MemoChat')
+        .sort((a,b)=>(b.lastAt ?? 0)-(a.lastAt ?? 0)).slice(0,Math.min(8,Math.max(0,limit))).map(room=>room.key);
+    },
+    recoverTitle(key,response){
+      const room=rooms.get(key),row=response?.chatInfo;
+      if(!room || room.titleKnown || room.kind==='MemoChat' || !object(row) || row.left!==undefined && row.left!==false)return false;
+      // CHATINFO is only optional display metadata here. Require an actual,
+      // unambiguous response identity; never copy the requested ID into it.
+      const ids=['chatId','id','roomId','chatRoomId','c'].filter(field=>Object.hasOwn(row,field));
+      if(!ids.length || ids.some(field=>serverId(row[field])!==room.serverRoomId))return false;
+      const name=title(row,ownUserId);if(!name)return false;
+      // In particular, displayMembers is not a verified membership snapshot.
+      room.title=name;room.titleKnown=true;return true;
+    },
     unknownRooms(body){
       if(rooms.size>=ROOM_LIMIT)return [];
       const ids=new Set();

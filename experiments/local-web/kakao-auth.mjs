@@ -74,18 +74,40 @@ export function createAuthLab({ transport, encodeQr, mode = 'live', now = Date.n
   if (!Number.isInteger(credentialRetentionMs) || credentialRetentionMs<1000 || credentialRetentionMs>60*60*1000) throw new Error('invalid_retention');
   let view = { phase: 'idle', message: 'QR 로그인 시작을 누르면 서버 허용 여부부터 확인합니다.', stage: null };
   let credentials = null, deviceUUID = null, qrId = null, timer = null, deadlineTimer = null, epoch = 0, attempts = 0, locked = false;
+  let credentialDeadline = null, credentialObservedAt = null;
   let probeAttempted = false;
   const logicalDeviceUUID = createHash('sha256').update(`dkljleskljfeisflssljeif ${randomUUID()}-${now()}`).digest('hex');
   let abort = new AbortController();
   const counts = { allowlist: 0, generate: 0, poll: 0 };
   const authEvents=[];
   let qrIssuedAt=null;
-  const forget = () => { credentials = null; deviceUUID = null; qrId = null; delete view.grid; delete view.passcode; delete view.expiresAt;
+  const forget = () => { credentials = null; credentialDeadline = null; credentialObservedAt = null; deviceUUID = null; qrId = null; delete view.grid; delete view.passcode; delete view.expiresAt;
     if (view.roomProbe?.phase === 'running') view.roomProbe = {phase:'failed',stage:'cancelled',connectionVerified:false}; };
   const stopTimer = () => { if (timer !== null) clear(timer); if (deadlineTimer !== null) clear(deadlineTimer); timer = null; deadlineTimer = null; };
-  const terminal = (phase, message) => { ++epoch; if (['blocked','error'].includes(phase)) locked = true; stopTimer(); abort.abort(); forget(); view = { ...view, phase, message }; };
+  const terminal = (phase, message) => {
+    ++epoch;if (['blocked','error'].includes(phase)) locked = true;
+    stopTimer();forget();view = { ...view, phase, message };
+    // Abort listeners can synchronously inspect the lab; publish the terminal
+    // state and remove credentials before allowing that reentrant observation.
+    abort.abort();
+  };
   const canStart = () => !locked && attempts < 3 && ['idle','expired','cancelled'].includes(view.phase);
   const schedule = (callback, ms) => { timer = later(callback, ms); timer?.unref?.(); };
+  function expireCredential(run=epoch) {
+    if(run!==epoch || !credentials)return false;
+    const observed=now();
+    if(!Number.isFinite(observed) || observed<credentialObservedAt || observed>=credentialDeadline){
+      terminal('expired','실험용 인증 메모리를 지웠습니다. 다시 연결하려면 QR 인증이 필요합니다.');return true;
+    }
+    credentialObservedAt=observed;return false;
+  }
+  function scheduleCredentialExpiry(run) {
+    schedule(()=>{
+      if(run!==epoch || !credentials || expireCredential(run))return;
+      // A prematurely delivered callback must not extend the absolute bound.
+      scheduleCredentialExpiry(run);
+    },Math.max(1,credentialDeadline-credentialObservedAt));
+  }
   function responseOK(result, stage) {
     view.stage = stage;
     view.httpStatus = Number.isInteger(result?.httpStatus) ? result.httpStatus : null;
@@ -117,11 +139,14 @@ export function createAuthLab({ transport, encodeQr, mode = 'live', now = Date.n
       if (!Number.isInteger(body.status)) { terminal('error', '인증 응답 형식을 확인할 수 없어 중단했습니다.'); return; }
       if (body.status === 0 && typeof body.accessToken === 'string' && body.accessToken.length > 0 && positiveId(body.user?.userId)) {
         stopTimer();
+        // Already queued QR callbacks must not expire or poll this new state.
+        const authenticatedRun=++epoch;
         credentials = { userId: String(body.user.userId), deviceUUID, accessToken: body.accessToken,
           refreshToken: typeof body.refreshToken === 'string' ? body.refreshToken : '' };
+        credentialObservedAt=now();credentialDeadline=credentialObservedAt+credentialRetentionMs;
         qrId = null; delete view.grid; delete view.passcode; delete view.expiresAt;
         view = { ...view, phase: 'authenticated', message: 'QR 인증 응답과 토큰을 받았습니다. 대화 서버 연결은 아직 검증하지 않았습니다.' };
-        schedule(() => terminal('expired', '실험용 인증 메모리를 지웠습니다. 다시 연결하려면 QR 인증이 필요합니다.'), credentialRetentionMs);
+        if(!expireCredential(authenticatedRun))scheduleCredentialExpiry(authenticatedRun);
         return;
       }
       // Do not interpret an arbitrary error plus retry interval as permission to retry.
@@ -152,11 +177,13 @@ export function createAuthLab({ transport, encodeQr, mode = 'live', now = Date.n
   }
   return {
     snapshot() {
+      expireCredential();
       return { ...view, mode, profile: PROFILE, credentialInMemory: credentials !== null,
         canStart: canStart(), sessionBlocked:locked, canProbe: !locked && view.phase === 'authenticated' && credentials !== null && !probeAttempted,
         attempts, actualChatConnected: view.roomProbe?.connectionVerified === true, actualMessageSent: false, requests: { ...counts },authEvents:authEvents.map(event=>({...event})) };
     },
     async start() {
+      expireCredential();
       if (!canStart()) return false;
       attempts++; probeAttempted = false; abort = new AbortController(); const run = ++epoch;
       qrIssuedAt=null;
@@ -193,20 +220,23 @@ export function createAuthLab({ transport, encodeQr, mode = 'live', now = Date.n
       return true;
     },
     async connectReadOnly(probe) {
+      expireCredential();
       if (view.phase !== 'authenticated' || !credentials || probeAttempted) return false;
       probeAttempted = true; const run = epoch;
       view.roomProbe = {phase:'running',stage:'booking',connectionVerified:false};
       try {
         const result = await probe(credentials, {signal:abort.signal});
+        expireCredential(run);
         if (run === epoch) {
           view.roomProbe = result;
           if (result.connectionVerified) view.message = '대화 서버의 로그인 응답을 확인했습니다. 이번 검사 연결은 종료했으며 상시 수신은 아직 검증하지 않았습니다.';
           if (result.phase !== 'completed') terminal('blocked','대화 서버 검사가 중단돼 이번 실행의 추가 연결을 막았습니다.');
         }
-      } catch { if (run === epoch) { view.roomProbe = {phase:'failed',stage:'worker',connectionVerified:false}; terminal('blocked','대화 서버 검사가 중단됐습니다.'); } }
+      } catch { expireCredential(run);if (run === epoch) { view.roomProbe = {phase:'failed',stage:'worker',connectionVerified:false}; terminal('blocked','대화 서버 검사가 중단됐습니다.'); } }
       return true;
     },
     withCredential(consumer) {
+      expireCredential();
       if(locked || view.phase!=='authenticated' || !credentials)return false;
       return consumer({userId:credentials.userId,deviceUUID:credentials.deviceUUID,accessToken:credentials.accessToken},{signal:abort.signal});
     },

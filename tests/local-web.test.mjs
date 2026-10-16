@@ -14,17 +14,67 @@ function rawStatus(url, { method = 'GET', headers = {}, body } = {}) {
     req.on('error', reject); req.end(body);
   });
 }
-function fixture(responses) {
+function fixture(responses, options = {}) {
   const calls = [], timers = [];
   let time = 100000;
   const lab = createAuthLab({
     transport: async (operation, payload) => { calls.push(operation); const reply = responses.shift(); return typeof reply === 'function' ? reply(operation, payload) : reply; },
     encodeQr: () => [[true]], now: () => time,
     later: (fn, ms) => { const timer = { fn, due: time + ms }; timers.push(timer); return timer; },
-    clear: timer => { const index = timers.indexOf(timer); if (index >= 0) timers.splice(index, 1); },
+    clear: timer => { const index = timers.indexOf(timer); if (index >= 0) timers.splice(index, 1); }, ...options,
   });
   return { lab, calls, timers, advance: ms => { time += ms; }, tick: async () => { timers.sort((a,b) => a.due-b.due); const timer = timers.shift(); assert.ok(timer); await timer.fn(); } };
 }
+
+const authenticatedResponses = () => [ok({allowlisted:true}), qr(), ok({status:0,user:{userId:'246810'},accessToken:'SYNTHETIC_RETAINED_ONLY'})];
+for (const entry of ['snapshot','withCredential','connectReadOnly','start']) test('credential deadline is enforced by '+entry+' without running its expiry callback', async () => {
+  const f=fixture(authenticatedResponses(),{credentialRetentionMs:1000});
+  await f.lab.start();await f.tick();
+  let signal,calls=0;f.lab.withCredential((_credential,options)=>{signal=options.signal;});
+  f.advance(1000);
+  if(entry==='snapshot')assert.equal(f.lab.snapshot().credentialInMemory,false);
+  else if(entry==='withCredential')assert.equal(f.lab.withCredential(()=>{calls++;}),false);
+  else if(entry==='connectReadOnly')assert.equal(await f.lab.connectReadOnly(()=>{calls++;}),false);
+  else { f.calls.length=0;assert.equal(await f.lab.start(),true);assert.deepEqual(f.calls,['allowlist']); }
+  assert.equal(calls,0);assert.equal(signal.aborted,true);
+  if(entry!=='start'){assert.equal(f.lab.snapshot().phase,'expired');assert.equal(f.timers.length,0);}
+  f.lab.cancel();
+});
+
+test('observed clock rollback expires credentials without exposing them to a consumer',async()=>{
+  const f=fixture(authenticatedResponses(),{credentialRetentionMs:1000});await f.lab.start();await f.tick();
+  f.advance(100);assert.equal(f.lab.snapshot().phase,'authenticated');f.advance(-1);
+  let called=false;assert.equal(f.lab.withCredential(()=>{called=true;}),false);assert.equal(called,false);
+  assert.equal(f.lab.snapshot().phase,'expired');assert.equal(f.lab.snapshot().credentialInMemory,false);assert.equal(f.timers.length,0);
+});
+
+test('early timer and activity do not extend the original absolute credential deadline',async()=>{
+  const f=fixture(authenticatedResponses(),{credentialRetentionMs:1000});await f.lab.start();await f.tick();
+  const first=f.timers[0];await f.tick();assert.equal(f.lab.snapshot().phase,'authenticated');assert.equal(f.timers[0].due,first.due);
+  f.advance(999);assert.equal(f.lab.withCredential(()=>true),true);f.advance(1);
+  assert.equal(f.lab.withCredential(()=>true),false);assert.equal(f.lab.snapshot().phase,'expired');
+});
+
+test('queued QR and previous-login expiry callbacks cannot end a newer authenticated epoch',async()=>{
+  const f=fixture([...authenticatedResponses(),...authenticatedResponses()],{credentialRetentionMs:1000});
+  await f.lab.start();const oldQr=f.timers.find(timer=>timer.due>102000);await f.tick();const oldExpiry=f.timers[0];
+  f.lab.cancel();f.advance(500);await f.lab.start();await f.tick();
+  await oldQr.fn();await oldExpiry.fn();assert.equal(f.lab.snapshot().phase,'authenticated');
+  f.advance(1000);assert.equal(f.lab.snapshot().phase,'expired');
+});
+
+test('late read-only probe completion cannot restore expired authentication',async()=>{
+  const f=fixture(authenticatedResponses(),{credentialRetentionMs:1000});await f.lab.start();await f.tick();let release,signal;
+  const pending=f.lab.connectReadOnly((_credential,options)=>{signal=options.signal;return new Promise(resolve=>{release=resolve;});});
+  f.advance(1000);release({phase:'completed',connectionVerified:true,roomCount:3});await pending;
+  const state=f.lab.snapshot();assert.equal(state.phase,'expired');assert.equal(state.credentialInMemory,false);assert.equal(state.actualChatConnected,false);assert.equal(signal.aborted,true);
+});
+
+test('credential expiry publishes forgotten state before synchronous abort observers run',async()=>{
+  const f=fixture(authenticatedResponses(),{credentialRetentionMs:1000});await f.lab.start();await f.tick();let observed;
+  f.lab.withCredential((_credential,{signal})=>signal.addEventListener('abort',()=>{observed=f.lab.snapshot();},{once:true}));
+  f.advance(1000);f.lab.snapshot();assert.equal(observed.phase,'expired');assert.equal(observed.credentialInMemory,false);
+});
 
 test('allowlist rejection, HTTP error and incomplete JSON never generate QR', async () => {
   for (const response of [ok({ allowlisted: false }), ok({}), ok({ allowlisted: 'true' }), ok({ allowlisted: true, status: -997 }), {httpStatus:415,body:null}]) {

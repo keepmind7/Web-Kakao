@@ -17,6 +17,7 @@ const readStates=new Map(),historyGaps=new Map(),latestMissing=new Set();
 let unknownSend=false,unknownPhoto=false,rejectPhoto=false;
 const offlineMessages=new Map();
 const removedRooms=new Set();
+const lifecycleChecks=[];
 let enableSettings=false;
 const defaultSettings=()=>({persist:false,notifications:false,readSync:false,roomFilter:'all',storageAvailable:true,storageError:false});
 let settings=defaultSettings();const roomSettings=new Map(),notificationQueue=[];
@@ -61,8 +62,116 @@ try{
     if(result.exceptionDetails)throw new Error(result.exceptionDetails.exception?.description || 'browser evaluation failed');
     return result.result?.value;
   };
-  const until=async expression=>{const until=Date.now()+10000;while(!await evaluate(expression)){if(Date.now()>until){console.log(JSON.stringify({syntheticBrowserTimeout:await evaluate("({selectedRoom,pendingSelection,busy,refreshing,ackInFlight,pageKey:currentPage?.key,history:currentPage?.history,readSync:currentPage?.readSync,reader:lastState?.reader,messageCount:document.querySelectorAll('#message-list article').length,historyButtonDisabled:el('history-load').disabled})"),historyRooms,statusRequests}));throw new Error('browser assertion timeout: '+expression);}await sleep(100);}};
+  const until=async expression=>{const until=Date.now()+10000;while(!await evaluate(expression)){if(Date.now()>until){console.log(JSON.stringify({syntheticBrowserTimeout:await evaluate("({selectedRoom,pendingSelection,busy,refreshing,ackInFlight,pageKey:currentPage?.key,history:currentPage?.history,readSync:currentPage?.readSync,reader:lastState?.reader,freshness,connectDisabled:el('reader-connect').disabled,messageCount:document.querySelectorAll('#message-list article').length,historyButtonDisabled:el('history-load').disabled})"),historyRooms,statusRequests}));throw new Error('browser assertion timeout: '+expression);}await sleep(100);}};
   const refreshUi=()=>evaluate("(async()=>{while(refreshing || busy)await new Promise(resolve=>setTimeout(resolve,10));await refresh();})()");
+  async function checkLifecycle(){
+  await evaluate("globalThis.testFocus=true;document.hasFocus=()=>globalThis.testFocus;");
+  // All lifecycle traffic stays on the injected synthetic loopback server.
+  // Abort-ignoring headers/body readers exercise Promise.race, not just abort.
+  // Capture production timer classes, then scale only test deadlines to 80 ms.
+  await evaluate("document.getElementById('filter-all').click()");await until("roomFilter==='all' && !settingsBusy && !refreshing");
+  await evaluate("document.querySelectorAll('.room-item')[0].click()");await until("currentPage?.messages?.length>0 && !refreshing && !ackInFlight");
+  await evaluate(`globalThis.qaFetch=fetch;globalThis.qaSetTimeout=setTimeout;globalThis.qaMode=null;globalThis.qaHeld=[];globalThis.qaRequests=[];globalThis.qaDeadlines=[];globalThis.qaFast=false;globalThis.qaPatch=null;globalThis.qaStatusActive=0;globalThis.qaStatusMaximum=0;
+    globalThis.setTimeout=(fn,ms,...args)=>{if(globalThis.qaFast && [12000,30000,80000].includes(ms)){globalThis.qaDeadlines.push(ms);return globalThis.qaSetTimeout(fn,80,...args);}return globalThis.qaSetTimeout(fn,ms,...args);};
+    globalThis.fetch=async(input,options={})=>{
+      const path=String(input);globalThis.qaRequests.push({path,method:options.method || 'GET',body:options.body || null});const mode=globalThis.qaMode;
+      const status=path==='/api/status';let finished=false;if(status){globalThis.qaStatusActive++;globalThis.qaStatusMaximum=Math.max(globalThis.qaStatusMaximum,globalThis.qaStatusActive);}
+      const finish=()=>{if(status && !finished){finished=true;globalThis.qaStatusActive--;}};
+      const wrap=response=>status?{ok:response.ok,status:response.status,async json(){try{return await response.json();}finally{finish();}}}:response;
+      if(mode==='status-headers' && status){globalThis.qaMode=null;return new Promise(resolve=>globalThis.qaHeld.push(async()=>resolve(wrap(await globalThis.qaFetch(input,{...options,signal:undefined})))));}
+      let response;try{response=await globalThis.qaFetch(input,options);}catch(error){finish();throw error;}
+      if(mode==='status-body' && path==='/api/status' || mode==='send-body' && path==='/api/reader/send' || mode==='act-body' && path==='/api/reader/disconnect' || mode==='old-A' && path.includes('/api/reader/messages?')){
+        globalThis.qaMode=null;const data=await response.json();if(mode==='old-A' && data.messages?.length)data.messages[0].text='STALE-A-MUST-NOT-RENDER';
+        return wrap({ok:response.ok,status:response.status,json:()=>new Promise(resolve=>globalThis.qaHeld.push(()=>resolve(data)))});
+      }
+      if(status && globalThis.qaPatch){const data=await response.json();Object.assign(data,globalThis.qaPatch,{reader:{...data.reader,...globalThis.qaPatch.reader}});return wrap({ok:response.ok,status:response.status,json:async()=>data});}
+      return wrap(response);
+    };`);
+  try{
+  const stopPoll=()=>evaluate("clearTimeout(pollTimer);pollTimer=null;clearTimeout(queuedRefreshTimer);queuedRefreshTimer=null;refreshPending=false;");
+  const readyPage=async()=>{const deadline=Date.now()+6000;while(!await evaluate("currentPage?.key===selectedRoom && currentPage.messages.length>0 && currentPage.history?.phase==='loaded' && !busy && !refreshing")){if(Date.now()>deadline)throw new Error('synthetic history did not settle');await refreshUi();await sleep(20);}};
+  await refreshUi();await stopPoll();
+  await evaluate("document.getElementById('compose-text').value='poll-focus-draft';document.getElementById('compose-text').dispatchEvent(new Event('input'));document.getElementById('compose-text').focus()");
+  await refreshUi();await refreshUi();assert.equal(await evaluate("document.activeElement.id==='compose-text' && !document.getElementById('compose-text').disabled && document.getElementById('compose-text').value==='poll-focus-draft' && freshness==='fresh'"),true);
+  lifecycleChecks.push('ordinary fresh polls preserve continuous composer focus');
+  const selectionRaceResults=[];
+  for(const order of ['selection-first','poll-first']){
+    await stopPoll();const room=await evaluate('selectedRoom'),beforeHistory=historyRooms.length;
+    messagesByRoom.delete(room);historyPhases.delete(room);revision++;
+    await evaluate(`readerRevision=-1;globalThis.qaMode='old-A';void ${order==='selection-first'?'selectRoom(selectedRoom)':'refresh()'}`);await until('globalThis.qaHeld.length===1');
+    if(order==='selection-first')await refreshUi();
+    else {await evaluate('void selectRoom(selectedRoom)');await until('pendingSelection!==null || busy || currentPage?.history?.phase!==undefined');}
+    await evaluate('globalThis.qaHeld.shift()()');await until('!busy && !refreshing && !refreshPending');await stopPoll();
+    selectionRaceResults.push({order,expectedHistoryRequests:1,actualHistoryRequests:historyRooms.length-beforeHistory});
+    // Leave the fixture loaded for the next independent scenario even when a
+    // regression was observed; the final assertion still fails this run.
+    if(historyRooms.length===beforeHistory)await evaluate('void act("/api/reader/history",{room:selectedRoom})');
+    await readyPage();await stopPoll();
+  }
+  const beforeLoadedSelection=historyRooms.length;await evaluate('void selectRoom(selectedRoom)');await readyPage();await refreshUi();assert.equal(historyRooms.length,beforeLoadedSelection);
+  writeFileSync(resolve(folder,'synthetic-selection-race.json'),JSON.stringify({scope:'synthetic only',results:selectionRaceResults},null,2));
+  lifecycleChecks.push('initial idle room selection versus polling GET in both response orders');
+  for(const mode of ['status-headers','status-body']){
+    await stopPoll();const sends=sendCalls.length,reads=seenCalls.length;
+    await evaluate(`globalThis.qaMode='${mode}';globalThis.qaFast=true;void refresh();`);await until("globalThis.qaHeld.length===1");await until("!refreshing && freshness==='unavailable'");
+    assert.equal(await evaluate("document.getElementById('compose-text').disabled && document.getElementById('attach-image').disabled && document.getElementById('send-message').disabled && document.getElementById('compose-text').value==='poll-focus-draft'"),true);
+    await evaluate("document.getElementById('compose-form').requestSubmit();void maybeSeen();globalThis.qaHeld.shift()();globalThis.qaFast=false;");await sleep(30);
+    assert.equal(await evaluate("freshness==='unavailable' && !refreshing"),true);assert.equal(sendCalls.length,sends);assert.equal(seenCalls.length,reads);
+    await refreshUi();assert.equal(await evaluate("freshness==='fresh' && !document.getElementById('compose-text').disabled"),true);
+  }
+  assert.equal(await evaluate('globalThis.qaDeadlines.filter(ms=>ms===12000).length>=2'),true);
+  lifecycleChecks.push('header and body stalls release locks preserve draft and reject late success');
+  await stopPoll();await evaluate("globalThis.qaMode='old-A';void refreshMessages(selectedRoom,readerGeneration)");await until("globalThis.qaHeld.length===1");
+  await evaluate("document.querySelectorAll('.room-item')[1].click()");await readyPage();
+  await evaluate("document.querySelectorAll('.room-item')[0].click()");await readyPage();
+  await evaluate("globalThis.qaHeld.shift()()");await sleep(30);
+  assert.equal(await evaluate("!document.getElementById('message-list').textContent.includes('STALE-A-MUST-NOT-RENDER') && !currentPage.messages.some(message=>message.text==='STALE-A-MUST-NOT-RENDER')"),true);
+  lifecycleChecks.push('A to B to A rejects older same-room GET by request identity');
+  await refreshUi();await stopPoll();const resumeReads=seenCalls.length,resumeSends=sendCalls.length;
+  await evaluate("globalThis.qaRequests=[];globalThis.qaMode='status-body';void refresh()");await until("globalThis.qaHeld.length===1");
+  await evaluate("window.dispatchEvent(new Event('focus'));window.dispatchEvent(new Event('online'));window.dispatchEvent(new PageTransitionEvent('pageshow',{persisted:true}));window.dispatchEvent(new Event('online'))");
+  assert.equal(await evaluate("refreshing && refreshPending && !userSelected && globalThis.qaRequests.filter(r=>r.path==='/api/status').length===1"),true);
+  await evaluate("globalThis.qaHeld.shift()()");await until("!refreshing && !refreshPending && freshness==='fresh'");await stopPoll();
+  assert.equal(await evaluate("globalThis.qaRequests.filter(r=>r.path==='/api/status').length"),2);assert.equal(seenCalls.length,resumeReads);assert.equal(sendCalls.length,resumeSends);
+  assert.equal(await evaluate("globalThis.qaRequests.filter(r=>['/api/start','/api/reader/connect','/api/reader/photo','/api/reader/seen','/api/reader/send'].includes(r.path)).length"),0);
+  lifecycleChecks.push('restore signals merge behind one refresh with zero send read QR connect');
+  await evaluate("document.querySelector('.room-item.selected').click()");await until("userSelected && currentPage?.messages?.length>0");await evaluate("window.dispatchEvent(new Event('focus'))");await until("!refreshing && !refreshPending");assert.equal(await evaluate('userSelected'),true);await stopPoll();
+  const busyRequests=await evaluate('globalThis.qaRequests.length');
+  await evaluate("globalThis.qaMode='act-body';void act('/api/reader/disconnect')");await until("busy && globalThis.qaHeld.length===1");
+  const busyStatuses=await evaluate("globalThis.qaRequests.filter(r=>r.path==='/api/status').length");
+  await evaluate("for(let i=0;i<4;i++)window.dispatchEvent(new Event('online'))");assert.equal(await evaluate("globalThis.qaRequests.filter(r=>r.path==='/api/status').length"),busyStatuses);
+  await evaluate("globalThis.qaHeld.shift()()");await until("!busy && !refreshing && !refreshPending && lastState.reader.phase==='disconnected'");await stopPoll();
+  assert.equal(await evaluate("globalThis.qaRequests.filter(r=>r.path==='/api/status').length"),busyStatuses+1);
+  assert.equal(await evaluate(`globalThis.qaRequests.slice(${busyRequests}).filter(r=>r.path==='/api/reader/disconnect').length`),1);
+  assert.equal(await evaluate(`globalThis.qaRequests.slice(${busyRequests}).filter(r=>['/api/start','/api/reader/connect','/api/reader/seen','/api/reader/send','/api/reader/photo'].includes(r.path)).length`),0);
+  lifecycleChecks.push('busy restore signals merge without repeating manual disconnect or reconnect');
+  // This explicit test click is the only reconnect below.
+  await evaluate("document.getElementById('reader-connect').click()");await until("lastState.reader.phase==='connected' && !busy && !refreshing");await readyPage();
+  await stopPoll();unknownSend=true;const beforeTimeoutSend=sendCalls.length;
+  await evaluate("globalThis.qaRequests=[];globalThis.qaMode='send-body';globalThis.qaFast=true;document.getElementById('compose-text').value='synthetic deadline send';document.getElementById('compose-text').dispatchEvent(new Event('input'));document.getElementById('compose-form').requestSubmit()");
+  await until("globalThis.qaHeld.length===1 && pendingSend?.phase==='unknown'");const timedId=await evaluate('pendingSend.clientId');assert.equal(sendCalls.length,beforeTimeoutSend+1);assert.equal(sendCalls.at(-1).clientId,timedId);
+  await sleep(170);await evaluate("globalThis.qaFast=false;globalThis.qaHeld.shift()();window.dispatchEvent(new Event('online'));window.dispatchEvent(new PageTransitionEvent('pageshow',{persisted:true}))");
+  await until("!refreshing && !refreshPending && freshness==='fresh'");await refreshUi();await stopPoll();
+  assert.equal(await evaluate(`pendingSend?.clientId===${JSON.stringify(timedId)} && pendingSend.phase==='unknown' && document.getElementById('compose-text').disabled && document.getElementById('compose-text').value==='synthetic deadline send'`),true);
+  assert.equal(sendCalls.length,beforeTimeoutSend+1);assert.equal(await evaluate("globalThis.qaRequests.filter(r=>r.path==='/api/reader/send').length"),1);assert.equal(await evaluate('globalThis.qaDeadlines.includes(30000)'),true);
+  assert.equal(await evaluate("globalThis.qaRequests.filter(r=>r.path.startsWith('/api/reader/messages?')).length>0"),true);
+  lifecycleChecks.push('POST timeout preserves clientId unknown lock and queries outcome without resend');
+  for(const patch of [{reader:{phase:'disconnected',canConnect:true}},{reader:{phase:'blocked',status:-1,canConnect:false}},{reader:{phase:'disconnected',attempts:3,canConnect:false},canOpenReader:false},{phase:'expired',credentialInMemory:false,canOpenReader:false,canStart:true,reader:{phase:'idle',canConnect:false}}]){
+    await stopPoll();const n=await evaluate('globalThis.qaRequests.length'),reads=seenCalls.length,sends=sendCalls.length;
+    await evaluate(`globalThis.qaPatch=${JSON.stringify(patch)};window.dispatchEvent(new Event('online'));window.dispatchEvent(new PageTransitionEvent('pageshow',{persisted:true}));`);await until("!refreshing && !refreshPending");await stopPoll();
+    assert.equal(await evaluate(`globalThis.qaRequests.slice(${n}).filter(r=>['/api/start','/api/reader/connect','/api/reader/seen','/api/reader/send','/api/reader/photo'].includes(r.path)).length`),0);
+    assert.equal(await evaluate("document.getElementById('compose-text').disabled && document.getElementById('attach-image').disabled"),true);assert.equal(seenCalls.length,reads);assert.equal(sendCalls.length,sends);
+  }
+  lifecycleChecks.push('manual blocked expired three-failure restore sends zero connect QR read text photo');
+  const statusMaximum=await evaluate('globalThis.qaStatusMaximum');assert.equal(statusMaximum,1);
+  unknownSend=false;await evaluate("globalThis.qaPatch=null;globalThis.fetch=globalThis.qaFetch;globalThis.setTimeout=globalThis.qaSetTimeout");await refreshUi();
+  writeFileSync(resolve(folder,'synthetic-lifecycle.json'),JSON.stringify({passed:selectionRaceResults.every(result=>result.actualHistoryRequests===result.expectedHistoryRequests),checks:lifecycleChecks,statusMaximum,restoreAutomatic:{connect:0,QR:0,seen:0,text:0,photo:0},deadlineExecution:'production 12000/30000 timer classes captured; selected test deadlines scaled to 80 ms',actualAccountUsed:false},null,2));
+  assert.ok(selectionRaceResults.every(result=>result.actualHistoryRequests===result.expectedHistoryRequests),'initial explicit selection must still queue exactly one history after polling supersedes its GET');
+  }finally{
+    unknownSend=false;
+    await evaluate("globalThis.qaPatch=null;globalThis.qaFast=false;globalThis.fetch=globalThis.qaFetch;globalThis.setTimeout=globalThis.qaSetTimeout;scheduleRefresh();");
+  }
+  }
   await until("document.getElementById('start') && !document.getElementById('start').disabled");
   await evaluate("globalThis.qrDraws=0;const originalFill=CanvasRenderingContext2D.prototype.fillRect;CanvasRenderingContext2D.prototype.fillRect=function(...args){globalThis.qrDraws++;return originalFill.apply(this,args);}");
   await evaluate("document.getElementById('start').click()");
@@ -75,11 +184,13 @@ try{
   await until("document.querySelectorAll('.room-item').length===2");
   assert.equal(await evaluate("document.getElementById('title').textContent"),'대화 서버 연결됨');
   assert.equal(await evaluate("getComputedStyle(document.querySelector('.app-shell')).display"),'grid');
+  if(process.env.WEB_KAKAO_QA_LIFECYCLE_ONLY==='1'){await checkLifecycle();console.log(JSON.stringify({passed:true,scope:'synthetic lifecycle only',checks:lifecycleChecks,actualAccountUsed:false,artifacts:folder}));}
+  else {
   // An initial default highlight is not an explicitly opened room or read intent.
   assert.equal(historyRooms.length,0);assert.equal(await evaluate('!userSelected && reconnectRoom===null'),true);
   for(let i=0;i<2;i++){
     const defaultSeen=seenCalls.length,defaultSends=sendCalls.length;
-    await evaluate("document.getElementById('reader-disconnect').click()");await until("lastState.reader.phase==='disconnected' && !busy");
+    await evaluate("document.getElementById('reader-disconnect').click()");await until("lastState.reader.phase==='disconnected' && !busy && !refreshing && !el('reader-connect').disabled");
     await evaluate("document.getElementById('reader-connect').click()");
     await until("lastState.reader.phase==='connected' && document.querySelectorAll('.room-item').length===2 && !refreshing && !busy");
     assert.equal(await evaluate('!userSelected && reconnectRoom===null && currentPage.messages.length===0'),true);
@@ -256,7 +367,7 @@ try{
   await evaluate("document.getElementById('compose-text').value='답장 초안';document.getElementById('compose-text').dispatchEvent(new Event('input'));document.getElementById('reply-cancel').click()");
   assert.equal(await evaluate("document.getElementById('reply-preview').hidden && document.getElementById('compose-text').value==='답장 초안'"),true);
   await evaluate("document.querySelector('#message-list article').dispatchEvent(new MouseEvent('contextmenu',{bubbles:true,cancelable:true,clientX:300,clientY:200}));document.getElementById('message-menu-reply').click();document.getElementById('send-message').click()");
-  await until("pendingSend===null && document.getElementById('reply-preview').hidden && document.querySelector('.message-quote')");
+  await until("pendingSend===null && document.getElementById('reply-preview').hidden && document.querySelector('.message-quote') && !refreshing && !ackInFlight");
   assert.equal(await evaluate("(()=>{const pane=document.querySelector('.chat-scroll');return pane.scrollHeight-pane.clientHeight-pane.scrollTop<=1;})()"),true,'accepted own reply must be visible at the latest position');
   assert.equal(sendCalls.at(-1).replyTo,'m_'+'1'.padStart(24,'0'));
   assert.equal(await evaluate("document.querySelector('.message-quote span').textContent"),payload);assert.equal(await evaluate("document.querySelector('.message-quote img')===null && globalThis.injected===undefined"),true);
@@ -302,7 +413,7 @@ try{
   await until("pendingSend===null && imageDraft!==null && !document.getElementById('image-send-dialog').open && !busy && !refreshing && !ackInFlight");
   rejectPhoto=false;
   const beforeDraftReconnectSeen=seenCalls.length;
-  await evaluate("document.getElementById('reader-disconnect').click()");await until("lastState.reader.phase==='disconnected' && !busy");
+  await evaluate("document.getElementById('reader-disconnect').click()");await until("lastState.reader.phase==='disconnected' && !busy && !refreshing && !el('reader-connect').disabled");
   await evaluate("document.getElementById('reader-connect').click()");
   await until("lastState.reader.phase==='connected' && currentPage?.key===selectedRoom && currentPage.messages.length===40 && !busy && !refreshing && !ackInFlight");
   assert.equal(await evaluate("readerGeneration>globalThis.rejectedDraftGeneration && imageDraft===null && !document.getElementById('image-preview').hasAttribute('src') && document.getElementById('image-send').disabled"),true);
@@ -315,7 +426,7 @@ try{
   await evaluate("globalThis.originalBitmapDecoder=createImageBitmap;globalThis.heldBitmap=null;globalThis.releaseBitmap=null;globalThis.createImageBitmap=async file=>{const bitmap=await globalThis.originalBitmapDecoder(file);globalThis.heldBitmap=bitmap;await new Promise(resolve=>{globalThis.releaseBitmap=resolve;});return bitmap;}");
   await evaluate(`void prepareImage(new File([Uint8Array.from(atob('${syntheticPng.toString('base64')}'),c=>c.charCodeAt(0))],'synthetic-delayed.png',{type:'image/png'}))`);
   await until("imagePreparing && typeof globalThis.releaseBitmap==='function'");
-  await evaluate("document.getElementById('reader-disconnect').click()");await until("lastState.reader.phase==='disconnected' && !busy");
+  await evaluate("document.getElementById('reader-disconnect').click()");await until("lastState.reader.phase==='disconnected' && !busy && !refreshing && !el('reader-connect').disabled");
   await evaluate("document.getElementById('reader-connect').click()");
   await until("lastState.reader.phase==='connected' && currentPage?.messages?.length===40 && !busy && !refreshing && !ackInFlight");
   assert.equal(await evaluate('!userSelected && reconnectRoom===selectedRoom'),true);assert.equal(seenCalls.length,beforeDraftReconnectSeen);
@@ -344,7 +455,7 @@ try{
   await until("document.getElementById('chat-title').textContent==='모의 대화방 B' && !document.getElementById('history-load').disabled");
   await evaluate("document.getElementById('pin-room').click()");
   await evaluate("document.getElementById('compose-text').value='재접속 초안';document.getElementById('compose-text').dispatchEvent(new Event('input'))");
-  await evaluate("document.getElementById('reader-disconnect').click()");await until("lastState.reader.phase==='disconnected' && !busy");
+  await evaluate("document.getElementById('reader-disconnect').click()");await until("lastState.reader.phase==='disconnected' && !busy && !refreshing && !el('reader-connect').disabled");
   offlineMessages.set(second,['offline-A','offline-B','offline-C'].map((text,i)=>({key:'m_'+(100+i).toString(16).padStart(24,'0'),text,sender:'모의 사용자',mine:false,at:1800000200000+i*1000})));
   const beforeReconnectHistory=historyRooms.length,beforeReconnectSeen=seenCalls.length;
   await evaluate("document.getElementById('reader-connect').click()");
@@ -357,7 +468,7 @@ try{
   await refreshUi();assert.equal(historyRooms.length,beforeReconnectHistory+1);assert.equal(seenCalls.length,beforeReconnectSeen);
   assert.equal(await evaluate('reconnectRoom===selectedRoom && !userSelected'),true);
   const repeatHistory=historyRooms.length,repeatSeen=seenCalls.length,repeatSends=sendCalls.length;
-  await evaluate("document.getElementById('reader-disconnect').click()");await until("lastState.reader.phase==='disconnected' && !busy");
+  await evaluate("document.getElementById('reader-disconnect').click()");await until("lastState.reader.phase==='disconnected' && !busy && !refreshing && !el('reader-connect').disabled");
   await evaluate("document.getElementById('reader-connect').click()");
   await until("document.getElementById('chat-title').textContent==='모의 대화방 B' && document.getElementById('message-list').textContent.includes('offline-C') && !refreshing");
   assert.deepEqual(historyRooms.slice(repeatHistory),[second]);assert.equal(seenCalls.length,repeatSeen);assert.equal(sendCalls.length,repeatSends);
@@ -367,7 +478,7 @@ try{
   removedRooms.add(second);revision++;await refreshUi();
   assert.equal(await evaluate('reconnectRoom===null && !userSelected && document.querySelectorAll(".room-item").length===1'),true);
   const missingHistory=historyRooms.length,missingSeen=seenCalls.length,missingSends=sendCalls.length;
-  await evaluate("document.getElementById('reader-disconnect').click()");await until("lastState.reader.phase==='disconnected' && !busy");
+  await evaluate("document.getElementById('reader-disconnect').click()");await until("lastState.reader.phase==='disconnected' && !busy && !refreshing && !el('reader-connect').disabled");
   await evaluate("document.getElementById('reader-connect').click()");
   await until("lastState.reader.phase==='connected' && document.querySelectorAll('.room-item').length===1 && !refreshing && !busy");
   assert.equal(historyRooms.length,missingHistory);assert.equal(seenCalls.length,missingSeen);assert.equal(sendCalls.length,missingSends);
@@ -393,6 +504,7 @@ try{
   await evaluate("document.getElementById('filter-pinned').click()");await until("roomFilter==='pinned' && !settingsBusy");
   await call('Page.reload');await until("typeof personalSettings!=='undefined' && personalSettings?.persist===true && roomFilter==='pinned' && document.querySelectorAll('.room-item').length===1");
   assert.equal(await evaluate("document.querySelector('.room-item strong').textContent.startsWith('모의 대화방 B')"),true);
+  await checkLifecycle();
   await evaluate("if(document.getElementById('account-panel').hidden)document.getElementById('account-toggle').click()");assert.equal(await evaluate("document.getElementById('account-panel').hidden"),false);
   await evaluate("document.getElementById('cancel').click()");await until("document.getElementById('reader-panel').hidden && document.getElementById('message-list').childElementCount===0");
   assert.equal(await evaluate("document.getElementById('chat-title').textContent"),'대화방을 선택해 주세요');
@@ -404,7 +516,8 @@ try{
   assert.equal(await evaluate("document.getElementById('message').textContent.includes('지원하지 않는 인증 응답')"),true);
   assert.equal(await evaluate("document.getElementById('reader-status').textContent"),'인증이 완료되지 않았습니다.');
   assert.equal(await evaluate("document.getElementById('start').disabled && document.getElementById('qr').hidden"),true);
-  console.log(JSON.stringify({passed:true,scope:'synthetic offline browser only',checks:['QR caching','room selection queue','DOM and scroll retention','hidden polling','text-only rendering','unread badge and total','local rename and reset','receipt count disappears on read','hidden/unfocused/scrolled room is not acknowledged','visible latest message acknowledgement','optional server read sync','IME Enter does not send','double-click sends once','unknown send preserves draft without retry','room pin ordering and filters retain selection and drafts','literal message search and result navigation','search does not acknowledge incoming messages','clipboard success and denial without OS clipboard access','pins survive transport reconnect and clear on account close','reconnect restores selected room and draft','offline messages fetched once without load button or read notification','cancel purges account data','QR -151 neutral message','all dialogs and account overlay block read and closing resumes eligible read','rejected photo draft is invalidated on reconnect','in-flight image preparation is canceled on reconnect and fresh selection remains usable','default automatic room does not become a reconnect target','changed and removed room targets stay isolated across reconnects','account close clears reconnect intent'],visibleRequests,hiddenRequests,screenshot:folder+'/synthetic-reader.png',actualAccountUsed:false}));
+  console.log(JSON.stringify({passed:true,scope:'synthetic offline browser only',checks:['QR caching','room selection queue','DOM and scroll retention','hidden polling','text-only rendering','unread badge and total','local rename and reset','receipt count disappears on read','hidden/unfocused/scrolled room is not acknowledged','visible latest message acknowledgement','optional server read sync','IME Enter does not send','double-click sends once','unknown send preserves draft without retry','room pin ordering and filters retain selection and drafts','literal message search and result navigation','search does not acknowledge incoming messages','clipboard success and denial without OS clipboard access','pins survive transport reconnect and clear on account close','reconnect restores selected room and draft','offline messages fetched once without load button or read notification','cancel purges account data','QR -151 neutral message','all dialogs and account overlay block read and closing resumes eligible read','rejected photo draft is invalidated on reconnect','in-flight image preparation is canceled on reconnect and fresh selection remains usable','default automatic room does not become a reconnect target','changed and removed room targets stay isolated across reconnects','account close clears reconnect intent',...lifecycleChecks],visibleRequests,hiddenRequests,screenshot:folder+'/synthetic-reader.png',actualAccountUsed:false}));
+  }
 }finally{
   ws?.close();
   let chromeExitObserved=Boolean(browser && (browser.exitCode!==null || browser.signalCode!==null));

@@ -14,6 +14,7 @@ export function createReaderSession(credential,factory,emit) {
   const gapProbes=new Map();
   const readProbed=new Set();
   const discoveryQueue=new Map(),discoveryAttempted=new Set();let discoveryPromise=null,discoveryInFlight=null,discoverTimer=null,reportFailure;
+  let titleQueue=[],titlePromise=null;
   let nextMessageId=Date.now()%0x3fffffff;
   const uploadAbort=new AbortController();
   const publish=(update,source)=>{
@@ -23,13 +24,28 @@ export function createReaderSession(credential,factory,emit) {
   const stopped=new Promise(resolve=>{resolveStop=resolve;});
   const close=()=>{
     if(closed)return;closed=true;uploadAbort.abort();
-    clearInterval(pingTimer);clearTimeout(discoverTimer);carriage?.stopPing();carriage?.disconnect();store?.clear();cursors.clear();gapProbes.clear();readProbed.clear();discoveryQueue.clear();discoveryAttempted.clear();resolveStop();
+    clearInterval(pingTimer);clearTimeout(discoverTimer);carriage?.stopPing();carriage?.disconnect();store?.clear();cursors.clear();gapProbes.clear();readProbed.clear();discoveryQueue.clear();discoveryAttempted.clear();titleQueue=[];resolveStop();
   };
   function scheduleDiscovery(){
     clearTimeout(discoverTimer);
-    if(closed || busy || discoveryPromise || !discoveryQueue.size)return;
+    if(closed || busy || discoveryPromise || titlePromise || !discoveryQueue.size && !titleQueue.length)return;
     discoverTimer=setTimeout(()=>{
-      if(closed || busy || discoveryPromise)return;
+      if(closed || busy || discoveryPromise || titlePromise)return;
+      if(!discoveryQueue.size){
+        const key=titleQueue.shift();if(!key)return;
+        titlePromise=Promise.resolve().then(async()=>{
+          if(closed)return;
+          try{
+            const response=await carriage.request('CHATINFO',{chatId:factory.toLong(store.serverRoomId(key))},3000);
+            if(closed || responseStatus(response)!==0 || response?.method!==undefined && response.method!=='CHATINFO')return;
+            if(store.recoverTitle(key,response.body))emit({type:'reader-rooms',rooms:store.rooms(),stats:store.stats(),source:'push'});
+          }catch{
+            // Optional metadata rejection/decoding is nonfatal. A real socket
+            // error/close still reaches the existing transport listeners.
+          }
+        }).finally(()=>{titlePromise=null;scheduleDiscovery();});
+        return;
+      }
       const [id,packets]=discoveryQueue.entries().next().value;discoveryQueue.delete(id);discoveryAttempted.add(id);
       discoveryInFlight={id,packets};
       discoveryPromise=(async()=>{
@@ -55,6 +71,7 @@ export function createReaderSession(credential,factory,emit) {
         void probeRoomCount(credential,factory,async(client,body)=>{
           if(closed)return;
           carriage=client;store=createReaderStore(body,credential.userId,factory.sessionSalt,factory.settingsSecret,{onCacheEvicted:key=>{cursors.delete(key);gapProbes.delete(key);}});
+          titleQueue=store.unnamedRooms(8);
           carriage.on('disconnected',()=>fail('disconnected'));
           carriage.on('error',()=>fail('transport'));
           carriage.on('push',packet=>{
@@ -95,6 +112,7 @@ export function createReaderSession(credential,factory,emit) {
           };
           pingTimer=(factory.every ?? setInterval)(heartbeat,30000);pingTimer?.unref?.();
           announced=true;emit({type:'reader-rooms',rooms:store.rooms(),stats:store.stats(),source:'loginlist'});resolve({ok:true});
+          scheduleDiscovery();
           await stopped;
         }).then(result=>{
           if(!announced){if(!closed)fail(result.stage,result.status);resolve({ok:false});}
@@ -102,6 +120,7 @@ export function createReaderSession(credential,factory,emit) {
       });
     },
     async history(key,requestId) {
+      if(titlePromise)await titlePromise;
       if(discoveryPromise)await discoveryPromise;
       if(closed || !store || !carriage || busy || !store.has(key))return false;
       // A zero max was rejected by the actual server. Use only a bound already
@@ -160,6 +179,7 @@ export function createReaderSession(credential,factory,emit) {
       finally{busy=false;scheduleDiscovery();}
     },
     async action(key,requestId,action,payload={}){
+      if(titlePromise)await titlePromise;
       if(discoveryPromise)await discoveryPromise;
       if(factory.messaging!==true || closed || busy || !store?.has(key) || !store.canSend(key))return false;
       if(!['send','photo','context','read'].includes(action))return false;
