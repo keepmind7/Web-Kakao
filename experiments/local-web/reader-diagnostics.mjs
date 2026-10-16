@@ -1,9 +1,11 @@
 import { mkdirSync,writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
+import { responseStatus } from './reader-response.mjs';
 
 const FIELDS=new Set(['chatDatas','chatInfos','chats','chatRooms','chatList','chatId','id','roomId','chatRoomId','c','t','a','n','s','l','i','k','ll','o','title','roomName','name','subject','meta','chatMetas','type','content','displayMembers','displayNickNames','displayNicknames','displayNames','nickName','nickname','profileName','displayName','lastChatLog','lastLog','chatLog','log','chatLogs','logs','msgs','messages','logId','msgId','message','msg','text','authorId','senderId','userId','writerId','sendAt','createdAt','updatedAt','lastChatLogId','lastLogId','isOK','minLogId','jsi','lastTokenId','lastChatId','status']);
-const METHODS=new Set(['GETCONF','CHECKIN','LOGINLIST','SYNCMSG','MCHATLOGS','PING','MSG','KICKOUT','CHANGESVR','BLSYNC','CHATINFO']);
+const METHODS=new Set(['GETCONF','CHECKIN','LOGINLIST','SYNCMSG','MCHATLOGS','PING','MSG','KICKOUT','CHANGESVR','BLSYNC','CHATINFO','WRITE','CHATONROOM','NOTIREAD','DECUNREAD','SHIP','POST','COMPLETE']);
+for(const field of ['m','mi','w','watermark','chatInfo','lastSeenLogId','activeMembersCount','left','attachment','url','thumbnailUrl','imageUrls','thumbnailUrls','h','wl','hl'])FIELDS.add(field);
 export const safeMethod=value=>METHODS.has(value)?value:'other';
 export function schemaShape(value,depth=0){
   if(value===null)return {type:'null'};
@@ -19,19 +21,24 @@ export function safeFault(error){
   const stack=typeof error?.stack==='string'?error.stack:'';
   return {category:names.has(error?.name)?error.name:'other',frames:['onData','decrypt','fromBuffer','deserialize','syncMsg','history','request'].filter(name=>new RegExp('\\b'+name+'\\b').test(stack))};
 }
-export function createReaderDiagnostic(){
+export function createReaderDiagnostic({writeSnapshot=null}={}){
   const folder=new URL('../../local-only/web-auth/',import.meta.url),path=new URL('reader-diagnostic.json',folder);
-  const state={runId:randomUUID(),startedAt:Date.now(),rawValuesRecorded:false,lastOperation:'startup',events:[]};let ended=false;
-  const save=()=>{try{mkdirSync(fileURLToPath(folder),{recursive:true});writeFileSync(path,JSON.stringify(state,null,2)+'\n');}catch{/* Never fall back to raw stderr. */}};
+  const state={runId:randomUUID(),startedAt:Date.now(),rawValuesRecorded:false,lastOperation:'startup',readSync:{requests:0,responses:0,accepted:0,rejected:0,unknown:0},events:[]};let ended=false;
+  const save=()=>{try{const data=JSON.stringify(state,null,2)+'\n';if(writeSnapshot)writeSnapshot(data);else{mkdirSync(fileURLToPath(folder),{recursive:true});writeFileSync(path,data);}}catch{/* Never fall back to raw stderr. */}};
   return {
     note(event,details={}){
       if(ended)return;
+      if(event==='request' && details.method==='NOTIREAD')state.readSync.requests++;
       state.lastOperation=typeof details.method==='string'?safeMethod(details.method):state.lastOperation;
       state.events.push({event,elapsedMs:Date.now()-state.startedAt,...details});state.events=state.events.slice(-40);save();
     },
     packet(direction,packet){
       const method=safeMethod(packet?.method);
       const body=packet?.body;
+      if(!ended && direction==='response' && method==='NOTIREAD'){
+        const status=responseStatus(packet);state.readSync.responses++;
+        state.readSync[status===0?'accepted':Number.isInteger(status)?'rejected':'unknown']++;
+      }
       this.note(direction,{method,status:Number.isInteger(packet?.status)?packet.status:null,bodyStatus:Number.isInteger(body?.status)?body.status:null,isOK:typeof body?.isOK==='boolean'?body.isOK:null,schema:schemaShape(body)});
     },
     end(reason,error){if(ended)return;state.exitReason=reason;if(error)state.fault=safeFault(error);ended=true;save();},

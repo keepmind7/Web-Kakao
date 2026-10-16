@@ -1,4 +1,4 @@
-"""네트워크·계정 접근 없이 Phase 1 문서와 고정 소스 해시를 확인한다."""
+"""네트워크·계정 접근 없이 문서와 최신 단계의 소스 해시를 확인한다."""
 import hashlib
 import json
 import re
@@ -22,10 +22,11 @@ for document in documents:
             issues.append(f"없는 로컬 링크: {document.relative_to(ROOT)} → {link}")
 
 hash_count = 0
+latest_source_manifest = next(path for path in [ROOT / "evidence/phase3/source-manifest.json", ROOT / "evidence/phase2/source-manifest.json", ROOT / "evidence/local-web/source-manifest.json"] if path.exists())
 for base, manifest in [
     (ROOT, ROOT / "evidence/experiment-source-manifest.json"),
     (ROOT / "tools/vendor/codex_harness", ROOT / "tools/vendor/codex_harness/source-manifest.json"),
-    (ROOT, ROOT / ("evidence/phase2/source-manifest.json" if (ROOT / "evidence/phase2/source-manifest.json").exists() else "evidence/local-web/source-manifest.json")),
+    (ROOT, latest_source_manifest),
 ]:
     data = json.loads(manifest.read_text(encoding="utf-8"))
     for entry in data["files"]:

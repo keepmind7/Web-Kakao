@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { schemaShape,safeFault,safeMethod } from '../experiments/local-web/reader-diagnostics.mjs';
+import { schemaShape,safeFault,safeMethod,createReaderDiagnostic } from '../experiments/local-web/reader-diagnostics.mjs';
 import { guardReaderClient } from '../experiments/local-web/reader-protocol.mjs';
 import { createReaderStore } from '../experiments/local-web/reader-data.mjs';
 import { responseStatus } from '../experiments/local-web/reader-response.mjs';
@@ -14,6 +14,18 @@ test('diagnostics contain structural metadata only, including for unknown field 
   const fault=safeFault({name:'RangeError',message:'FAKE_PRIVATE_TOKEN',stack:'RangeError FAKE_PRIVATE_MESSAGE\n at onData (C:/PRIVATE_ACCOUNT/forge-protocol.ts:1)'});
   assert.deepEqual(fault,{category:'RangeError',frames:['onData']});assert.equal(JSON.stringify(fault).includes('PRIVATE'),false);
   assert.equal(safeMethod('FAKE_PRIVATE_METHOD'),'other');
+});
+test('read acknowledgement counts survive the rolling log without retaining message or room identifiers',()=>{
+  let snapshot;
+  const diagnostic=createReaderDiagnostic({writeSnapshot:value=>{snapshot=JSON.parse(value);}});
+  for(const body of [{status:0},{status:-203},{status:'invalid'}]){
+    diagnostic.note('request',{method:'NOTIREAD'});
+    diagnostic.packet('response',{method:'NOTIREAD',status:0,body:{...body,chatId:'9007199254740993',msg:'FAKE_PRIVATE_TEXT'}});
+  }
+  for(let i=0;i<45;i++)diagnostic.note('request',{method:'PING'});
+  assert.equal(snapshot.events.length,40);
+  assert.deepEqual(snapshot.readSync,{requests:3,responses:3,accepted:1,rejected:1,unknown:1});
+  for(const value of ['9007199254740993','FAKE_PRIVATE_TEXT'])assert.equal(JSON.stringify(snapshot).includes(value),false);
 });
 test('compact LOGINLIST nickname arrays label rooms without network queries',()=>{
   const store=createReaderStore({chatDatas:[{c:'9007199254740993',k:['예시 이름 A','예시 이름 B'],i:['111','222']}]},'333');

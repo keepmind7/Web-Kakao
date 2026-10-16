@@ -3,10 +3,10 @@ import { normalizedResponse } from './reader-response.mjs';
 
 // The pinned SDK matches a packet ID before checking the method. A server push
 // with the same numeric ID must not resolve a pending history request.
-export function guardReaderClient(Client,diagnostic){
+export function guardReaderClient(Client,diagnostic,{messaging=false,media=false}={}){
   return class extends Client{
     async request(method,...args){
-      if(!allowedReaderMethod(method))throw new Error('read_only_required');
+      if(media?!(messaging && method==='POST'):!allowedReaderMethod(method,{messaging}))throw new Error('read_only_required');
       diagnostic?.note('request',{method});
       const response=await super.request(method,...args);
       diagnostic?.packet('response',response);

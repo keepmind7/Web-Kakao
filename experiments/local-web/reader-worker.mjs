@@ -20,7 +20,7 @@ function send(message) {
     process.send(message,()=>{clearTimeout(fallback);stop('session-failed');});
   }else process.send(message);
 }
-function bound(){clearTimeout(operationTimer);operationTimer=setTimeout(()=>{diagnostic?.end('operation-deadline');process.exit(3);},20000);}
+function bound(ms=20000){clearTimeout(operationTimer);operationTimer=setTimeout(()=>{diagnostic?.end('operation-deadline');process.exit(3);},ms);}
 process.on('message',async message=>{
   if(message?.type==='reader-close'){stop();return;}
   if(message?.type==='reader-start' && !started){
@@ -30,9 +30,13 @@ process.on('message',async message=>{
       if(typeof credential?.accessToken!=='string' || typeof credential?.userId!=='string' || typeof credential?.deviceUUID!=='string')throw new Error('credential_shape');
       checkPinnedSource({workingCopy:true});
       const sdk=await import('../../local-only/spikes/modern/src/kakao/forge-protocol.ts');
-      const guard=Client=>guardReaderClient(Client,diagnostic);
+      const messaging=message.messaging===true;
+      const guard=Client=>guardReaderClient(Client,diagnostic,{messaging});
       const Booking=guard(sdk.BookingClient),Ticket=guard(sdk.TicketClient),Carriage=guard(sdk.CarriageClient);
-      session=createReaderSession(credential,{booking:()=>new Booking(),ticket:()=>new Ticket(),carriage:()=>new Carriage(),toLong:sdk.toLong,gapProbe:message.gapProbe===true,observeHistory:details=>diagnostic.note('history-page',details)},event=>{
+      const Media=guardReaderClient(sdk.CarriageClient,diagnostic,{messaging,media:true});
+      const sessionSalt=typeof message.sessionSalt==='string' && /^[a-f0-9]{64}$/.test(message.sessionSalt)?Buffer.from(message.sessionSalt,'hex'):undefined;
+      const settingsSecret=typeof message.settingsSecret==='string' && /^[a-f0-9]{64}$/.test(message.settingsSecret)?Buffer.from(message.settingsSecret,'hex'):null;
+      session=createReaderSession(credential,{booking:()=>new Booking(),ticket:()=>new Ticket(),carriage:()=>new Carriage(),media:()=>new Media(),toLong:sdk.toLong,messaging,sessionSalt,settingsSecret,gapProbe:message.gapProbe===true,readProbe:true,observeRead:details=>diagnostic.note('read-verification',details),observeHistory:details=>diagnostic.note('history-page',details),observeUpload:details=>diagnostic.note('photo-upload',details)},event=>{
         send(event);
       });
       await session.start();clearTimeout(operationTimer);operationBusy=false;
@@ -44,6 +48,13 @@ process.on('message',async message=>{
     operationBusy=true;bound();
     const accepted=await session.history(message.key,message.requestId);clearTimeout(operationTimer);
     operationBusy=false;
+    if(!accepted)send({type:'reader-request-rejected',requestId:message.requestId});
+  }
+  if(message?.type==='reader-action' && session && roomKeyValid(message.key) && Number.isSafeInteger(message.requestId)){
+    if(operationBusy){send({type:'reader-request-rejected',requestId:message.requestId});return;}
+    operationBusy=true;bound(message.action==='photo'?70000:24000);
+    const accepted=await session.action(message.key,message.requestId,message.action,message.payload);
+    clearTimeout(operationTimer);operationBusy=false;
     if(!accepted)send({type:'reader-request-rejected',requestId:message.requestId});
   }
 });

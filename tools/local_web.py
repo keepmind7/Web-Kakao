@@ -35,7 +35,7 @@ def connect():
 
 def public_status(url, state):
     # Allowlist only: never serialize QR grid, passcode, cookies, CSRF or credentials.
-    return {"url": url, **{key: state[key] for key in ["build", "gapProbe", "mode", "phase", "stage", "httpStatus", "apiStatus", "qrIssued", "credentialInMemory", "actualChatConnected", "chatConnectionActive", "actualMessageSent", "requests", "roomProbe", "reader"] if key in state}}
+    return {"url": url, **{key: state[key] for key in ["build", "gapProbe", "messaging", "mode", "phase", "stage", "httpStatus", "apiStatus", "qrIssued", "credentialInMemory", "actualChatConnected", "chatConnectionActive", "actualMessageSent", "requests", "roomProbe", "reader"] if key in state}}
 
 
 def main():
@@ -45,6 +45,7 @@ def main():
     parser.add_argument("action", choices=["start", "status", "stop", "attempt", "probe"])
     parser.add_argument("--mock", action="store_true")
     parser.add_argument("--gap-probe", action="store_true", help="누락 구간에 MCHATLOGS를 한 번 확인하는 읽기 실험")
+    parser.add_argument("--messaging", action="store_true", help="텍스트 전송과 읽음 상태 기능 활성화")
     parser.add_argument("--port", type=int, default=8787)
     args = parser.parse_args()
     try:
@@ -53,6 +54,9 @@ def main():
         current = None
     if args.action == "start":
         if current:
+            if bool(current[2].get("messaging")) != args.messaging:
+                print("기존 서버와 요청한 대화 기능 모드가 다릅니다. 현재 세션을 유지했습니다. 모드를 바꾸려면 세션 정리 후 서버를 다시 시작하세요.")
+                return 2
             if bool(current[2].get("gapProbe")) != args.gap_probe:
                 print("기존 서버와 요청한 조회 모드가 다릅니다. 현재 세션은 유지했습니다. 모드를 바꾸려면 웹에서 로컬 세션 삭제 후 stop, 원하는 모드로 start 하세요.")
                 return 2
@@ -68,6 +72,8 @@ def main():
             command.append("--live")
         if args.gap_probe:
             command.append("--gap-probe")
+        if args.messaging:
+            command.append("--messaging")
         with (FOLDER / "server.stdout.log").open("ab") as stdout, (FOLDER / "server.stderr.log").open("ab") as stderr:
             process = subprocess.Popen(command, cwd=ROOT, env=env, stdout=stdout, stderr=stderr,
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)

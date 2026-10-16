@@ -2,11 +2,143 @@
 const el = id => document.getElementById(id);
 let csrf = null, busy = false, expiresAt = null;
 let refreshing=false,hasAccount=false,readerGeneration=0,readerRevision=-1,selectedRoom=null,roomsCache=[],lastState=null,actionEpoch=0,readerAttempt=null;
-let pendingSelection=null;
+let pendingSelection=null,reconnectRoom=null;
 let renderedRooms=null,renderedMessages=null,renderedMessageRoom=null,renderedQr=null;
+let userSelected=false,currentPage=null,ackInFlight=false,pendingSend=null,uncertainPhoto=null,renameTarget=null;
+const drafts=new Map(),sendNotes=new Map();
+const pinnedRooms=new Set();
+let roomFilter='all',messageQuery='',searchMatches=[],searchIndex=-1,copyStatusTimer=null;
+let personalSettings=null,settingsRevision=-1,settingsBusy=false,settingsEpoch=0,notificationBusy=false;
+const shownNotifications=new Map();
+const replyDrafts=new Map();let imageDraft=null,imagePreparing=false,imageEpoch=0;
+let messageMenuTarget=null,messageMenuTimer=null;
+function closeMessageMenu(restoreFocus=false){
+  clearTimeout(messageMenuTimer);messageMenuTimer=null;
+  const previous=messageMenuTarget;messageMenuTarget=null;el('message-menu').hidden=true;
+  if(restoreFocus && previous?.element.isConnected)previous.element.focus({preventScroll:true});
+}
+function menuMessage(){
+  const target=messageMenuTarget;
+  return hasAccount && target?.generation===readerGeneration && target.room===selectedRoom && currentPage?.key===selectedRoom
+    ?currentPage.messages?.find(message=>message.key===target.message):null;
+}
+function openMessageMenu(element,room,message,{x,y,keyboard=false}={}){
+  if(!hasAccount || room!==selectedRoom)return;
+  clearTimeout(messageMenuTimer);
+  messageMenuTarget={element,room,message:message.key,generation:readerGeneration};
+  const menu=el('message-menu'),reply=el('message-menu-reply');
+  reply.hidden=!(message.canReply && roomNow()?.canSend && lastState?.messaging && lastState?.build>=6);
+  reply.disabled=Boolean(pendingSend);menu.hidden=false;
+  const bounds=element.getBoundingClientRect(),size=menu.getBoundingClientRect(),pane=document.querySelector('.chat-scroll').getBoundingClientRect();
+  if(!Number.isFinite(x) || !Number.isFinite(y)){
+    const side=element.classList.contains('mine')?bounds.left-size.width-8:bounds.right+8;
+    if(side>=pane.left+6 && side+size.width<=pane.right-6){x=side;y=bounds.top;}
+    else{x=bounds.right-size.width;y=bounds.top>=size.height+8?bounds.top-size.height-6:bounds.bottom+6;}
+  }
+  menu.style.left=Math.max(6,Math.min(x,window.innerWidth-size.width-6))+'px';
+  menu.style.top=Math.max(6,Math.min(y,window.innerHeight-size.height-6))+'px';
+  if(keyboard)(reply.hidden?el('message-menu-copy'):reply).focus();
+}
+function scheduleMessageMenuClose(){clearTimeout(messageMenuTimer);messageMenuTimer=setTimeout(()=>closeMessageMenu(),180);}
+function preferenceReady(){return lastState?.preferences===true && personalSettings!==null;}
+function roomNow(){return roomsCache.find(room=>room.key===selectedRoom);}
+function nearBottom(){const scroll=document.querySelector('.chat-scroll');return scroll.scrollHeight-scroll.clientHeight-scroll.scrollTop<=48;}
+async function postLocal(path,body){
+  if(!csrf)return false;
+  const response=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify(body)});
+  if(!response.ok)return false;
+  await response.json();return true;
+}
+function renderComposer(){
+  const room=roomNow(),ready=hasAccount && lastState?.reader?.phase==='connected';
+  const writable=ready && lastState?.messaging===true && room?.canSend===true;
+  el('rename-room').disabled=!hasAccount || !room;
+  el('pin-room').disabled=!hasAccount || !room || settingsBusy;
+  el('pin-room').textContent=pinnedRooms.has(selectedRoom)?'고정 해제':'고정';
+  el('pin-room').setAttribute('aria-pressed',String(pinnedRooms.has(selectedRoom)));
+  el('message-search-toggle').disabled=!hasAccount || !room;
+  el('mute-room').disabled=!hasAccount || !room || !preferenceReady() || settingsBusy;
+  el('mute-room').textContent=room?.muted?'알림 켜기':'알림 끄기';el('mute-room').setAttribute('aria-pressed',String(room?.muted===true));
+  el('browser-notifications').disabled=!hasAccount || !preferenceReady() || settingsBusy || !('Notification' in window) || !('silent' in Notification.prototype);
+  el('persist-preferences').disabled=!hasAccount || !preferenceReady() || !personalSettings.storageAvailable || settingsBusy;
+  el('forget-preferences').disabled=!hasAccount || !preferenceReady() || settingsBusy;
+  for(const filter of ['all','unread','pinned']){el('filter-'+filter).disabled=!hasAccount;el('filter-'+filter).setAttribute('aria-pressed',String(roomFilter===filter));}
+  el('read-sync').disabled=lastState?.messaging!==true;
+  el('compose-text').disabled=!writable || Boolean(pendingSend);
+  el('attach-image').disabled=!writable || lastState?.build<6 || Boolean(pendingSend) || Boolean(uncertainPhoto) || imagePreparing;
+  el('image-send').disabled=!writable || busy || ackInFlight || Boolean(pendingSend) || Boolean(uncertainPhoto) || lastState?.reader?.operationBusy===true || imagePreparing;
+  const reply=replyDrafts.get(selectedRoom);el('reply-preview').hidden=!reply;
+  el('reply-author').textContent=reply?reply.sender+'에게 답장':'';el('reply-text').textContent=reply?.text || '';
+  el('reply-cancel').disabled=false;
+  el('send-message').disabled=!writable || busy || ackInFlight || Boolean(pendingSend) || lastState?.reader?.operationBusy===true || !el('compose-text').value.trim();
+  el('send-status').textContent=pendingSend?.phase==='unknown'?(pendingSend.kind==='photo'?'사진 전송 결과를 확인할 수 없습니다. 휴대폰에서 도착 여부를 확인해 주세요.':'전송 결과를 확인할 수 없습니다. 대화에서 도착 여부를 확인해 주세요.')
+    :pendingSend?(pendingSend.kind==='photo'?'사진을 보내고 있습니다…':'메시지를 보내고 있습니다…'):uncertainPhoto?'사진 전송 결과는 미확인입니다. 텍스트와 답장은 계속 보낼 수 있습니다.':sendNotes.get(selectedRoom) || (!ready?'계정을 연결하고 대화방을 선택해 주세요.':!writable?'이 방은 현재 읽기 전용입니다.':'');
+  el('send-reset').hidden=pendingSend?.phase!=='unknown' && !uncertainPhoto;
+  el('send-reset').textContent=pendingSend?.phase==='unknown'?'전송 결과를 확인했어요':'사진 도착 여부를 확인했어요';
+  const count=room?.unreadLocalCount || 0;
+  el('new-messages').hidden=!count || nearBottom();el('new-messages').textContent=`새 메시지 ${count>99?'99+':count}개 ↓`;
+}
+function markSendUnknown(pending){
+  if(pendingSend!==pending)return;
+  if(pending.kind==='photo'){pending.phase='unknown';uncertainPhoto=pending;pendingSend=null;}
+  else pending.phase='unknown';
+  renderComposer();
+}
+async function refreshPendingSend(){
+  if(!pendingSend || !hasAccount)return;
+  const pending=pendingSend;
+  try{
+    const page=await localJson('/api/reader/messages?room='+encodeURIComponent(pending.room));
+    if(pendingSend!==pending || !hasAccount)return;
+    const outcome=page.outbox?.find(entry=>entry.clientId===pending.clientId);
+    if(!outcome || outcome.phase==='sending')return;
+    if(outcome.phase==='unknown'){markSendUnknown(pending);return;}
+    if(outcome.phase==='accepted'){
+      if(pending.kind==='photo'){clearImageDraft();}
+      else{drafts.delete(pending.room);if(selectedRoom===pending.room && el('compose-text').value===pending.text)el('compose-text').value='';if(replyDrafts.get(pending.room)?.key===pending.replyTo)replyDrafts.delete(pending.room);}
+      sendNotes.set(pending.room,'서버에 전송했습니다.');
+    }else sendNotes.set(pending.room,'전송하지 못했습니다. 연결 상태를 확인해 주세요.');
+    pendingSend=null;
+    renderComposer();
+    if(pending.focusInput && selectedRoom===pending.room && document.hasFocus() && !document.hidden
+      && ['BODY','send-message','compose-text'].includes(document.activeElement?.id || document.activeElement?.tagName)
+      && el('account-panel').hidden && !el('rename-dialog').open && !el('image-send-dialog').open && !el('compose-text').disabled)el('compose-text').focus({preventScroll:true});
+    if(outcome.phase==='accepted' && selectedRoom===pending.room){
+      const generation=readerGeneration;
+      await refreshMessages(pending.room,generation);
+      if(hasAccount && generation===readerGeneration && selectedRoom===pending.room){const pane=document.querySelector('.chat-scroll');pane.scrollTop=pane.scrollHeight;}
+    }
+  }catch{/* Keep the same request identity; never automatically resend. */}
+}
+async function maybeSeen(){
+  const room=roomNow(),page=currentPage;
+  if(ackInFlight || busy || settingsBusy || pendingSend || messageQuery || !userSelected || document.hidden || !document.hasFocus() || !nearBottom()
+    || !hasAccount || lastState?.reader?.phase!=='connected' || lastState.reader.operationBusy
+    || page?.key!==selectedRoom || !page.latestVisible || !page.seenToken || ['loading','failed','unrecognized'].includes(page.history?.phase))return;
+  const lastMessage=page.messages?.at(-1)?.key;
+  if(!lastMessage)return;
+  // A gap in older history does not undo seeing the latest message. The server
+  // acknowledgement, rather than HTTP queue acceptance, determines completion.
+  const submitted=page.readSync?.messageKey===lastMessage && ['sending','accepted','unknown','failed'].includes(page.readSync.phase);
+  const notify=lastState.messaging===true && room?.canSend===true && el('read-sync').checked && !submitted;
+  if(!notify && !room?.unreadLocalCount)return;
+  const key=selectedRoom,generation=readerGeneration;ackInFlight=true;renderComposer();
+  try{if(await postLocal('/api/reader/seen',{room:key,token:page.seenToken,notify}) && generation===readerGeneration)readerRevision=-1;}
+  catch{/* A failed local acknowledgement must not erase the badge. */}
+  finally{ackInFlight=false;renderComposer();}
+}
+async function advanceRoom(){
+  if(ackInFlight || busy || pendingSend || !userSelected || !hasAccount || lastState?.reader?.phase!=='connected' || lastState.reader.operationBusy)return;
+  if(lastState.messaging===true && roomNow()?.canSend && currentPage?.key===selectedRoom && currentPage.messages?.length && currentPage.receiptPhase==='idle' && currentPage.history?.phase!=='loading'){
+    ackInFlight=true;renderComposer();
+    try{if(await postLocal('/api/reader/context',{room:selectedRoom}))readerRevision=-1;}finally{ackInFlight=false;renderComposer();}
+    return;
+  }
+  await maybeSeen();
+}
 async function flushSelection(){
   const pending=pendingSelection;
-  if(!pending || busy || lastState?.reader?.historyBusy)return;
+  if(!pending || busy || lastState?.reader?.historyBusy || lastState?.reader?.operationBusy)return;
   if(!hasAccount || pending.generation!==readerGeneration || pending.key!==selectedRoom || lastState?.reader?.phase!=='connected'){pendingSelection=null;return;}
   pendingSelection=null;
   if(roomsCache.find(room=>room.key===pending.key)?.historyAvailable!==false)await act('/api/reader/history',{room:pending.key});
@@ -16,16 +148,23 @@ function renderChatHeading(){
   const room=roomsCache.find(row=>row.key===selectedRoom);
   el('chat-title').textContent=room?.title || '대화방을 선택해 주세요';
   el('chat-avatar').textContent=room?.title?.slice(0,1) || 'W';
-  el('chat-subtitle').textContent=room ? '읽기 전용' : '대화방을 선택해 주세요';
+  el('chat-subtitle').textContent=room ? (lastState?.messaging && room.canSend?'로컬 대화':'읽기 전용') : '대화방을 선택해 주세요';
   el('welcome').hidden=Boolean(room);
 }
 const labels = { idle:'로그인 준비', checking:'등록 허용 확인', generating:'QR 요청 중', waiting:'휴대폰으로 QR 스캔', approval:'휴대폰 승인 대기', authenticated:'인증 응답 확인', blocked:'연결 시도 중단', error:'연결 오류', expired:'인증 시간 만료', cancelled:'로컬 세션 삭제' };
 function render(state) {
   lastState=state;
   const nextAttempt=Number.isInteger(state.reader?.attempts)?state.reader.attempts:null;
+  if(state.credentialInMemory && hasAccount && selectedRoom && userSelected
+    && (nextAttempt!==readerAttempt || ['connecting','disconnected'].includes(state.reader?.phase))){reconnectRoom=selectedRoom;drafts.set(selectedRoom,el('compose-text').value);}
   if(!state.credentialInMemory || (nextAttempt!==null && nextAttempt!==readerAttempt)){
+    closeMessageMenu();
+    if(!state.credentialInMemory)reconnectRoom=null;
     if(hasAccount || nextAttempt!==readerAttempt)readerGeneration++;
     selectedRoom=null;roomsCache=[];readerRevision=-1;
+    userSelected=false;currentPage=null;
+    resetMessageSearch(true);
+    if(!state.credentialInMemory){drafts.clear();replyDrafts.clear();clearImageDraft();sendNotes.clear();pinnedRooms.clear();roomFilter='all';pendingSend=null;uncertainPhoto=null;personalSettings=null;settingsRevision=-1;settingsEpoch++;for(const notice of shownNotifications.values())notice.close();shownNotifications.clear();el('browser-notifications').checked=false;el('persist-preferences').checked=false;el('notification-status').textContent='';el('preferences-status').textContent='';if(el('photo-dialog').open)el('photo-dialog').close();clearTimeout(copyStatusTimer);el('message-action-status').hidden=true;document.title='Web Kakao · 대화';el('compose-text').value='';el('read-sync').checked=false;if(el('rename-dialog').open)el('rename-dialog').close();}
     pendingSelection=null;
     renderedRooms=null;renderedMessages=null;renderedMessageRoom=null;
     el('room-list').replaceChildren();el('message-list').replaceChildren();el('reader-workspace').hidden=true;
@@ -83,34 +222,44 @@ function render(state) {
     : '인증이 확인됐습니다. 대화방을 불러와 주세요.';
   el('history-load').textContent=reader?.historyBusy?'불러오는 중…':'메시지 불러오기';
   el('history-load').disabled=busy || !selectedRoom || roomsCache.find(room=>room.key===selectedRoom)?.historyAvailable===false || reader?.phase!=='connected' || reader?.historyBusy===true;
+  renderComposer();
 }
 async function localJson(path){const response=await fetch(path,{cache:'no-store'});if(!response.ok)throw new Error();return response.json();}
 const time=value=>value ? new Date(value).toLocaleTimeString('ko-KR',{hour:'2-digit',minute:'2-digit'}) : '';
 function renderRooms(){
   const query=el('room-search').value.trim().toLocaleLowerCase();
-  const signature=JSON.stringify([roomsCache,selectedRoom,query]);
+  const signature=JSON.stringify([roomsCache,selectedRoom,query,roomFilter,[...pinnedRooms]]);
   if(signature===renderedRooms)return;
   renderedRooms=signature;
   const fragment=document.createDocumentFragment();
-  const filtered=roomsCache.filter(room=>room.title.toLocaleLowerCase().includes(query));
+  const pinRanks=new Map([...pinnedRooms].map((key,index)=>[key,index]));
+  const filtered=roomsCache.filter(room=>[room.title,room.baseTitle].some(title=>title?.toLocaleLowerCase().includes(query))
+    && (roomFilter!=='unread' || room.unreadLocalCount>0) && (roomFilter!=='pinned' || pinnedRooms.has(room.key)))
+    .sort((a,b)=>Number(pinRanks.has(b.key))-Number(pinRanks.has(a.key)) || (pinRanks.has(a.key)?pinRanks.get(a.key)-pinRanks.get(b.key):(b.lastAt || 0)-(a.lastAt || 0)));
   for(const room of filtered){
     const button=document.createElement('button');button.className='room-item'+(room.key===selectedRoom?' selected':'');button.type='button';button.setAttribute('aria-pressed',String(room.key===selectedRoom));
     const title=document.createElement('strong');title.textContent=room.title;
+    if(pinnedRooms.has(room.key)){const pin=document.createElement('span');pin.className='pin-label';pin.textContent='고정';title.append(pin);}
     const preview=document.createElement('span');preview.className='room-preview';preview.textContent=room.preview || '미리보기 없음';
     const avatar=document.createElement('span');avatar.className='avatar';avatar.textContent=room.title.slice(0,1);avatar.setAttribute('aria-hidden','true');
     const copy=document.createElement('span');copy.className='room-copy';copy.append(title,preview);
     const when=document.createElement('span');when.className='room-time';when.textContent=room.lastAt?new Date(room.lastAt).toLocaleTimeString('ko-KR',{hour:'2-digit',minute:'2-digit'}):'';
-    button.append(avatar,copy,when);button.addEventListener('click',()=>selectRoom(room.key));fragment.append(button);
+    const side=document.createElement('span');side.className='room-side';side.append(when);
+    if(room.unreadLocalCount>0){const badge=document.createElement('span');badge.className='unread-badge';badge.textContent=room.unreadLocalCount>99?'99+':String(room.unreadLocalCount)+(room.unreadCoverage==='partial'?'+':'');badge.setAttribute('aria-label',`이 웹에서 확인하지 않은 새 메시지 ${room.unreadLocalCount}개`);side.append(badge);}
+    button.append(avatar,copy,side);button.addEventListener('click',()=>selectRoom(room.key));fragment.append(button);
   }
-  if(!filtered.length && roomsCache.length){const empty=document.createElement('p');empty.className='sidebar-empty';empty.textContent='검색 결과가 없습니다.';fragment.append(empty);}
+  if(!filtered.length && roomsCache.length){const empty=document.createElement('p');empty.className='sidebar-empty';empty.textContent=query?'검색 결과가 없습니다.':roomFilter==='unread'?'안 읽은 대화방이 없습니다.':'고정한 대화방이 없습니다.';fragment.append(empty);}
   el('room-list').replaceChildren(fragment);
+  const total=roomsCache.reduce((count,room)=>count+(room.unreadLocalCount || 0),0);document.title=(total?`(${total>99?'99+':total}) `:'')+'Web Kakao · 대화';
 }
 async function selectRoom(key){
+  closeMessageMenu();
   const generation=readerGeneration;
   if(key===selectedRoom && pendingSelection?.key===key)return;
   pendingSelection=null;
-  if(key!==selectedRoom){renderedMessages=null;renderedMessageRoom=null;el('message-list').replaceChildren();}
-  selectedRoom=key;renderRooms();el('history-note').textContent='메시지 표시를 준비하고 있습니다.';
+  if(selectedRoom)drafts.set(selectedRoom,el('compose-text').value);
+  if(key!==selectedRoom){if(!pendingSend)clearImageDraft();resetMessageSearch(false);renderedMessages=null;renderedMessageRoom=null;el('message-list').replaceChildren();}
+  selectedRoom=key;userSelected=true;currentPage=null;el('compose-text').value=drafts.get(key) || '';renderRooms();el('history-note').textContent='메시지 표시를 준비하고 있습니다.';
   renderChatHeading();showAccount(false);
   if(lastState)render(lastState);
   const page=await refreshMessages(key,generation);
@@ -124,6 +273,7 @@ async function refreshMessages(key,generation){
   try{
     const page=await localJson('/api/reader/messages?room='+encodeURIComponent(key));
     if(!hasAccount || generation!==readerGeneration || key!==selectedRoom)return;
+    currentPage=page;
     const history=page.history || {};
     el('history-note').textContent=history.phase==='loaded' ? (history.gap?'이전 대화 일부를 불러오지 못했습니다.':'')
       : history.phase==='unavailable' ? '서버가 조회 범위 번호를 제공하지 않아 이 방의 이력을 요청하지 않았습니다.'
@@ -141,25 +291,131 @@ async function refreshMessages(key,generation){
     let previousDay=null;
     for(const message of page.messages || []){
       if(message.at){const day=new Date(message.at).toLocaleDateString('ko-KR');if(day!==previousDay){const label=document.createElement('div');label.className='day-label';label.textContent=day;fragment.append(label);previousDay=day;}}
-      const item=document.createElement('article');item.className='message'+(message.mine?' mine':'');
+      const item=document.createElement('article');item.className='message'+(message.mine?' mine':'');item.dataset.messageKey=message.key;
       const author=document.createElement('div');author.className='muted';author.textContent=[message.sender,time(message.at)].filter(Boolean).join(' · ');
-      const text=document.createElement('p');text.textContent=message.text || '[본문 없음]';item.append(author,text);fragment.append(item);
+      const text=document.createElement('p');text.textContent=message.text || '[본문 없음]';item.append(author,text);
+      if(message.reply){const quote=document.createElement('blockquote');quote.className='message-quote';const name=document.createElement('strong');name.textContent=message.reply.sender || '원본 메시지';const content=document.createElement('span');content.textContent=message.reply.text || '[본문 없음]';quote.append(name,content);item.insertBefore(quote,text);}
+      const images=(message.photos || []).filter(photo=>typeof photo?.src==='string' && /^\/api\/photo\?room=r_[a-f0-9]{24}&message=m_[a-f0-9]{24}&index=(?:[0-9]|[12][0-9])$/.test(photo.src));
+      if(images.length){text.className='sr-only';const gallery=document.createElement('div');gallery.className='photo-gallery';for(const photo of images){
+        const button=document.createElement('button');button.type='button';button.className='photo-open';button.setAttribute('aria-label','사진 크게 보기');
+        const image=document.createElement('img');image.loading='lazy';image.decoding='async';image.alt=message.mine?'보낸 사진':'받은 사진';image.referrerPolicy='no-referrer';
+        if(photo.width && photo.height){image.width=photo.width;image.height=photo.height;}
+        const fallback=document.createElement('span');fallback.textContent='사진을 불러올 수 없습니다. 눌러서 다시 시도';fallback.hidden=true;
+        image.addEventListener('error',()=>{image.hidden=true;fallback.hidden=false;button.setAttribute('aria-label','사진 다시 불러오기');});image.addEventListener('load',()=>{image.hidden=false;fallback.hidden=true;button.setAttribute('aria-label','사진 크게 보기');});
+        button.addEventListener('click',()=>{if(fallback.hidden){el('photo-error').hidden=true;el('photo-full').src=photo.src;el('photo-dialog').showModal();}else{image.hidden=false;fallback.hidden=true;image.src=photo.src;}});
+        image.src=photo.src;button.append(image,fallback);gallery.append(button);
+      }item.append(gallery);}
+      item.tabIndex=0;item.setAttribute('aria-haspopup','menu');item.setAttribute('aria-controls','message-menu');
+      item.addEventListener('mouseenter',()=>openMessageMenu(item,key,message));item.addEventListener('mouseleave',scheduleMessageMenuClose);
+      item.addEventListener('contextmenu',event=>{if(event.shiftKey)return;event.preventDefault();openMessageMenu(item,key,message,{x:event.clientX,y:event.clientY,keyboard:true});});
+      item.addEventListener('keydown',event=>{if(event.key==='ContextMenu' || event.key==='F10' && event.shiftKey){event.preventDefault();openMessageMenu(item,key,message,{keyboard:true});}});
+      if(message.mine && Number.isSafeInteger(message.unreadCount) && message.unreadCount>0){const unread=document.createElement('span');unread.className='message-read';unread.textContent=String(message.unreadCount);unread.setAttribute('aria-label',`읽지 않은 사람 ${message.unreadCount}명`);item.append(unread);}
+      fragment.append(item);
     }
     if(!page.messages?.length){const empty=document.createElement('p');empty.className='muted';empty.textContent=emptyText;fragment.append(empty);}
-    el('message-list').replaceChildren(fragment);
+    closeMessageMenu();el('message-list').replaceChildren(fragment);
     renderedMessageRoom=key;renderedMessages=signature;
-    if(page.messages?.length)scroll.scrollTop=changedRoom || atBottom?scroll.scrollHeight:top;
+    if(page.messages?.length)scroll.scrollTop=messageQuery?(changedRoom?0:top):changedRoom || atBottom?scroll.scrollHeight:top;
+    updateMessageSearch();
     return page;
   }catch{if(key===selectedRoom && generation===readerGeneration){el('history-note').hidden=false;el('history-note').textContent='메시지를 표시할 수 없습니다. 연결 상태를 확인해 주세요.';}}
 }
+function resetMessageSearch(close){
+  messageQuery='';searchMatches=[];searchIndex=-1;el('message-search').value='';
+  if(close){el('message-search-bar').hidden=true;el('message-search-toggle').setAttribute('aria-expanded','false');}
+  updateMessageSearch();
+}
+function updateMessageSearch(move=false){
+  const previousKey=searchMatches[searchIndex]?.dataset.messageKey;
+  searchMatches=[];
+  const pattern=messageQuery?new RegExp(messageQuery.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'),'giu'):null;
+  for(const article of el('message-list').querySelectorAll('article')){
+    article.classList.remove('search-current');
+    const paragraph=article.querySelector('p'),text=paragraph.textContent;
+    if(!pattern){if(paragraph.querySelector('mark'))paragraph.textContent=text;continue;}
+    pattern.lastIndex=0;const matches=[...text.matchAll(pattern)];
+    if(!matches.length){if(paragraph.querySelector('mark'))paragraph.textContent=text;continue;}
+    const fragment=document.createDocumentFragment();let offset=0;
+    for(const match of matches.slice(0,200)){fragment.append(document.createTextNode(text.slice(offset,match.index)));const mark=document.createElement('mark');mark.textContent=match[0];fragment.append(mark);offset=match.index+match[0].length;}
+    fragment.append(document.createTextNode(text.slice(offset)));paragraph.replaceChildren(fragment);searchMatches.push(article);
+  }
+  searchIndex=searchMatches.findIndex(article=>article.dataset.messageKey===previousKey);
+  if(searchMatches.length && searchIndex<0)searchIndex=0;
+  el('message-search-count').textContent=!messageQuery?'':searchMatches.length?`${searchIndex+1} / ${searchMatches.length}`:'일치하는 메시지가 없습니다';
+  el('message-search-prev').disabled=el('message-search-next').disabled=!searchMatches.length;
+  if(searchIndex>=0){searchMatches[searchIndex].classList.add('search-current');if(move)searchMatches[searchIndex].scrollIntoView({block:'center'});}
+}
+function moveMessageSearch(direction){
+  if(!searchMatches.length)return;
+  searchMatches[searchIndex]?.classList.remove('search-current');searchIndex=(searchIndex+direction+searchMatches.length)%searchMatches.length;
+  searchMatches[searchIndex].classList.add('search-current');searchMatches[searchIndex].scrollIntoView({block:'center'});
+  el('message-search-count').textContent=`${searchIndex+1} / ${searchMatches.length}`;
+}
+async function copyMessage(text){
+  const generation=readerGeneration;
+  let note;
+  try{if(!navigator.clipboard?.writeText)throw new Error();await navigator.clipboard.writeText(text);note='복사했습니다.';}
+  catch{note='복사하지 못했습니다. 메시지를 선택해 복사해 주세요.';}
+  if(!hasAccount || generation!==readerGeneration)return;
+  clearTimeout(copyStatusTimer);el('message-action-status').textContent=note;el('message-action-status').hidden=false;
+  copyStatusTimer=setTimeout(()=>{el('message-action-status').hidden=true;},3000);
+}
+async function refreshSettings(state){
+  if(!hasAccount || !state.preferences || settingsBusy || settingsRevision===state.reader?.revision)return;
+  const generation=readerGeneration,epoch=settingsEpoch;
+  try{
+    const data=await localJson('/api/preferences');if(!hasAccount || generation!==readerGeneration || epoch!==settingsEpoch)return;
+    personalSettings=data.settings;settingsRevision=state.reader?.revision;
+    if(!personalSettings)return;
+    roomFilter=personalSettings.roomFilter;el('read-sync').checked=personalSettings.readSync;
+    el('browser-notifications').checked=personalSettings.notifications;el('persist-preferences').checked=personalSettings.persist;
+    el('preferences-status').textContent=personalSettings.storageError?'개인 설정을 읽거나 저장하지 못했습니다.':personalSettings.persist?'이 노트북에 개인 설정을 저장합니다.':'현재 계정 연결 동안 설정을 유지합니다.';
+    el('notification-status').textContent=!('Notification' in window) || !('silent' in Notification.prototype)?'이 브라우저는 무음 알림을 지원하지 않습니다.':personalSettings.notifications && Notification.permission!=='granted'?'브라우저 사이트 설정에서 알림을 허용해 주세요.':personalSettings.notifications?'웹이 열려 있는 동안 본문 없이 무음으로 알립니다.':'';
+    if(!personalSettings.notifications){for(const notice of shownNotifications.values())notice.close();shownNotifications.clear();}
+  }catch{el('preferences-status').textContent='개인 설정을 불러오지 못했습니다.';}
+}
+async function changeSettings(path,body){
+  if(!preferenceReady() || settingsBusy)return false;
+  const generation=readerGeneration;settingsBusy=true;settingsEpoch++;renderComposer();
+  let success=false;
+  try{success=await postLocal(path,body);if(!success)el('preferences-status').textContent='설정을 저장하지 못했습니다. 다시 확인해 주세요.';}
+  catch{el('preferences-status').textContent='설정을 저장하지 못했습니다. 연결 상태를 확인해 주세요.';}
+  finally{settingsBusy=false;if(generation===readerGeneration){settingsRevision=-1;readerRevision=-1;await refresh();renderComposer();}}
+  return success;
+}
+async function saveSettings(patch){return changeSettings('/api/preferences',patch);}
+async function saveRoomSettings(patch){if(!selectedRoom)return false;return changeSettings('/api/preferences/room',{room:selectedRoom,...patch});}
+async function receiveNotifications(){
+  if(notificationBusy || settingsBusy || !hasAccount || !personalSettings?.notifications || !('Notification' in window) || Notification.permission!=='granted' || !('silent' in Notification.prototype))return;
+  const generation=readerGeneration;notificationBusy=true;
+  try{
+    const response=await fetch('/api/notifications/claim',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:'{}'});
+    if(!response.ok)return;const data=await response.json();if(!hasAccount || generation!==readerGeneration || !personalSettings?.notifications)return;
+    for(const item of (data.notices || []).slice(0,5)){
+      const room=roomsCache.find(row=>row.key===item.key);if(!room || room.muted || !/^[a-f0-9]{32}$/.test(item.id))continue;
+      if(room.key===selectedRoom && userSelected && !document.hidden && document.hasFocus() && nearBottom() && !messageQuery && currentPage?.latestVisible)continue;
+      const notice=new Notification(room.title,{body:'새 메시지가 도착했습니다.',tag:'web-kakao-'+item.key,silent:true});
+      shownNotifications.get(item.key)?.close();shownNotifications.set(item.key,notice);
+      while(shownNotifications.size>8){const [key,old]=shownNotifications.entries().next().value;old.close();shownNotifications.delete(key);}
+      notice.onclick=()=>{notice.close();if(hasAccount && generation===readerGeneration){window.focus();roomFilter='all';renderRooms();void selectRoom(item.key);}};
+    }
+  }catch{el('notification-status').textContent='알림을 표시하지 못했습니다. 브라우저 권한을 확인해 주세요.';}
+  finally{notificationBusy=false;}
+}
 async function refreshReader(state){
   if(!hasAccount || !state.reader || state.reader.revision===readerRevision)return;
-  const generation=readerGeneration;
+  const generation=readerGeneration,epoch=actionEpoch;
   const data=await localJson('/api/reader/rooms');
-  if(!hasAccount || generation!==readerGeneration)return;
+  if(!hasAccount || generation!==readerGeneration || epoch!==actionEpoch || state!==lastState)return;
   roomsCache=data.rooms || [];readerRevision=state.reader.revision;
+  if(preferenceReady()){pinnedRooms.clear();for(const row of [...roomsCache].filter(row=>Number.isInteger(row.pinOrder)).sort((a,b)=>a.pinOrder-b.pinOrder))pinnedRooms.add(row.key);}
   if(!roomsCache.some(room=>room.key===selectedRoom)){
-    selectedRoom=roomsCache[0]?.key || null;renderedMessages=null;renderedMessageRoom=null;el('message-list').replaceChildren();el('history-note').textContent='메시지 표시를 준비하고 있습니다.';
+    const restore=state.reader.phase==='connected' && roomsCache.some(room=>room.key===reconnectRoom)?reconnectRoom:null;
+    selectedRoom=restore || roomsCache[0]?.key || null;userSelected=false;currentPage=null;el('compose-text').value=drafts.get(selectedRoom) || '';renderedMessages=null;renderedMessageRoom=null;el('message-list').replaceChildren();el('history-note').textContent='메시지 표시를 준비하고 있습니다.';
+    // Restore only the previously opened room. Fetching it is separate from
+    // acknowledging it: a reconnect must not send a read receipt by itself.
+    if(restore)pendingSelection={key:restore,generation};
+    if(state.reader.phase==='connected')reconnectRoom=null;
   }
   el('reader-workspace').hidden=!roomsCache.length;renderRooms();
   renderChatHeading();
@@ -177,7 +433,7 @@ async function refresh() {
       const page = await fetch('/', {cache:'no-store'}); if (!page.ok) throw new Error();
       response = await fetch('/api/status', {cache:'no-store'});
     }
-    if (!response.ok) throw new Error(); const state=await response.json();if(epoch!==actionEpoch)return;render(state);await refreshReader(state);await flushSelection();
+    if (!response.ok) throw new Error(); const state=await response.json();if(epoch!==actionEpoch)return;render(state);await refreshSettings(state);await refreshReader(state);await refreshPendingSend();await flushSelection();await advanceRoom();await receiveNotifications();renderComposer();
   }
   catch { el('message').textContent = '로컬 서버에 연결할 수 없습니다. 실행 상태를 확인해 주세요.'; el('start').disabled = el('cancel').disabled = el('reader-connect').disabled = el('history-load').disabled = true; }
   finally{refreshing=false;}
@@ -198,9 +454,128 @@ el('reader-connect').addEventListener('click',()=>act('/api/reader/connect'));
 el('reader-disconnect').addEventListener('click',()=>act('/api/reader/disconnect'));
 el('history-load').addEventListener('click',()=>{if(selectedRoom)act('/api/reader/history',{room:selectedRoom});});
 el('room-search').addEventListener('input',renderRooms);
+for(const filter of ['all','unread','pinned'])el('filter-'+filter).addEventListener('click',()=>{if(preferenceReady())void saveSettings({roomFilter:filter});else{roomFilter=filter;renderRooms();renderComposer();}});
+el('pin-room').addEventListener('click',()=>{if(!hasAccount || !roomNow())return;if(preferenceReady()){const order=pinnedRooms.has(selectedRoom)?null:Math.max(-1,...roomsCache.map(row=>row.pinOrder ?? -1))+1;void saveRoomSettings({pinOrder:order});}else{if(pinnedRooms.has(selectedRoom))pinnedRooms.delete(selectedRoom);else pinnedRooms.add(selectedRoom);renderRooms();renderComposer();}});
+el('message-search-toggle').addEventListener('click',()=>{const open=el('message-search-bar').hidden;if(open){el('message-search-bar').hidden=false;el('message-search-toggle').setAttribute('aria-expanded','true');el('message-search').focus();}else resetMessageSearch(true);});
+el('message-search').addEventListener('input',()=>{messageQuery=el('message-search').value.trim();searchMatches=[];searchIndex=-1;updateMessageSearch(true);});
+el('message-search').addEventListener('keydown',event=>{if(event.key==='Enter'){event.preventDefault();moveMessageSearch(event.shiftKey?-1:1);}else if(event.key==='Escape'){event.preventDefault();event.stopPropagation();resetMessageSearch(true);el('message-search-toggle').focus();}});
+el('message-search-prev').addEventListener('click',()=>moveMessageSearch(-1));
+el('message-search-next').addEventListener('click',()=>moveMessageSearch(1));
+el('message-search-close').addEventListener('click',()=>{resetMessageSearch(true);el('message-search-toggle').focus();});
 el('account-toggle').addEventListener('click',()=>showAccount(el('account-panel').hidden));
 el('account-close').addEventListener('click',()=>{showAccount(false);el('account-toggle').focus();});
-document.addEventListener('keydown',event=>{if(event.key==='Escape' && !el('account-panel').hidden){showAccount(false);el('account-toggle').focus();}});
+el('compose-text').addEventListener('input',()=>{if(selectedRoom)drafts.set(selectedRoom,el('compose-text').value);renderComposer();});
+el('compose-text').addEventListener('keydown',event=>{
+  if(event.key==='Enter' && !event.shiftKey && !event.isComposing && event.keyCode!==229){event.preventDefault();el('compose-form').requestSubmit();}
+});
+el('compose-form').addEventListener('submit',async event=>{
+  event.preventDefault();
+  const room=roomNow(),text=el('compose-text').value;
+  if(busy || ackInFlight || pendingSend || !hasAccount || !lastState?.messaging || lastState.reader?.phase!=='connected' || lastState.reader?.operationBusy || !room?.canSend || !text.trim())return;
+  if([...text].length>4000){sendNotes.set(selectedRoom,'메시지는 4,000자까지 보낼 수 있습니다.');renderComposer();return;}
+  const replyTo=replyDrafts.get(selectedRoom)?.key;
+  if(replyTo && !currentPage?.messages?.some(message=>message.key===replyTo && message.canReply)){sendNotes.set(selectedRoom,'원본 메시지를 다시 불러오거나 답장을 취소해 주세요.');renderComposer();return;}
+  const pending={room:selectedRoom,text,replyTo,kind:'text',clientId:crypto.randomUUID(),phase:'sending',focusInput:['compose-text','send-message'].includes(document.activeElement?.id)};pendingSend=pending;renderComposer();
+  try{
+    const accepted=await postLocal('/api/reader/send',{room:pending.room,text:pending.text,clientId:pending.clientId,...(pending.replyTo?{replyTo:pending.replyTo}:{})});
+    if(pendingSend!==pending || !hasAccount)return;
+    if(!accepted){pendingSend=null;sendNotes.set(pending.room,'지금은 전송할 수 없습니다. 연결 상태를 확인해 주세요.');}
+    readerRevision=-1;await refresh();
+  }catch{markSendUnknown(pending);}
+  finally{renderComposer();}
+});
+el('send-reset').addEventListener('click',()=>{
+  if(pendingSend?.phase==='unknown'){
+    if(window.confirm('대화에서 전송 결과를 확인하셨나요? 다시 보내면 같은 내용이 중복될 수 있습니다.')){pendingSend=null;renderComposer();}
+  }else if(uncertainPhoto && window.confirm('휴대폰에서 사진의 도착 여부를 확인하셨나요? 이 버튼은 사진을 다시 보내지 않습니다.')){uncertainPhoto=null;clearImageDraft();renderComposer();}
+});
+el('reply-cancel').addEventListener('click',()=>{replyDrafts.delete(selectedRoom);renderComposer();if(!el('compose-text').disabled)el('compose-text').focus({preventScroll:true});});
+el('message-menu').addEventListener('mouseenter',()=>clearTimeout(messageMenuTimer));
+el('message-menu').addEventListener('mouseleave',scheduleMessageMenuClose);
+el('message-menu-reply').addEventListener('click',()=>{
+  const message=menuMessage();
+  if(!message || pendingSend || !message.canReply || !roomNow()?.canSend || !lastState?.messaging)return;
+  replyDrafts.set(selectedRoom,{key:message.key,sender:message.sender,text:message.text});closeMessageMenu();renderComposer();el('compose-text').focus({preventScroll:true});
+});
+el('message-menu-copy').addEventListener('click',()=>{const message=menuMessage();closeMessageMenu();if(message)void copyMessage(message.text || '[본문 없음]');});
+el('message-menu').addEventListener('keydown',event=>{
+  if(event.key==='Escape'){event.preventDefault();event.stopPropagation();closeMessageMenu(true);}
+  else if(['ArrowDown','ArrowUp','Home','End'].includes(event.key)){
+    event.preventDefault();const items=[...el('message-menu').querySelectorAll('button')].filter(item=>!item.hidden && !item.disabled);
+    const current=items.indexOf(document.activeElement),next=event.key==='Home'?0:event.key==='End'?items.length-1:(current+(event.key==='ArrowDown'?1:-1)+items.length)%items.length;items[next]?.focus();
+  }else if(event.key==='Tab')closeMessageMenu();
+});
+document.addEventListener('pointerdown',event=>{if(messageMenuTarget && !el('message-menu').contains(event.target))closeMessageMenu();});
+window.addEventListener('resize',()=>closeMessageMenu());
+function clearImageDraft(){imageEpoch++;if(imageDraft?.url)URL.revokeObjectURL(imageDraft.url);imageDraft=null;imagePreparing=false;el('image-preview').removeAttribute('src');el('image-file').value='';if(el('image-send-dialog').open)el('image-send-dialog').close();}
+async function prepareImage(file){
+  if(!file || imagePreparing || pendingSend || el('attach-image').disabled)return;
+  clearImageDraft();const epoch=imageEpoch,key=selectedRoom,generation=readerGeneration;imagePreparing=true;renderComposer();let bitmap;
+  try{
+    if(!['image/jpeg','image/png','image/webp'].includes(file.type) || file.size>20*1024*1024 || !file.size)throw new Error();
+    bitmap=await createImageBitmap(file);if(bitmap.width*bitmap.height>40000000)throw new Error();
+    const scale=Math.min(1,4096/Math.max(bitmap.width,bitmap.height)),canvas=document.createElement('canvas');canvas.width=Math.max(1,Math.round(bitmap.width*scale));canvas.height=Math.max(1,Math.round(bitmap.height*scale));canvas.getContext('2d').drawImage(bitmap,0,0,canvas.width,canvas.height);
+    const mime=file.type==='image/jpeg'?'image/jpeg':'image/png';const blob=await new Promise(resolve=>canvas.toBlob(resolve,mime,.9));
+    if(!blob || blob.size>10*1024*1024)throw new Error();
+    const image=await new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(reader.result.split(',')[1]);reader.onerror=reject;reader.readAsDataURL(blob);});
+    if(epoch!==imageEpoch || generation!==readerGeneration || !hasAccount || key!==selectedRoom)return;
+    imageDraft={room:key,generation,image,url:URL.createObjectURL(blob)};el('image-preview').src=imageDraft.url;el('image-recipient').textContent=(roomNow()?.title || '선택한 대화방')+'에 보냅니다.';el('image-send-dialog').showModal();
+  }catch{if(epoch===imageEpoch && hasAccount){sendNotes.set(key,'사진을 준비하지 못했습니다. JPEG·PNG·WebP 20MiB 이하 파일을 선택해 주세요. 변환 후에는 10MiB 이하만 보낼 수 있습니다.');}}
+  finally{bitmap?.close();if(epoch===imageEpoch){imagePreparing=false;if(!imageDraft)el('image-file').value='';renderComposer();}}
+}
+el('attach-image').addEventListener('click',()=>{if(imageDraft?.room===selectedRoom){el('image-send-dialog').showModal();return;}el('image-file').click();});
+el('image-file').addEventListener('change',()=>void prepareImage(el('image-file').files[0]));
+el('compose-text').addEventListener('paste',event=>{
+  const images=[...(event.clipboardData?.items || [])].filter(item=>item.kind==='file' && item.type.startsWith('image/'));
+  if(!images.length)return; // Leave ordinary text paste to the browser.
+  event.preventDefault();
+  if(el('attach-image').disabled || pendingSend)return;
+  const file=images[0].getAsFile();if(file)void prepareImage(file);
+});
+el('image-cancel').addEventListener('click',()=>clearImageDraft());
+el('image-send-dialog').addEventListener('cancel',()=>clearImageDraft());
+el('image-send').addEventListener('click',async()=>{
+  const image=imageDraft,room=roomNow();
+  if(!image || image.room!==selectedRoom || image.generation!==readerGeneration || !hasAccount || pendingSend || uncertainPhoto || busy || ackInFlight || !room?.canSend || lastState?.reader?.phase!=='connected' || lastState.reader.operationBusy)return;
+  const pending={room:image.room,kind:'photo',clientId:crypto.randomUUID(),phase:'sending',focusInput:true};pendingSend=pending;el('image-send-dialog').close();renderComposer();
+  try{const accepted=await postLocal('/api/reader/photo',{room:image.room,image:image.image,clientId:pending.clientId});if(pendingSend!==pending || !hasAccount)return;if(!accepted){pendingSend=null;sendNotes.set(image.room,'사진을 보내지 못했습니다. ＋에서 미리보기를 다시 확인할 수 있습니다.');}readerRevision=-1;await refresh();}
+  catch{markSendUnknown(pending);}
+  finally{renderComposer();}
+});
+el('rename-room').addEventListener('click',()=>{
+  const room=roomNow();if(!hasAccount || !room)return;
+  renameTarget={key:room.key,generation:readerGeneration};el('room-title-input').value=room.localTitle || room.title;el('rename-error').textContent='';el('rename-dialog').showModal();el('room-title-input').select();
+});
+async function saveRoomTitle(value){
+  const target=renameTarget;if(!target || !hasAccount || target.generation!==readerGeneration)return;
+  if(value!==null && (!value.trim() || [...value.trim()].length>120 || /[\u0000-\u001f\u007f]/u.test(value))){el('rename-error').textContent='이름은 줄바꿈 없이 1~120자로 입력해 주세요.';return;}
+  try{
+    if(!await postLocal('/api/preferences/room',{room:target.key,title:value===null?null:value.trim()})){el('rename-error').textContent='이름을 변경하지 못했습니다.';return;}
+    if(target.generation!==readerGeneration)return;
+    el('rename-dialog').close();readerRevision=-1;await refresh();
+  }catch{el('rename-error').textContent='로컬 서버 연결을 확인해 주세요.';}
+}
+el('rename-form').addEventListener('submit',event=>{event.preventDefault();void saveRoomTitle(el('room-title-input').value);});
+el('rename-reset').addEventListener('click',()=>void saveRoomTitle(null));
+el('rename-cancel').addEventListener('click',()=>el('rename-dialog').close());
+el('read-sync').addEventListener('change',()=>{if(preferenceReady())void saveSettings({readSync:el('read-sync').checked});else{readerRevision=-1;void refresh();}});
+el('mute-room').addEventListener('click',()=>void saveRoomSettings({muted:!roomNow()?.muted}));
+el('persist-preferences').addEventListener('change',()=>void saveSettings({persist:el('persist-preferences').checked}));
+el('forget-preferences').addEventListener('click',async()=>{if(!preferenceReady() || settingsBusy || !window.confirm('이 계정의 개인 설정을 초기화하고 저장 파일을 삭제할까요?'))return;await changeSettings('/api/preferences/forget',{});});
+el('browser-notifications').addEventListener('change',async()=>{
+  if(el('browser-notifications').checked){
+    let permission=Notification.permission;if(permission==='default')permission=await Notification.requestPermission();
+    if(permission!=='granted'){el('browser-notifications').checked=false;el('notification-status').textContent='브라우저 알림 권한이 없습니다. 사이트 설정에서 허용해 주세요.';return;}
+  }
+  await saveSettings({notifications:el('browser-notifications').checked});
+});
+el('photo-close').addEventListener('click',()=>el('photo-dialog').close());
+el('photo-dialog').addEventListener('close',()=>el('photo-full').removeAttribute('src'));
+el('photo-full').addEventListener('error',()=>{el('photo-error').hidden=false;});
+el('new-messages').addEventListener('click',()=>{const scroll=document.querySelector('.chat-scroll');scroll.scrollTop=scroll.scrollHeight;requestAnimationFrame(()=>void maybeSeen());});
+document.querySelector('.chat-scroll').addEventListener('scroll',()=>{closeMessageMenu();renderComposer();void maybeSeen();},{passive:true});
+window.addEventListener('focus',()=>void refresh());
+document.addEventListener('keydown',event=>{if(event.key==='Escape' && messageMenuTarget){event.preventDefault();closeMessageMenu(el('message-menu').contains(document.activeElement));}else if(event.key==='Escape' && !el('account-panel').hidden){showAccount(false);el('account-toggle').focus();}});
 let pollTimer=null;
 function scheduleRefresh(){
   clearTimeout(pollTimer);
