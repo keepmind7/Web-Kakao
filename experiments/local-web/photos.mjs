@@ -28,26 +28,43 @@ export function imageType(data){
   if(data.toString('ascii',0,4)==='RIFF' && data.toString('ascii',8,12)==='WEBP')return 'image/webp';
   return null;
 }
-export async function fetchPhoto(value,{signal,resolve=lookup,request=https.request,redirects=0}={}){
-  const target=photoUrl(value);if(!target || redirects>2)throw new Error('photo_unavailable');
-  const url=new URL(target),addresses=await resolve(url.hostname,{all:true,verbatim:true});
-  const address=addresses.find(item=>isIP(item.address) && safeDestination(item.address,443));
-  if(!address || signal?.aborted)throw new Error('photo_unavailable');
-  return new Promise((resolveResult,reject)=>{
-    const fail=()=>reject(new Error('photo_unavailable'));
-    const req=request(url,{agent:false,autoSelectFamily:false,signal,servername:url.hostname,lookup:(_host,_options,callback)=>callback(null,address.address,address.family),headers:{Accept:'image/jpeg,image/png,image/webp,image/gif'},timeout:8000},response=>{
-      if([301,302,303,307,308].includes(response.statusCode)){
-        response.resume();let next;try{next=new URL(response.headers.location,url).href;}catch{fail();return;}
-        fetchPhoto(next,{signal,resolve,request,redirects:redirects+1}).then(resolveResult,fail);return;
-      }
-      if(response.statusCode!==200 || Number(response.headers['content-length'])>10*1024*1024){response.destroy();fail();return;}
-      const chunks=[];let size=0;
-      response.on('data',chunk=>{size+=chunk.length;if(size>10*1024*1024){req.destroy();fail();}else chunks.push(chunk);});
-      response.on('error',fail);response.on('aborted',fail);
-      response.on('end',()=>{const data=Buffer.concat(chunks),type=imageType(data);if(!type){fail();return;}resolveResult({data,type});});
-    });
-    req.on('timeout',()=>req.destroy());req.on('error',fail);req.end();
+export async function fetchPhoto(value,{signal,resolve=lookup,request=https.request,redirects=0,deadlineMs=8000}={}){
+  if(!Number.isFinite(deadlineMs) || deadlineMs<=0 || deadlineMs>2147483647)throw new Error('photo_unavailable');
+  const controller=new AbortController(),requests=new Set();
+  const abort=()=>controller.abort();signal?.addEventListener('abort',abort,{once:true});
+  if(signal?.aborted)abort();
+  const timer=setTimeout(abort,deadlineMs);
+  const raced=operation=>new Promise((accept,reject)=>{
+    let settled=false;
+    const finish=(callback,value)=>{if(settled)return;settled=true;controller.signal.removeEventListener('abort',onAbort);callback(value);};
+    const onAbort=()=>finish(reject,new Error('photo_unavailable'));
+    controller.signal.addEventListener('abort',onAbort,{once:true});
+    if(controller.signal.aborted){onAbort();return;}
+    Promise.resolve().then(()=>{if(controller.signal.aborted)throw new Error('photo_unavailable');return operation();}).then(value=>finish(accept,value),error=>finish(reject,error));
   });
+  const fetch=async(value,count)=>{
+    const target=photoUrl(value);if(!target || count>2 || controller.signal.aborted)throw new Error('photo_unavailable');
+    const url=new URL(target),addresses=await raced(()=>resolve(url.hostname,{all:true,verbatim:true}));
+    const address=addresses.find(item=>isIP(item.address) && safeDestination(item.address,443));
+    if(!address || controller.signal.aborted)throw new Error('photo_unavailable');
+    const result=await raced(()=>new Promise((accept,reject)=>{
+      const fail=()=>reject(new Error('photo_unavailable'));
+      const req=request(url,{agent:false,autoSelectFamily:false,signal:controller.signal,servername:url.hostname,lookup:(_host,_options,callback)=>callback(null,address.address,address.family),headers:{Accept:'image/jpeg,image/png,image/webp,image/gif'}},response=>{
+        if([301,302,303,307,308].includes(response.statusCode)){
+          response.resume();let next;try{next=new URL(response.headers.location,url).href;}catch{fail();return;}
+          requests.delete(req);req.destroy();accept({redirect:next});return;
+        }
+        if(response.statusCode!==200 || Number(response.headers['content-length'])>10*1024*1024){response.destroy();fail();return;}
+        const chunks=[];let size=0;
+        response.on('data',chunk=>{size+=chunk.length;if(size>10*1024*1024){req.destroy();fail();}else chunks.push(chunk);});
+        response.on('error',fail);response.on('aborted',fail);
+        response.on('end',()=>{const data=Buffer.concat(chunks),type=imageType(data);if(!type){fail();return;}requests.delete(req);accept({data,type});});
+      });
+      requests.add(req);req.on('error',fail);req.end();
+    }));
+    return result.redirect?fetch(result.redirect,count+1):result;
+  };
+  try{return await fetch(value,redirects);}finally{clearTimeout(timer);signal?.removeEventListener('abort',abort);controller.abort();for(const req of requests)req.destroy();requests.clear();}
 }
 export function createPhotoCache({fetcher=fetchPhoto}={}){
   const entries=new Map(),pending=new Map();let bytes=0,epoch=0,active=0;const controllers=new Set(),waiting=[];
@@ -60,8 +77,8 @@ export function createPhotoCache({fetcher=fetchPhoto}={}){
       const promise=(async()=>{try{
         if(active>=4)await new Promise(resolve=>waiting.push(resolve));else active++;
         if(current!==epoch)throw new Error('photo_unavailable');
-        const item=await fetcher(url,{signal:controller.signal});if(current!==epoch)throw new Error('photo_unavailable');
-        while(entries.size && (entries.size>=12 || bytes+item.data.length>30*1024*1024)){const [key,value]=entries.entries().next().value;bytes-=value.data.length;entries.delete(key);}
+        const item=await fetcher(url,{signal:controller.signal});if(!Buffer.isBuffer(item?.data) || item.data.length>10*1024*1024)throw new Error('photo_unavailable');if(current!==epoch)throw new Error('photo_unavailable');
+        while(entries.size && (entries.size>=64 || bytes+item.data.length>30*1024*1024)){const [key,value]=entries.entries().next().value;bytes-=value.data.length;entries.delete(key);}
         entries.set(url,item);bytes+=item.data.length;return item;
       }finally{controllers.delete(controller);if(current===epoch){pending.delete(url);const next=waiting.shift();if(next)next();else active--;}}})();pending.set(url,promise);return promise;
     },

@@ -6,6 +6,17 @@ import https from 'node:https';
 import { createAuthLab, createTransport, checkPinnedSource } from '../experiments/local-web/kakao-auth.mjs';
 import { createLocalServer, encodeQr } from '../experiments/local-web/server.mjs';
 
+// Browser control is granted only by the local launcher capability exchange.
+async function browserSession(app,url){
+  const issue=await fetch(url+'/api/local/launch',{method:'POST',headers:{Origin:url,'Content-Type':'application/json','X-Local-Control':app.controlToken},body:'{}'});
+  assert.equal(issue.status,200);assert.equal(issue.headers.get('set-cookie'),null);
+  const {ticket}=await issue.json();assert.match(ticket,/^[a-f0-9]{64}$/);
+  const session=await fetch(url+'/api/local/session',{method:'POST',headers:{Origin:url,'Content-Type':'application/json'},body:JSON.stringify({ticket})});
+  assert.equal(session.status,200);
+  const cookie=session.headers.get('set-cookie');assert.match(cookie,/HttpOnly; SameSite=Strict/);
+  return {cookie:cookie.split(';')[0],response:session};
+}
+
 const ok = body => ({ httpStatus: 200, body });
 const qr = () => ok({ status: 0, url: 'kakaotalk://qrlogin?id=synthetic-test-only', remainingSeconds: 180 });
 function rawStatus(url, { method = 'GET', headers = {}, body } = {}) {
@@ -76,10 +87,11 @@ test('credential expiry publishes forgotten state before synchronous abort obser
   f.advance(1000);f.lab.snapshot();assert.equal(observed.phase,'expired');assert.equal(observed.credentialInMemory,false);
 });
 
-test('allowlist rejection, HTTP error and incomplete JSON never generate QR', async () => {
-  for (const response of [ok({ allowlisted: false }), ok({}), ok({ allowlisted: 'true' }), ok({ allowlisted: true, status: -997 }), {httpStatus:415,body:null}]) {
+test('allowlist denial blocks while malformed responses remain manually retryable; neither generates QR', async () => {
+  for (const [response,phase] of [[ok({ allowlisted: false }),'blocked'], [ok({}),'error'], [ok({ allowlisted: 'true' }),'error'], [ok({ allowlisted: true, status: -997 }),'blocked'], [{httpStatus:415,body:null},'blocked']]) {
     const f = fixture([response]); await f.lab.start();
-    assert.equal(f.lab.snapshot().phase, 'blocked'); assert.deepEqual(f.calls, ['allowlist']); assert.equal(f.timers.length, 0);
+    assert.equal(f.lab.snapshot().phase, phase); assert.deepEqual(f.calls, ['allowlist']); assert.equal(f.timers.length, 0);
+    assert.equal(f.lab.snapshot().canStart,phase==='error');
   }
 });
 test('server denial with retry interval is terminal and never auto-retried', async () => {
@@ -124,7 +136,8 @@ test('read-only consumer receives credentials only internally and cannot restore
 });
 test('incomplete success is not authenticated', async () => {
   const f = fixture([ok({allowlisted:true}), qr(), ok({status:0,accessToken:'FAKE_TOKEN'})]);
-  await f.lab.start(); await f.tick(); assert.equal(f.lab.snapshot().phase, 'blocked'); assert.equal(f.lab.snapshot().credentialInMemory, false);
+  await f.lab.start(); await f.tick(); assert.equal(f.lab.snapshot().phase, 'error'); assert.equal(f.lab.snapshot().credentialInMemory, false);
+  assert.equal(f.lab.snapshot().canStart,true);assert.equal(f.timers.length,0);
 });
 test('cancel during network wait cannot resurrect QR or authentication', async () => {
   let release;
@@ -144,7 +157,8 @@ test('expiry stops polling; malformed or oversized QR content never reaches disp
   assert.equal(f.lab.snapshot().phase, 'expired'); assert.deepEqual(f.calls, ['allowlist','generate']);
   for (const url of ['', 'invalid\ncontrol', 'x'.repeat(2049)]) {
     const bad = fixture([ok({allowlisted:true}),ok({status:0,url,remainingSeconds:180})]); await bad.lab.start();
-    assert.equal(bad.lab.snapshot().phase, 'blocked'); assert.equal(bad.lab.snapshot().grid, undefined);
+    assert.equal(bad.lab.snapshot().phase, 'error'); assert.equal(bad.lab.snapshot().grid, undefined);
+    assert.equal(bad.lab.snapshot().canStart,true);assert.equal(bad.timers.length,0);
   }
 });
 test('opaque QR payload is rendered verbatim, not treated as a navigable URL', async () => {
@@ -214,8 +228,9 @@ test('local web enforces cookie, Origin, CSRF, Host and has no chat endpoints', 
   const url = await app.listen(0);
   try {
     assert.equal((await fetch(url+'/api/status')).status,403);
-    const page = await fetch(url); const cookie = page.headers.get('set-cookie').split(';')[0];
-    assert.match(page.headers.get('set-cookie'),/HttpOnly; SameSite=Strict/); assert.equal(page.headers.get('cache-control'),'no-store, max-age=0');
+    const page = await fetch(url); assert.equal(page.headers.get('set-cookie'),null);
+    const {cookie,response:session}=await browserSession(app,url);
+    assert.match(session.headers.get('set-cookie'),/HttpOnly; SameSite=Strict/); assert.equal(page.headers.get('cache-control'),'no-store, max-age=0');
     assert.equal(page.headers.get('access-control-allow-origin'),null);
     const state = await (await fetch(url+'/api/status',{headers:{cookie}})).json();
     const headers = {cookie,origin:url,'content-type':'application/json','x-csrf-token':state.csrf};
@@ -247,7 +262,7 @@ test('authenticated web can run one protected read-only probe without exposing a
   }});
   const url=await app.listen(0);
   try {
-    const page=await fetch(url);const cookie=page.headers.get('set-cookie').split(';')[0];
+    const {cookie}=await browserSession(app,url);
     const state=await (await fetch(url+'/api/status',{headers:{cookie}})).json();
     const headers={cookie,origin:url,'content-type':'application/json','x-csrf-token':state.csrf};
     const post=(path,extra={})=>fetch(url+path,{method:'POST',headers:{...headers,...extra},body:'{}'});

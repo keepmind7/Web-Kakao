@@ -1,6 +1,7 @@
 """Exercise the export boundary with synthetic ADB responses, never a device."""
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -55,7 +56,7 @@ class ApkExportTests(unittest.TestCase):
         shutil.copyfile(ROOT / 'tools/apk_export/Export-KakaoApk.ps1', self.root / 'Export-KakaoApk.ps1')
         (self.root / 'mock_adb.py').write_text(MOCK, encoding='utf-8')
         (self.root / 'fake-adb.cmd').write_text(
-            '@echo off\r\n"' + sys.executable + '" "' + str(self.root / 'mock_adb.py') + '" %*\r\n',
+            '@echo off\r\n"%WEB_KAKAO_TEST_PYTHON%" "%~dp0mock_adb.py" %*\r\n',
             encoding='ascii', newline='')
         for name in ['base.apk', 'split_config.arm64_v8a.apk']:
             with ZipFile(self.root / name, 'w') as apk:
@@ -66,7 +67,8 @@ class ApkExportTests(unittest.TestCase):
         return subprocess.run(
             ['powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
              str(self.root / 'Export-KakaoApk.ps1'), '-AdbPath', str(self.root / 'fake-adb.cmd'), *extra],
-            capture_output=True, timeout=45, creationflags=subprocess.CREATE_NO_WINDOW)
+            capture_output=True, timeout=45, creationflags=subprocess.CREATE_NO_WINDOW,
+            env={**os.environ, 'WEB_KAKAO_TEST_PYTHON': sys.executable})
 
     def calls(self):
         path = self.root / 'calls.jsonl'

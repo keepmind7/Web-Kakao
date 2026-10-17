@@ -8,6 +8,17 @@ import { createReaderSession,allowedReaderMethod } from '../experiments/local-we
 import { guardReaderClient } from '../experiments/local-web/reader-protocol.mjs';
 import { createLocalServer } from '../experiments/local-web/server.mjs';
 
+// Browser control is granted only by the local launcher capability exchange.
+async function browserSession(app,url){
+  const issue=await fetch(url+'/api/local/launch',{method:'POST',headers:{Origin:url,'Content-Type':'application/json','X-Local-Control':app.controlToken},body:'{}'});
+  assert.equal(issue.status,200);assert.equal(issue.headers.get('set-cookie'),null);
+  const {ticket}=await issue.json();assert.match(ticket,/^[a-f0-9]{64}$/);
+  const session=await fetch(url+'/api/local/session',{method:'POST',headers:{Origin:url,'Content-Type':'application/json'},body:JSON.stringify({ticket})});
+  assert.equal(session.status,200);
+  const cookie=session.headers.get('set-cookie');assert.match(cookie,/HttpOnly; SameSite=Strict/);
+  return {cookie:cookie.split(';')[0],response:session};
+}
+
 const room='r_'+'a'.repeat(24),other='r_'+'b'.repeat(24),msg=n=>'m_'+n.toString(16).padStart(24,'0');
 const incoming=n=>({key:msg(n),incoming:true,afterBaseline:true,userMessage:true});
 test('unread ledger excludes duplicates, own messages, baseline history and control events',()=>{
@@ -156,7 +167,7 @@ test('new-room pushes are buffered through one CHATINFO and published after room
     assert.deepEqual(events.filter(e=>e.type==='reader-messages' && e.source==='push').at(-1).messages.map(m=>m.text),['합성 50','합성 51','합성 52']);
   }finally{release?.();session.close();}
 });
-test('discovery ignores foreign CHATINFO and blocks a server denial without retry',async()=>{
+test('discovery ignores foreign CHATINFO and skips a server denial without retry or disconnect',async()=>{
   for(const deny of [false,true]){
     const f=sdkFixture(),events=[];
     f.carriage.request=async(method,body)=>{f.calls.push({method,body});return {status:deny?-203:0,body:deny?{status:-203}:{chatInfo:{chatId:'333',type:'DirectChat'}}};};
@@ -166,14 +177,14 @@ test('discovery ignores foreign CHATINFO and blocks a server denial without retr
       await new Promise(r=>setTimeout(r,200));
       assert.equal(events.some(e=>e.type==='reader-rooms' && e.rooms.length>2),false);
       assert.equal(f.calls.filter(c=>c.method==='CHATINFO').length,1);
-      assert.equal(events.some(e=>e.type==='reader-failed' && e.stage==='discovery'),deny);
+      assert.equal(events.some(e=>e.type==='reader-failed'),false);
     }finally{session.close();}
   }
 });
 test('session sends scoped WRITE, merges ACK, then uses actual log ID for NOTIREAD',async()=>{
   const f=sdkFixture(),events=[],session=createReaderSession(cred,f.sdk,e=>events.push(e));
   try{await session.start();const key=events[0].rooms[0].key;assert.equal(await session.action(key,1,'send',{text:'합성'}),true);
-    const write=f.calls.find(c=>c.method==='WRITE');assert.equal(write.body.chatId,'9007199254740993');assert.equal(write.body.msg,'합성');assert.equal(write.body.noSeen,true);
+    const write=f.calls.find(c=>c.method==='WRITE');assert.equal(write.body.chatId,'9007199254740993');assert.equal(write.body.msg,'합성');assert.equal(write.body.noSeen,false);
     const message=events.find(e=>e.source==='sent').messages[0];assert.equal(await session.action(key,2,'read',{message:message.key}),true);
     assert.deepEqual(f.calls.find(c=>c.method==='NOTIREAD').body,{chatId:'9007199254740993',watermark:'20'});
     assert.equal(await session.action(key,3,'read',{message:msg(100)}),false);
@@ -183,10 +194,11 @@ test('WRITE timeout is unknown with no retry and rejection remains failed',async
   for(const mode of ['timeout','deny']){const f=sdkFixture(),events=[],session=createReaderSession(cred,f.sdk,e=>events.push(e));
     try{await session.start();f[mode]();await session.action(events[0].rooms[0].key,1,'send',{text:'합성'});
       assert.equal(events.find(e=>e.type==='reader-action').phase,mode==='timeout'?'unknown':'failed');assert.equal(f.calls.filter(c=>c.method==='WRITE').length,1);
-      assert.equal(await session.action(events[0].rooms[0].key,2,'send',{text:'합성'}),false);
+      assert.equal(events.some(e=>e.type==='reader-failed'),mode==='timeout');
+      assert.equal(await session.action(events[0].rooms[0].key,2,'send',{text:'합성'}),mode!=='timeout');
     }finally{session.close();}}
 });
-test('bounded read probe compares CHATINFO before and after NOTIREAD without another room-entry command',async()=>{
+test('bounded read probe establishes entry once then compares supplemental CHATINFO around NOTIREAD',async()=>{
   const f=sdkFixture(),events=[],observed=[];let snapshots=0;
   const original=f.carriage.request;
   f.carriage.request=async(method,body)=>{
@@ -200,18 +212,18 @@ test('bounded read probe compares CHATINFO before and after NOTIREAD without ano
     f.carriage.emit('push',{method:'MSG',status:0,body:{chatId:'9007199254740993',chatLog:{logId:'20',authorId:'111',msg:'Synthetic'}}});
     const message=events.find(e=>e.type==='reader-messages').messages[0];
     await session.action(key,1,'read',{message:message.key});
-    assert.deepEqual(f.calls.map(row=>row.method),['CHATINFO','NOTIREAD','CHATINFO']);
+    assert.deepEqual(f.calls.map(row=>row.method),['CHATONROOM','CHATINFO','NOTIREAD','CHATINFO']);
     assert.deepEqual(observed,[{before:{roomMatched:true,seenAtLeastTarget:false},after:{roomMatched:true,seenAtLeastTarget:true},targetIsOwn:false,requestedIsOwn:false}]);
     await session.action(key,2,'read',{message:message.key});
     assert.equal(f.calls.filter(row=>row.method==='CHATINFO').length,2);
-    assert.equal(f.calls.some(row=>row.method==='CHATONROOM' || row.method==='WRITE'),false);
+    assert.equal(f.calls.filter(row=>row.method==='CHATONROOM').length,1);assert.equal(f.calls.some(row=>row.method==='WRITE'),false);
   }finally{session.close();}
 });
 test('new HTTP actions preserve authentication, origin/CSRF and strict payload validation',async()=>{
   let sends=0,renames=0,seen=0;const app=createLocalServer({mode:'live',messaging:true,encode:()=>[[true]],transport:async op=>op==='allowlist'?{httpStatus:200,body:{allowlisted:true}}:op==='generate'?{httpStatus:200,body:{status:0,url:'OFFLINE-NOT-FOR-LOGIN',remainingSeconds:60}}:{httpStatus:200,body:{status:0,user:{userId:'246810'},accessToken:'FAKE_PRIVATE_TOKEN'}},readerFactory:()=>({snapshot:()=>({phase:'connected',canConnect:false}),close(){},sendText(){sends++;return true;},rename(){renames++;return true;},seen(){seen++;return true;}})});
   const url=await app.listen(0);
   try{
-    const root=await fetch(url),cookie=root.headers.get('set-cookie').split(';')[0];const state=await(await fetch(url+'/api/status',{headers:{cookie}})).json();
+    const {cookie}=await browserSession(app,url);const state=await(await fetch(url+'/api/status',{headers:{cookie}})).json();
     const post=(path,body,origin=url)=>fetch(url+path,{method:'POST',headers:{cookie,origin,'content-type':'application/json','x-csrf-token':state.csrf},body:JSON.stringify(body)});
     const body={room,text:'합성',clientId:'12345678-1234-4123-8123-123456789abc'};
     assert.equal((await post('/api/reader/send',body)).status,409);await app.lab.start();for(let i=0;i<300 && !app.lab.snapshot().credentialInMemory;i++)await new Promise(r=>setTimeout(r,10));

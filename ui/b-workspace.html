@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>시안 B · 다크 작업공간형</title>
+<style>
+:root{--bg:#0f1115;--rail:#0a0b0e;--panel:#15181d;--panel2:#1b1f26;--line:#262b33;--text:#e7eaee;--muted:#8a929d;--accent:#7c9cff;--accent2:#2a3350;--mine:#1f2638;--ok:#3ecf8e;--warn:#f5c451;font-family:"Pretendard","Apple SD Gothic Neo","Malgun Gothic",system-ui,sans-serif;color:var(--text);color-scheme:dark}
+*{box-sizing:border-box}[hidden]{display:none!important}body{margin:0;background:var(--bg)}button,input,textarea{font:inherit;color:inherit}button{cursor:pointer;border:0;background:none}
+button:focus-visible,input:focus-visible,textarea:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.app{display:grid;grid-template-columns:64px 300px minmax(0,1fr) 290px;height:100dvh}
+.app.noinfo{grid-template-columns:64px 300px minmax(0,1fr) 0}
+/* 레일 */
+.rail{background:var(--rail);display:flex;flex-direction:column;align-items:center;gap:6px;padding:14px 0;border-right:1px solid var(--line)}
+.rail button{width:42px;height:42px;border-radius:12px;color:var(--muted);font-size:19px;display:grid;place-items:center;position:relative}
+.rail button:hover{background:var(--panel2);color:var(--text)}.rail button[aria-current=true]{background:var(--accent2);color:var(--accent)}
+.rail .sp{flex:1}.rail .conn::after{content:"";position:absolute;right:7px;bottom:7px;width:9px;height:9px;border-radius:50%;background:var(--ok);border:2px solid var(--rail)}
+.logo{width:38px;height:38px;border-radius:12px;background:linear-gradient(135deg,#7c9cff,#b18cff);display:grid;place-items:center;font-weight:800;color:#0f1115;margin-bottom:10px}
+/* 목록 */
+.side{background:var(--panel);border-right:1px solid var(--line);display:flex;flex-direction:column;min-height:0}
+.side h1{font-size:16px;margin:0;padding:18px 16px 12px;display:flex;justify-content:space-between;align-items:center}
+.side h1 small{font-size:11px;font-weight:500;color:var(--ok);display:flex;align-items:center;gap:5px}
+.side h1 small::before{content:"";width:6px;height:6px;border-radius:50%;background:var(--ok)}
+.search{margin:0 12px 10px;display:flex;gap:8px;align-items:center;background:var(--panel2);border:1px solid var(--line);border-radius:9px;padding:0 10px;color:var(--muted)}
+.search input{flex:1;border:0;background:none;outline:none;padding:8px 0;font-size:13px}
+.search kbd{font-size:10px;border:1px solid var(--line);border-radius:4px;padding:1px 5px}
+.tabs{display:flex;margin:0 12px 6px;border-bottom:1px solid var(--line)}
+.tabs button{padding:8px 10px;font-size:13px;color:var(--muted);border-bottom:2px solid transparent;margin-bottom:-1px}
+.tabs button[aria-pressed=true]{color:var(--text);border-color:var(--accent)}
+.rooms{overflow-y:auto;flex:1;padding:6px}
+.sec{font-size:11px;color:var(--muted);letter-spacing:.06em;padding:10px 10px 4px}
+.room{display:flex;gap:10px;align-items:center;width:100%;text-align:left;padding:8px 10px;border-radius:8px}
+.room:hover{background:var(--panel2)}.room.on{background:var(--accent2)}
+.av{flex:none;width:34px;height:34px;border-radius:10px;display:grid;place-items:center;color:#0f1115;font-weight:700;font-size:14px}
+.rc{flex:1;min-width:0}.rc b{display:block;font-size:14px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.room.unread .rc b{font-weight:700}
+.rc small{display:block;font-size:12px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:2px}
+.rm{display:flex;flex-direction:column;align-items:flex-end;gap:4px}.rm time{font-size:10px;color:var(--muted)}
+.badge{min-width:18px;padding:0 5px;border-radius:6px;background:var(--accent);color:#0f1115;font-size:11px;font-weight:700;text-align:center}
+.ro{font-size:10px;color:var(--warn);border:1px solid #f5c45155;border-radius:4px;padding:0 4px}
+/* 채팅 */
+.chat{display:flex;flex-direction:column;min-width:0;min-height:0}
+.head{display:flex;align-items:center;gap:10px;padding:12px 18px;border-bottom:1px solid var(--line);min-height:60px}
+.head h2{font-size:15px;margin:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.head p{font-size:12px;color:var(--muted);margin:0 0 0 4px;white-space:nowrap}
+.head .grow{flex:1}
+.ib{width:34px;height:34px;border-radius:8px;color:var(--muted);display:grid;place-items:center;font-size:16px}
+.ib:hover,.ib[aria-pressed=true]{background:var(--panel2);color:var(--text)}
+.scroll{flex:1;overflow-y:auto;padding:8px 0 16px}
+.more{display:block;margin:8px auto;font-size:12px;color:var(--accent);padding:6px 12px;border-radius:6px}.more:hover{background:var(--panel2)}
+.day{display:flex;align-items:center;gap:12px;font-size:11px;color:var(--muted);margin:12px 18px}.day::before,.day::after{content:"";flex:1;height:1px;background:var(--line)}
+.msg{display:flex;gap:12px;padding:6px 18px;position:relative}.msg:hover{background:#ffffff06}
+.msg.cont{padding-top:1px}.msg.cont .av,.msg.cont .mh{display:none}.msg.cont .body{margin-left:46px}
+.msg .av{width:34px;height:34px;margin-top:2px}
+.mh{display:flex;align-items:baseline;gap:8px}.mh b{font-size:14px}.mh time{font-size:11px;color:var(--muted)}
+.msg.mine .mh b{color:var(--accent)}
+.text{font-size:14px;line-height:1.6;white-space:pre-wrap;overflow-wrap:anywhere;color:#d6dae0}
+.msg.mine .text{background:var(--mine);display:inline-block;padding:6px 10px;border-radius:8px;margin-top:3px}
+.read{font-size:11px;color:var(--warn);margin-left:6px;font-weight:700}
+.q{border-left:2px solid var(--accent);padding:2px 10px;margin:4px 0;font-size:12px;color:var(--muted)}.q b{color:var(--text);font-weight:600}
+.photo{width:260px;height:170px;border-radius:10px;margin-top:4px;background:linear-gradient(135deg,#3a4d7a,#7a5a9a 55%,#c08a6a);border:1px solid var(--line)}
+.acts{position:absolute;right:18px;top:-12px;display:none;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:2px}
+.msg:hover .acts{display:flex}.acts button{padding:4px 8px;font-size:12px;color:var(--muted);border-radius:6px}.acts button:hover{color:var(--text);background:var(--line)}
+/* 입력 */
+.compose{padding:0 18px 16px}
+.box{border:1px solid var(--line);background:var(--panel);border-radius:12px;overflow:hidden}
+.box:focus-within{border-color:#4a5677}
+.reply{display:flex;align-items:center;gap:10px;padding:8px 12px;font-size:12px;color:var(--muted);border-bottom:1px solid var(--line);background:var(--panel2)}
+.reply div{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.reply b{color:var(--accent)}
+.box textarea{display:block;width:100%;border:0;background:none;outline:none;resize:none;padding:12px 14px 4px;font-size:14px;line-height:1.5;color:var(--text)}
+.bar{display:flex;align-items:center;gap:4px;padding:4px 8px 8px}.bar .hint{flex:1;font-size:11px;color:var(--muted);padding-left:6px}
+.send{background:var(--accent);color:#0f1115;font-weight:700;border-radius:8px;padding:6px 14px;font-size:13px}.send:disabled{background:var(--line);color:var(--muted);cursor:default}
+.locked{border:1px dashed #f5c45166;color:var(--warn);background:#f5c4510d;border-radius:12px;padding:14px;font-size:13px;text-align:center}
+/* 정보 패널 */
+.info{background:var(--panel);border-left:1px solid var(--line);overflow-y:auto;padding:22px 18px;min-width:0}
+.noinfo .info{display:none}
+.info .big{width:64px;height:64px;border-radius:20px;font-size:26px;margin:0 auto 10px}
+.info h3{text-align:center;margin:0;font-size:16px}.info .sub{text-align:center;color:var(--muted);font-size:12px;margin:4px 0 18px}
+.grp{border-top:1px solid var(--line);padding:14px 0}.grp h4{margin:0 0 8px;font-size:11px;color:var(--muted);letter-spacing:.06em;font-weight:600}
+.opt{display:flex;justify-content:space-between;align-items:center;padding:7px 0;font-size:13px;gap:10px}
+.opt small{display:block;color:var(--muted);font-size:11px}
+.sw{appearance:none;flex:none;width:34px;height:20px;border-radius:999px;background:var(--line);position:relative;cursor:pointer}
+.sw::after{content:"";position:absolute;top:3px;left:3px;width:14px;height:14px;border-radius:50%;background:#9aa3ad;transition:.15s}
+.sw:checked{background:var(--accent)}.sw:checked::after{left:17px;background:#0f1115}
+.lb{display:flex;align-items:center;gap:10px;width:100%;text-align:left;padding:8px;border-radius:8px;font-size:13px;color:#cdd2d8}.lb:hover{background:var(--panel2)}
+.conn-card{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:12px;font-size:12px;line-height:1.7;color:var(--muted)}
+.conn-card b{color:var(--ok)}
+/* 로그인 모달 */
+.modal{position:fixed;inset:0;background:#000a;display:grid;place-items:center;z-index:5}
+.modal section{width:min(420px,92vw);background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:26px;text-align:center}
+.qr{width:180px;height:180px;margin:18px auto;border-radius:12px;background:repeating-conic-gradient(#0f1115 0 25%,#fff 0 50%) 0 0/24px 24px;border:12px solid #fff}
+.steps{display:flex;justify-content:center;gap:6px;margin:6px 0 4px;font-size:11px;color:var(--muted)}.steps span{padding:3px 8px;border-radius:999px;background:var(--panel2)}.steps .now{background:var(--accent2);color:var(--accent)}
+.btn{background:var(--accent);color:#0f1115;font-weight:700;border-radius:10px;padding:10px 16px;font-size:14px}.btn.ghost{background:var(--panel2);color:var(--text)}
+@media(max-width:1180px){.app,.app.noinfo{grid-template-columns:64px 280px minmax(0,1fr) 0}.info{display:none}.app.showinfo .info{display:block;position:fixed;right:0;top:0;bottom:0;width:300px;z-index:4;box-shadow:-10px 0 30px #0008}}
+@media(max-width:760px){.app,.app.noinfo{grid-template-columns:56px minmax(0,1fr) 0 0}.chat{display:none}.app.chatview{grid-template-columns:0 0 minmax(0,1fr) 0}.app.chatview .rail,.app.chatview .side{display:none}.app.chatview .chat{display:flex}.back{display:grid!important}}
+.back{display:none}
+</style></head>
+<body>
+<div class="app" id="app">
+  <nav class="rail" aria-label="메뉴">
+    <div class="logo" aria-hidden="true">W</div>
+    <button aria-current="true" aria-label="대화">💬</button>
+    <button aria-label="고정한 방">★</button>
+    <div class="sp"></div>
+    <button class="conn" id="open-login" aria-label="계정 연결 · 연결됨">⇄</button>
+    <button aria-label="설정">⚙</button>
+  </nav>
+  <aside class="side" aria-label="대화 목록">
+    <h1>대화 <small>실시간</small></h1>
+    <label class="search"><span aria-hidden="true">⌕</span><input id="q" type="search" placeholder="대화방 검색" aria-label="대화방 검색"><kbd>Ctrl K</kbd></label>
+    <div class="tabs" role="group" aria-label="필터"><button data-f="all" aria-pressed="true">전체</button><button data-f="unread" aria-pressed="false">안 읽음</button><button data-f="pinned" aria-pressed="false">고정</button></div>
+    <div class="rooms" id="rooms"></div>
+  </aside>
+  <section class="chat" aria-label="선택한 대화방">
+    <header class="head">
+      <button class="ib back" id="back" aria-label="목록으로">‹</button>
+      <h2 id="h-title"></h2><p id="h-sub"></p><span class="grow"></span>
+      <button class="ib" aria-label="대화 검색">⌕</button>
+      <button class="ib" id="toggle-info" aria-label="방 정보" aria-pressed="true">ⓘ</button>
+    </header>
+    <div class="scroll" id="scroll"></div>
+    <footer class="compose" id="compose"></footer>
+  </section>
+  <aside class="info" id="info" aria-label="방 정보"></aside>
+</div>
+<div class="modal" id="login" hidden>
+  <section aria-label="계정 연결">
+    <div class="steps"><span>1 QR 스캔</span><span class="now">2 확인 코드</span><span>3 대화방 불러오기</span></div>
+    <div class="qr" aria-label="QR 코드 예시"></div>
+    <p style="color:var(--muted);font-size:13px;margin:0 0 8px">휴대폰에 아래 확인 코드를 입력하세요</p>
+    <div style="font-size:30px;letter-spacing:10px;font-weight:700">4821</div>
+    <p style="color:var(--muted);font-size:12px">남은 시간 4:32 · 인증은 이 노트북 메모리에만 1시간 보관</p>
+    <div style="display:flex;gap:8px;justify-content:center;margin-top:14px"><button class="btn ghost" id="close-login">닫기</button><button class="btn">대화방 불러오기</button></div>
+  </section>
+</div>
+<script src="mock-data.js"></script>
+<script>
+const $=id=>document.getElementById(id),{esc,initial}=MOCK;let sel='minji',filter='all';
+function roomBtn(r){return `<button class="room${r.id===sel?' on':''}${r.unread?' unread':''}" data-id="${r.id}"><div class="av" style="background:${r.color}">${esc(initial(r.name))}</div><div class="rc"><b>${esc(r.name)}</b><small>${esc(r.preview)}</small></div><div class="rm"><time>${r.time}</time>${r.unread?`<span class="badge">${r.unread}</span>`:r.kind==='open'?'<span class="ro">읽기 전용</span>':''}</div></button>`;}
+function renderRooms(){const list=MOCK.filter(filter,$('q').value),pin=list.filter(r=>r.pinned),rest=list.filter(r=>!r.pinned);
+  $('rooms').innerHTML=(pin.length?'<div class="sec">고정</div>'+pin.map(roomBtn).join(''):'')+(rest.length?'<div class="sec">대화</div>'+rest.map(roomBtn).join(''):'');}
+function renderChat(){const r=MOCK.rooms.find(x=>x.id===sel);$('h-title').textContent=r.name;$('h-sub').textContent='· '+MOCK.subtitle(r);
+  let prev=null;$('scroll').innerHTML='<button class="more">↑ 이전 메시지 불러오기</button>'+MOCK.history(sel).map(m=>{if(m.day){prev=null;return `<div class="day">${m.day}</div>`;}const who=m.mine?'나':m.from,cont=prev===who;prev=who;
+    const content=m.photo?'<div class="photo" role="img" aria-label="사진"></div>':`${m.quote?`<div class="q"><b>${esc(m.quote.author)}</b> · ${esc(m.quote.text)}</div>`:''}<div class="text">${esc(m.text)}</div>`;
+    return `<div class="msg${m.mine?' mine':''}${cont?' cont':''}"><div class="av" style="background:${m.mine?'#7c9cff':r.color}">${esc(initial(who))}</div><div class="body"><div class="mh"><b>${esc(who)}</b><time>${m.time}</time></div>${content}${m.mine&&m.read?`<span class="read" title="안 읽은 사람 수">${m.read}</span>`:''}</div><div class="acts"><button>답장</button><button>복사</button></div></div>`;}).join('');
+  $('compose').innerHTML=r.kind==='open'?'<div class="locked">이 오픈채팅은 아직 읽기 전용입니다. 텍스트·사진·읽음 알림을 지원하지 않습니다.</div>':`<div class="box"><div class="reply"><div><b>김민지</b>에게 답장 · 사진 잘 받았어! 내일 봐</div><button class="ib" aria-label="답장 취소">×</button></div><textarea rows="2" placeholder="${esc(r.name)}에게 메시지 보내기" aria-label="메시지 입력"></textarea><div class="bar"><button class="ib" aria-label="사진 첨부">＋</button><span class="hint">Enter 전송 · Shift+Enter 줄바꿈 · Ctrl+V 사진 붙여넣기</span><button class="send" disabled>전송</button></div></div>`;
+  const ta=$('compose').querySelector('textarea');if(ta)ta.oninput=()=>$('compose').querySelector('.send').disabled=!ta.value.trim();
+  $('info').innerHTML=`<div class="av big" style="background:${r.color}">${esc(initial(r.name))}</div><h3>${esc(r.name)}</h3><p class="sub">${MOCK.subtitle(r)}</p>
+  <div class="grp"><h4>이 방</h4><label class="opt"><span>상단에 고정</span><input class="sw" type="checkbox" ${r.pinned?'checked':''}></label><label class="opt"><span>알림</span><input class="sw" type="checkbox" checked></label>
+  <button class="lb">✎ 이 웹에서 이름 변경</button><button class="lb">⌕ 불러온 메시지에서 검색</button><button class="lb">↑ 이전 메시지 불러오기</button></div>
+  <div class="grp"><h4>읽음</h4><label class="opt"><span>카카오톡에도 읽음 알리기<small>최신 메시지를 실제로 봤을 때만</small></span><input class="sw" type="checkbox"></label></div>
+  <div class="grp"><h4>연결</h4><div class="conn-card"><b>● 연결됨</b> · 실시간 수신 중<br>인증 남은 시간 42분<br>대화·사진은 메모리에만 보관</div></div>`;
+  $('scroll').scrollTop=1e9;}
+$('rooms').onclick=e=>{const b=e.target.closest('.room');if(!b)return;sel=b.dataset.id;$('app').classList.add('chatview');renderRooms();renderChat();};
+document.querySelector('.tabs').onclick=e=>{const b=e.target.closest('button');if(!b)return;filter=b.dataset.f;document.querySelectorAll('.tabs button').forEach(x=>x.setAttribute('aria-pressed',x===b));renderRooms();};
+$('q').oninput=renderRooms;$('back').onclick=()=>$('app').classList.remove('chatview');
+$('toggle-info').onclick=()=>{const wide=matchMedia('(min-width:1181px)').matches,cls=wide?'noinfo':'showinfo',on=$('app').classList.toggle(cls);$('toggle-info').setAttribute('aria-pressed',wide?!on:on);};
+$('open-login').onclick=()=>$('login').hidden=false;$('close-login').onclick=()=>$('login').hidden=true;
+renderRooms();renderChat();
+</script>
+</body></html>

@@ -30,6 +30,17 @@ export function logArray(body) {
   return ['chatLogs','logs','msgs','messages','l'].map(key=>body?.[key]).find(Array.isArray);
 }
 const idOfRoom = row => serverId(row?.chatId ?? row?.id ?? row?.roomId ?? row?.chatRoomId ?? row?.c);
+const normalKinds=new Set(['DirectChat','MultiChat','MemoChat']);
+const openKinds=new Set(['OpenDirectChat','OpenMultiChat']);
+const kindOf=value=>value==='OD'?'OpenDirectChat':value==='OM'?'OpenMultiChat':normalKinds.has(value) || openKinds.has(value)?value:'unknown';
+const int32=value=>Number.isInteger(value) && value>=-2147483648 && value<=2147483647;
+const signedLinkId=value=>{const id=serverId(value);return id && BigInt(id)<=9223372036854775807n?id:'';};
+const fieldsOf=(row,fields)=>fields.filter(field=>object(row) && Object.hasOwn(row,field)).map(field=>row[field]);
+function matchingRoom(body,id,{required=true}={}){
+  const ids=[...fieldsOf(body,['chatId','roomId','chatRoomId','c']),...fieldsOf(body?.chatInfo,['chatId','id','roomId','chatRoomId','c'])];
+  return (!required || ids.length>0) && ids.every(value=>serverId(value)===id);
+}
+function explicitTitle(row){return titleText(row?.title,row?.roomName,row?.name,row?.subject) || metaTitle(row?.meta) || (Array.isArray(row?.chatMetas)?row.chatMetas.slice(0,50).filter(value=>value?.type===3).map(value=>metaTitle(value.content ?? value)).find(Boolean):'') || '';}
 const lastLog = row => row?.lastChatLog ?? row?.lastLog ?? row?.chatLog ?? (object(row?.l) ? row.l : null);
 function timestamp(value) {
   const number = Number(value);
@@ -78,11 +89,12 @@ export function createReaderStore(body, ownUserId, salt=randomBytes(32),settings
   if (!rows) throw new Error('room_list_missing');
   let sourceRoomCount=rows.length;
   const rooms=new Map(),byServerId=new Map(),cache=new Map(),aliases=new Map();
-  let duplicates=0,invalidMessages=0,aliasCount=0;
+  let duplicates=0,invalidMessages=0,aliasCount=0,pinned=null;
   const opaque=(prefix,id)=>prefix+createHmac('sha256',salt).update(id).digest('hex').slice(0,24);
   function addRoom(row,{discovered=false}={}) {
     const serverRoomId=idOfRoom(row);if(!serverRoomId || byServerId.has(serverRoomId) || rooms.size>=ROOM_LIMIT)return null;
-    const kind=['DirectChat','MultiChat','MemoChat'].includes(row?.t ?? row?.type)?(row.t ?? row.type):'unknown';
+    const ids=fieldsOf(row,['chatId','id','roomId','chatRoomId','c']);if(ids.some(id=>serverId(id)!==serverRoomId))return null;
+    const rawType=row?.t ?? row?.type,kind=row?.t!==undefined && row?.type!==undefined && kindOf(row.t)!==kindOf(row.type)?'unknown':kindOf(rawType);
     const key=opaque('r_',serverRoomId),name=kind==='MemoChat'?'나와의 채팅':title(row,ownUserId),candidate=lastLog(row);
     const attached=serverId(candidate?.chatId ?? candidate?.roomId ?? candidate?.c);
     const last=attached && attached!==serverRoomId?null:candidate;
@@ -91,7 +103,9 @@ export function createReaderStore(body, ownUserId, salt=randomBytes(32),settings
     const seed=seedId?{logId:seedId,chatId:serverRoomId,authorId:serverId(last?.authorId ?? last?.senderId),type:last?.type ?? last?.t,attachment:last?.attachment,msg:text(last),sendAt:timestamp(last?.sendAt ?? last?.createdAt),senderName:clean(last?.senderName ?? last?.authorName,80)}:null;
     const names=new Map();
     if(Array.isArray(row?.i) && Array.isArray(row?.k))for(let n=0;n<Math.min(row.i.length,row.k.length,500);n++){const id=serverId(row.i[n]),name=clean(row.k[n],80);if(id && name)names.set(id,name);}
-    rooms.set(key,{key,serverRoomId,historyEnd,baseline:discovered?'0':historyEnd,seed,names,kind,cacheEpoch:0,receiptVersion:0,membershipDirty:false,expectedMembers:Number.isSafeInteger(row.a ?? row.activeMembersCount)?(row.a ?? row.activeMembersCount):null,members:null,watermarks:new Map(),receiptReady:false,
+    const linkIds=fieldsOf(row,['li','linkId','openLinkId']);
+    const linkId=linkIds.length && linkIds.every(value=>serverId(value) && serverId(value)===serverId(linkIds[0]))?serverId(linkIds[0]):null;
+    rooms.set(key,{key,serverRoomId,preferenceKey:settingsSecret?preferenceId(settingsSecret,'room',ownUserId,serverRoomId):null,historyEnd,baseline:discovered?'0':historyEnd,seed,names,kind,rawType,linkId,link:null,ownMember:null,contextVerified:false,token:'0',muteUntil:0,explicitTitle:Boolean(explicitTitle(row)),left:row.left===true,cacheEpoch:0,receiptVersion:0,membershipDirty:false,expectedMembers:Number.isSafeInteger(row.a ?? row.activeMembersCount)?(row.a ?? row.activeMembersCount):null,members:null,watermarks:new Map(),receiptReady:false,
       title:name || `이름 없는 대화방 ${rooms.size+1}`,titleKnown:Boolean(name),preview:text(last).slice(0,160),lastAt:timestamp(last?.sendAt ?? last?.createdAt ?? row?.updatedAt)});
     byServerId.set(serverRoomId,key);
     return key;
@@ -102,7 +116,7 @@ export function createReaderStore(body, ownUserId, salt=randomBytes(32),settings
     const messages=cache.get(key) ?? new Map();
     cache.delete(key);cache.set(key,messages);
     while(cache.size>CACHE_LIMIT){
-      const removed=cache.keys().next().value;cache.delete(removed);aliasCount-=aliases.get(removed)?.size ?? 0;aliases.delete(removed);
+      const removed=[...cache.keys()].find(candidate=>candidate!==pinned);cache.delete(removed);aliasCount-=aliases.get(removed)?.size ?? 0;aliases.delete(removed);
       const evicted=rooms.get(removed);if(evicted)evicted.cacheEpoch++;
       onCacheEvicted(removed);
     }
@@ -148,14 +162,126 @@ export function createReaderStore(body, ownUserId, salt=randomBytes(32),settings
   function watermark(value){
     try{if(value===0 || value===0n || value==='0' || object(value) && value.toString?.()==='0')return '0';return serverId(value);}catch{return '';}
   }
+  function capabilities(room){
+    const normal=Boolean(room && normalKinds.has(room.kind) && !room.left);
+    const linkReady=Boolean(room && openKinds.has(room.kind) && !room.left && room.linkId && room.link?.active===true && !room.link.expired);
+    // Pinned node-kakao 8512e469 openlink/open-link-type.ts: OWNER=1,
+    // NONE=2, MANAGER=4. This is a compatibility whitelist, not a complete
+    // recovery of current privilege bits; unknown/bot roles stay disabled.
+    const ready=linkReady && room.contextVerified && room.ownMember?.userId===ownUserId && [1,2,4].includes(room.ownMember.role);
+    const writable=Boolean(ready && room.muteUntil===0);
+    return {canText:normal || writable,canReply:normal || writable,canPhoto:normal || writable,canRead:normal || Boolean(ready),canContext:normal || linkReady,canSend:normal || writable};
+  }
+  function invalidate(room){room.receiptVersion++;room.contextVerified=false;room.ownMember=null;room.receiptReady=false;room.membershipDirty=true;}
+  function applyLink(row,{deleted=false,eligible}={}){
+    if(!object(row))return [];
+    const ids=fieldsOf(row,['li','linkId','openLinkId']);
+    if(!ids.length || ids.some(value=>!signedLinkId(value) || signedLinkId(value)!==signedLinkId(ids[0])))return [];
+    const id=signedLinkId(ids[0]),changed=[];
+    for(const room of rooms.values())if(openKinds.has(room.kind) && !room.left && room.linkId===id && (!eligible || eligible.has(room.key))){
+      const active=deleted?false:row.ac===true;
+      const expired=deleted || row.isExpired===true || row.expired===true; // raw ex is not an expiry field.
+      const token=row.otk===undefined?null:int32(row.otk)?row.otk:null;
+      const next={active,expired,token,name:titleText(row.ln,row.linkName)};
+      // Any link revision can change the available actions. Do not let an old
+      // context response re-enable a room after a metadata update/deletion.
+      invalidate(room);room.link=next;
+      if(next.name && !room.explicitTitle){room.title=next.name;room.titleKnown=true;}
+      changed.push(room.key);
+    }
+    return changed;
+  }
+  function applyLinkRows(rows,{eligible,requested}={}){
+    const candidates=new Map(),blocked=new Set(),changed=new Set();
+    for(const row of rows){
+      const ids=fieldsOf(row,['li','linkId','openLinkId']),id=ids.length?signedLinkId(ids[0]):'';
+      if(!id || ids.some(value=>signedLinkId(value)!==id)){
+        for(const value of ids){const attached=signedLinkId(value);if(attached && (!requested || requested.has(attached)))blocked.add(attached);}
+        continue;
+      }
+      if(requested && !requested.has(id))continue;
+      // Duplicate metadata is ambiguous even when its first row looks usable.
+      // Revoke rather than let array order choose the room's available actions.
+      if(candidates.has(id))blocked.add(id);else candidates.set(id,row);
+    }
+    for(const id of blocked)for(const key of applyLink({li:id,ac:false},{eligible}))changed.add(key);
+    for(const [id,row] of candidates)if(!blocked.has(id))for(const key of applyLink(row,{eligible}))changed.add(key);
+    return [...changed];
+  }
   return {
-    rooms(){return [...rooms.values()].map(room=>({key:room.key,...(settingsSecret?{preferenceKey:preferenceId(settingsSecret,'room',ownUserId,room.serverRoomId)}:{}),title:room.title,titleKnown:room.titleKnown,preview:room.preview,lastAt:room.lastAt,kind:room.kind,canSend:room.kind!=='unknown',historyAvailable:Boolean(room.historyEnd)})).sort((a,b)=>(b.lastAt ?? 0)-(a.lastAt ?? 0));},
+    rooms(){return [...rooms.values()].map(room=>({key:room.key,...(room.preferenceKey?{preferenceKey:room.preferenceKey}:{}),contextRevision:room.receiptVersion,cacheEpoch:room.cacheEpoch,title:room.title,titleKnown:room.titleKnown,preview:room.preview,lastAt:room.lastAt,kind:room.kind,...capabilities(room),historyAvailable:Boolean(room.historyEnd)})).sort((a,b)=>(b.lastAt ?? 0)-(a.lastAt ?? 0));},
+    pin(key){if(!rooms.has(key))return false;pinned=key;return true;},
     has:key=>rooms.has(key),
     serverRoomId:key=>rooms.get(key)?.serverRoomId,
     historyEnd:key=>rooms.get(key)?.historyEnd,
     cacheEpoch:key=>rooms.get(key)?.cacheEpoch,
     receiptVersion:key=>rooms.get(key)?.receiptVersion,
-    canSend:key=>rooms.has(key) && rooms.get(key).kind!=='unknown',
+    canSend:key=>capabilities(rooms.get(key)).canSend,
+    canAction(key,action){const name={send:'canText',reply:'canReply',photo:'canPhoto',read:'canRead',context:'canContext'}[action];return Boolean(name && capabilities(rooms.get(key))[name]);},
+    isOpen:key=>openKinds.has(rooms.get(key)?.kind),
+    linkId:key=>rooms.get(key)?.linkId,
+    hasOpenLinks:()=>[...rooms.values()].some(room=>openKinds.has(room.kind) && !room.left && signedLinkId(room.linkId)),
+    entryToken:key=>rooms.get(key)?.token ?? '0',
+    entryOption:key=>rooms.get(key)?.ownMember?.token>=0?rooms.get(key).ownMember.token:0,
+    entrySnapshot(key,response,version){
+      const room=rooms.get(key);if(!room || version!==room.receiptVersion || !matchingRoom(response,room.serverRoomId))return false;
+      const row=response?.chatInfo ?? response;
+      room.contextVerified=false;room.ownMember=null;
+      const links=[...fieldsOf(response,['li','linkId','openLinkId']),...fieldsOf(response?.chatInfo,['li','linkId','openLinkId'])];
+      if(openKinds.has(room.kind) && (!room.linkId || links.some(value=>serverId(value)!==room.linkId)))return false;
+      const token=response?.o===undefined?'0':watermark(response.o);if(!token)return false;
+      // APK CHATONROOM.o -> saved room token -> next CHATONROOM.token. A
+      // LOGINLIST/global cursor is deliberately never a token source.
+      room.token=token;
+      if(openKinds.has(room.kind)){
+        // APK25.11.2 iq.o.a: userId Long, lmt/opt Integer, pv Long.
+        // context.notiRead controls count display, not this action gate.
+        const member=row.olu,role=member?.lmt,memberToken=member?.opt;
+        const id=serverId(member?.userId);
+        const mute=row.mt===undefined?0:row.mt;
+        if(id!==ownUserId || !int32(role) || ![1,2,4].includes(role) || !int32(mute) || mute<0 || memberToken!==undefined && !int32(memberToken)){
+          return true; // Matching entry ACK is distinct from action permission.
+        }
+        room.ownMember={userId:id,role,token:memberToken ?? -1,privilege:member.pv};room.muteUntil=mute;
+      }
+      room.contextVerified=true;return true;
+    },
+    linkSyncSnapshot:()=>new Map([...rooms.values()].map(room=>[room.key,room.receiptVersion])),
+    missingOpenLinkIds(limit=16){
+      const bounded=Number.isFinite(limit)?Math.min(16,Math.max(0,Math.floor(limit))):0,ids=new Set();
+      for(const room of rooms.values())if(ids.size<bounded && openKinds.has(room.kind) && !room.left && room.link===null){const id=signedLinkId(room.linkId);if(id)ids.add(id);}
+      return [...ids];
+    },
+    syncLinks(response,versions){
+      if(!object(response) || response.ols!==undefined && (!Array.isArray(response.ols) || response.ols.length>ROOM_LIMIT) || response.dlis!==undefined && (!Array.isArray(response.dlis) || response.dlis.length>ROOM_LIMIT) || !int32(response.ltk) || response.ltk<0)return [];
+      const changed=new Set();
+      // Select the originally matching rooms once; an ols update itself bumps
+      // their revision, so a deletion in this same snapshot must still win.
+      const eligible=versions?new Set([...rooms.values()].filter(room=>versions.get(room.key)===room.receiptVersion).map(room=>room.key)):null;
+      for(const key of applyLinkRows(response.ols ?? [],{eligible}))changed.add(key);
+      for(const id of response.dlis ?? [])for(const key of applyLink({li:id},{deleted:true,eligible}))changed.add(key);
+      return [...changed];
+    },
+    infoLinks(response,requestedIds,versions){
+      if(!object(response) || !Array.isArray(response.ols) || response.ols.length>ROOM_LIMIT || !Array.isArray(requestedIds) || requestedIds.length>16 || !(versions instanceof Map))return [];
+      const ids=requestedIds.map(signedLinkId);if(ids.some(id=>!id))return [];
+      const requested=new Set(ids),eligible=new Set([...rooms.values()].filter(room=>openKinds.has(room.kind) && !room.left && room.link===null && requested.has(room.linkId) && versions.get(room.key)===room.receiptVersion).map(room=>room.key));
+      return applyLinkRows(response.ols,{eligible,requested});
+    },
+    linkUpdate(method,response){
+      if(method==='SYNCLINKPF' || method==='SYNCMEMT' || method==='LINKKICKED'){
+        const roomIds=fieldsOf(response,['c','chatId','roomId']),linkIds=fieldsOf(response,['li','linkId']);
+        if(!roomIds.length && !linkIds.length)return [];
+        const updates=[];
+        for(const room of rooms.values())if(openKinds.has(room.kind) && roomIds.every(id=>serverId(id)===room.serverRoomId) && linkIds.every(id=>serverId(id)===room.linkId)){
+          invalidate(room);if(method==='LINKKICKED'){room.left=true;room.link=null;}
+          updates.push({key:room.key,...view(room.key),receiptInvalidated:true,entryInvalidated:true});
+        }
+        return updates;
+      }
+      const row=response?.ol ?? response?.openLink ?? response;
+      return applyLink(row,{deleted:['SYNCLINKDL','LNKDELETED'].includes(method)}).map(key=>({key,...view(key),receiptInvalidated:true,entryInvalidated:true}));
+    },
     unnamedRooms(limit=8){
       return [...rooms.values()].filter(room=>!room.titleKnown && room.kind!=='MemoChat')
         .sort((a,b)=>(b.lastAt ?? 0)-(a.lastAt ?? 0)).slice(0,Math.min(8,Math.max(0,limit))).map(room=>room.key);
@@ -167,9 +293,9 @@ export function createReaderStore(body, ownUserId, salt=randomBytes(32),settings
       // unambiguous response identity; never copy the requested ID into it.
       const ids=['chatId','id','roomId','chatRoomId','c'].filter(field=>Object.hasOwn(row,field));
       if(!ids.length || ids.some(field=>serverId(row[field])!==room.serverRoomId))return false;
-      const name=title(row,ownUserId);if(!name)return false;
+      const name=explicitTitle(row) || room.link?.name || title(row,ownUserId);if(!name)return false;
       // In particular, displayMembers is not a verified membership snapshot.
-      room.title=name;room.titleKnown=true;return true;
+      room.title=name;room.titleKnown=true;room.explicitTitle=Boolean(explicitTitle(row));return true;
     },
     unknownRooms(body){
       if(rooms.size>=ROOM_LIMIT)return [];
@@ -201,8 +327,7 @@ export function createReaderStore(body, ownUserId, salt=randomBytes(32),settings
     replyForMessage(key,messageKey){const item=[...(cache.get(key)?.values() ?? [])].find(message=>message.key===messageKey);return item?.canReply?replyExtra(item.replyTarget):null;},
     receiptSnapshot(key,body,version){
       const room=rooms.get(key);if(!room || version!==undefined && version!==room.receiptVersion)return false;room.receiptReady=false;
-      const attached=[body?.c,body?.chatId].filter(value=>value!==undefined);
-      if(!attached.length || attached.some(value=>serverId(value)!==room.serverRoomId))return false;
+      if(!matchingRoom(body,room.serverRoomId))return false;
       const ids=Array.isArray(body.mi)?body.mi:Array.isArray(body.m)?body.m.map(member=>member?.userId):null;
       if(!ids || ids.length>100 || !Array.isArray(body.a) || !Array.isArray(body.w) || body.a.length>100 || body.a.length!==body.w.length)return false;
       const members=ids.map(serverId);if(members.some(id=>!id) || new Set(members).size!==members.length || (room.kind!=='MemoChat' && !members.some(id=>id!==ownUserId)))return false;
@@ -218,10 +343,13 @@ export function createReaderStore(body, ownUserId, salt=randomBytes(32),settings
       room.members=memberSet;room.watermarks=marks;room.expectedMembers=memberSet.size;room.membershipDirty=false;room.receiptReady=true;
       return true;
     },
-    invalidateReceipts(body){
+    invalidateReceipts(body,{left=false}={}){
       const key=byServerId.get(serverId(body?.chatId ?? body?.c ?? body?.chatLog?.chatId)),room=rooms.get(key);
-      if(!room)return null;room.receiptReady=false;room.membershipDirty=true;room.receiptVersion++;
-      return {key,...view(key),receiptInvalidated:true};
+      if(!room)return null;invalidate(room);
+      const suppliedLink=fieldsOf(body,['li','linkId']);
+      if(suppliedLink.some(value=>serverId(value)!==room.linkId)){room.link=null;room.linkId=null;}
+      if(body?.left===true || left && serverId(body?.userId)===ownUserId && body?.left!==false){room.left=true;room.link=null;}
+      return {key,...view(key),receiptInvalidated:true,entryInvalidated:true};
     },
     readUpdate(body){
       const key=byServerId.get(serverId(body?.chatId ?? body?.c)),room=rooms.get(key);
@@ -236,8 +364,13 @@ export function createReaderStore(body, ownUserId, salt=randomBytes(32),settings
       const original=body?.chatLog ?? body?.log;
       const id=serverId(original?.logId ?? body?.logId);
       if(!id)return null;
-      const attached=[original?.chatId,original?.roomId,original?.c,body?.chatId,body?.roomId,body?.c].filter(value=>value!==undefined);
-      if(attached.some(value=>serverId(value)!==room.serverRoomId))return null;
+      const sources=[body,body?.chatLog,body?.log];
+      const attached=sources.flatMap(row=>fieldsOf(row,['chatId','roomId','chatRoomId','c']));
+      if(type===2 && !attached.length || attached.some(value=>serverId(value)!==room.serverRoomId))return null;
+      const authors=sources.flatMap(row=>[...fieldsOf(row,['authorId','senderId','userId','writerId']),...fieldsOf(row?.sender,['userId'])]);
+      const types=sources.flatMap(row=>fieldsOf(row,['type','msgType','t']));
+      const logs=sources.flatMap(row=>fieldsOf(row,['logId']));
+      if(logs.some(value=>serverId(value)!==id) || authors.some(value=>serverId(value)!==ownUserId) || types.some(value=>!Number.isInteger(value) || value!==type))return null;
       const update=this.push({chatId:room.serverRoomId,chatLog:{...original,chatId:room.serverRoomId,logId:id,authorId:ownUserId,type,msg:message,attachment:original?.attachment ?? attachment,sendAt:original?.sendAt ?? body?.sendAt}})[0];
       return update?{...update,messageKey:opaque('m_',room.serverRoomId+':'+id)}:null;
     },

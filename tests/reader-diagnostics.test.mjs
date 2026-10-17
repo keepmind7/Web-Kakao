@@ -23,6 +23,7 @@ test('read acknowledgement counts survive the rolling log without retaining mess
     diagnostic.packet('response',{method:'NOTIREAD',status:0,body:{...body,chatId:'9007199254740993',msg:'FAKE_PRIVATE_TEXT'}});
   }
   for(let i=0;i<45;i++)diagnostic.note('request',{method:'PING'});
+  diagnostic.flush();
   assert.equal(snapshot.events.length,40);
   assert.deepEqual(snapshot.readSync,{requests:3,responses:3,accepted:1,rejected:1,unknown:1});
   for(const value of ['9007199254740993','FAKE_PRIVATE_TEXT'])assert.equal(JSON.stringify(snapshot).includes(value),false);
@@ -61,4 +62,15 @@ test('method fallback still resolves the correct response and write operations r
   client.finishPacket({packetId:99,method:'SYNCMSG',status:0,body:{}});assert.equal(resolved.packetId,99);
   await assert.rejects(client.request('WRITE',{}));await assert.rejects(client.request('NOTIREAD',{}));
   assert.equal((await client.request('SYNCMSG',{})).status,0);
+});
+
+test('link-bootstrap response diagnostics retain allowlisted shapes without metadata values',()=>{
+  let snapshot;
+  const diagnostic=createReaderDiagnostic({writeSnapshot:value=>{snapshot=JSON.parse(value);}});
+  for(const method of ['SYNCLINK','INFOLINK']){
+    diagnostic.note('request',{method});diagnostic.packet('response',{method,status:0,body:{ltk:0,ols:[{li:'9007199254740993',ln:'FAKE_PRIVATE_LINK_NAME',ac:true,olu:{userId:'999',lmt:2,opt:3,pv:'0'}}],dlis:['9007199254740995']}});
+    diagnostic.flush();
+    const event=snapshot.events.at(-1);assert.equal(event.method,method);assert.equal(event.schema.fields.ols.type,'array');assert.equal(event.schema.fields.ols.sample[0].fields.li.type,'string');
+  }
+  for(const value of ['FAKE_PRIVATE_LINK_NAME','9007199254740993','9007199254740995','\"999\"'])assert.equal(JSON.stringify(snapshot).includes(value),false);
 });

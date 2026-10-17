@@ -10,6 +10,17 @@ import { guardReaderClient } from '../experiments/local-web/reader-protocol.mjs'
 import { uploadPhoto,MAX_UPLOAD_CHUNK_BYTES } from '../experiments/local-web/media-upload.mjs';
 import { createLocalServer } from '../experiments/local-web/server.mjs';
 
+// Browser control is granted only by the local launcher capability exchange.
+async function browserSession(app,url){
+  const issue=await fetch(url+'/api/local/launch',{method:'POST',headers:{Origin:url,'Content-Type':'application/json','X-Local-Control':app.controlToken},body:'{}'});
+  assert.equal(issue.status,200);assert.equal(issue.headers.get('set-cookie'),null);
+  const {ticket}=await issue.json();assert.match(ticket,/^[a-f0-9]{64}$/);
+  const session=await fetch(url+'/api/local/session',{method:'POST',headers:{Origin:url,'Content-Type':'application/json'},body:JSON.stringify({ticket})});
+  assert.equal(session.status,200);
+  const cookie=session.headers.get('set-cookie');assert.match(cookie,/HttpOnly; SameSite=Strict/);
+  return {cookie:cookie.split(';')[0],response:session};
+}
+
 const png=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=','base64');
 const room='r_'+'a'.repeat(24),message='m_'+'b'.repeat(24),uuid='12345678-1234-4123-8123-123456789abc';
 const credential={userId:'999',deviceUUID:'SYNTHETIC',accessToken:'FAKE_TOKEN'};
@@ -38,10 +49,10 @@ test('photo admission checks bytes, dimensions, size and canonical base64 instea
   assert.equal(decodeImage(png.toString('base64')+'\n'),null);assert.equal(decodeImage(Buffer.from('<svg/>').toString('base64')),null);
   const large=Buffer.from(png);large.writeUInt32BE(4097,16);assert.equal(inspectImage(large),null);assert.equal(inspectImage(Buffer.alloc(IMAGE_LIMIT+1)),null);
 });
-function uploadFixture({offset=0,denial=null,disconnect=false,routeError=false}={}){
+function uploadFixture({offset=0,denial=null,disconnect=false,routeError=false,completeBody}={}){
   const calls=[],bytes=[];let media,expected=png.length-offset;
   return {calls,bytes,options:{carriage:{async request(method,body){calls.push({method,body});return {status:denial==='ship'?-203:0,body:{k:'FAKE_UPLOAD_KEY',vh:'upload.kakao.com',p:443}};}},
-    createClient(){media=Object.assign(new EventEmitter(),{async connect(host,port){calls.push({method:'connect',host,port});},async request(method,body){calls.push({method,body});expected=body.s-offset;if(disconnect)throw new Error('PRIVATE');if(expected===0)queueMicrotask(()=>media.emit('push',{method:'COMPLETE',status:0,body:{status:0,chatLog:{logId:'20',chatId:'123'}}}));return {status:denial==='post'?-203:0,body:{o:offset}};},async writeEncrypted(data){bytes.push(Buffer.from(data));if(bytes.reduce((sum,b)=>sum+b.length,0)===expected)media.emit('push',{method:'COMPLETE',status:0,body:{status:0,chatLog:{logId:'20',chatId:'123'}}});},disconnect(){}});return media;},
+    createClient(){media=Object.assign(new EventEmitter(),{async connect(host,port){calls.push({method:'connect',host,port});},async request(method,body){calls.push({method,body});expected=body.s-offset;if(disconnect)throw new Error('PRIVATE');if(expected===0)queueMicrotask(()=>media.emit('push',{method:'COMPLETE',status:0,body:completeBody ?? {status:0,chatLog:{logId:'20',chatId:'123'}}}));return {status:denial==='post'?-203:0,body:{o:offset}};},async writeEncrypted(data){bytes.push(Buffer.from(data));if(bytes.reduce((sum,b)=>sum+b.length,0)===expected)media.emit('push',{method:'COMPLETE',status:0,body:completeBody ?? {status:0,chatLog:{logId:'20',chatId:'123'}}});},disconnect(){}});return media;},
     toLong:String,chatId:'123',userId:'999',messageId:'345',data:png,profile:{os:'android',appVersion:'26.1.2'},resolve:async(host,port)=>{if(routeError)throw new Error('private route');return '1.2.3.4';}}};
 }
 test('photo uses SHIP and dedicated POST/COMPLETE once, streams remaining bytes and never WRITE',async()=>{
@@ -49,8 +60,9 @@ test('photo uses SHIP and dedicated POST/COMPLETE once, streams remaining bytes 
   assert.equal(outcome.phase,'accepted');assert.equal(outcome.chatLog.logId,'20');assert.deepEqual(Buffer.concat(f.bytes),png.subarray(10));
   assert.deepEqual(f.calls.map(c=>c.method),['SHIP','connect','POST']);assert.equal(f.calls[1].host,'1.2.3.4');
   assert.equal(f.calls[2].body.f,'photo.png');assert.equal(f.calls[2].body.mm,'45005');assert.equal(f.calls[2].body.w,1);
-  // node-kakao MediaUploadForm.size is a numeric size, independently of Long IDs.
-  assert.equal(f.calls[0].body.s,png.length);assert.equal(f.calls[2].body.s,png.length);
+  // APK25.11.2 and the pinned modern uploader serialize byte counts as int64.
+  assert.equal(f.calls[0].body.s,String(png.length));assert.equal(f.calls[2].body.s,String(png.length));
+  assert.equal(f.calls[2].body.ex,'{}');
   assert.equal(f.calls[0].body.cs,createHash('sha1').update(png).digest('hex').toUpperCase());
   assert.equal(f.calls[2].body.mid,'345');
 });
@@ -60,6 +72,16 @@ test('photo failure distinguishes pre-POST, denied and uncertain delivery, with 
     assert.ok(f.calls.filter(c=>c.method==='SHIP').length<=1);assert.ok(f.calls.filter(c=>c.method==='POST').length<=1);
   }
   const f=uploadFixture(),controller=new AbortController();controller.abort();assert.equal((await uploadPhoto({...f.options,signal:controller.signal})).phase,'failed');assert.equal(f.calls.length,0);
+});
+test('plain-photo POST expresses scope, null supplement and the declared companion mode without changing read consent',async()=>{
+  for(const subDeviceMode of [true,false,undefined]){
+    const f=uploadFixture(),profile={...f.options.profile,...(subDeviceMode===undefined?{}:{subDeviceMode})};
+    assert.equal((await uploadPhoto({...f.options,profile})).phase,'accepted');
+    const body=f.calls.find(call=>call.method==='POST').body;
+    assert.equal(body.ex,'{}');assert.equal(body.sp,null);assert.equal(body.scp,1);assert.equal(body.silence,false);assert.equal(body.ns,true);
+    if(subDeviceMode===undefined)assert.equal(Object.hasOwn(body,'dt'),false);
+    else assert.equal(body.dt,subDeviceMode?4:1);
+  }
 });
 test('a COMPLETE already received with a full resume offset is not missed',async()=>{
   const f=uploadFixture({offset:png.length});assert.equal((await uploadPhoto(f.options)).phase,'accepted');assert.equal(f.bytes.length,0);
@@ -104,12 +126,12 @@ test('manager idempotency includes reply and photo content, and never resends un
 test('an evicted or foreign reply target is rejected before dispatch without disconnecting',()=>{
   const child=childFixture(),reader=createReadOnlyReader({messaging:true,spawn:()=>child});try{
     reader.connect(credential);ready(child);assert.equal(reader.sendText(room,'답장',uuid,'m_'+'c'.repeat(24)),false);
-    assert.equal(reader.sendText(room,'답장',uuid,message),true);const action=child.sent.at(-1);child.emit('message',{type:'reader-request-rejected',requestId:action.requestId});
+    assert.equal(reader.sendText(room,'답장',uuid,message),true);const action=child.sent.at(-1);child.emit('message',{type:'reader-request-rejected',key:room,requestId:action.requestId});
     assert.equal(reader.messages(room).outbox[0].phase,'failed');assert.equal(reader.snapshot().phase,'connected');
   }finally{reader.close();}
 });
-function sessionFixture(){
-  const f=uploadFixture(),events=[];
+function sessionFixture(uploadOptions){
+  const f=uploadFixture(uploadOptions),events=[];
   const carriage=Object.assign(new EventEmitter(),{connect:async()=>{},stopPing(){},disconnect(){},loginList:async()=>({status:0,body:{chatDatas:[{c:'123',t:'DirectChat',ll:'10'}]}}),request:async(method,body)=>{if(method==='SHIP')return f.options.carriage.request(method,body);f.calls.push({method,body});return {status:0,body:{logId:'20',msgId:body.msgId}};}});
   const client=()=>Object.assign(new EventEmitter(),{connect:async()=>{},disconnect(){},request:async()=>({status:0,body:{ticket:{lsl:['ticket.kakao.com']},wifi:{ports:[443]}}}),checkin:async()=>({status:0,host:'carriage.kakao.com',port:443})});
   const factory={messaging:true,booking:client,ticket:client,carriage:()=>carriage,media:f.options.createClient,resolveUpload:f.options.resolve,toLong:String,resolve:async h=>h,every:()=>0};
@@ -126,11 +148,83 @@ test('session constructs type26 from a real cached target and photo COMPLETE wit
     assert.equal(events.filter(e=>e.type==='reader-action').at(-1).phase,'accepted');
   }finally{session.close();}
 });
+test('photo completion keeps verified outer room identity through session and store without fabricating a chatLog room',async()=>{
+  const completeBody={status:0,c:'123',chatLog:{logId:'20',authorId:'999',type:2}},f=sessionFixture({completeBody});
+  try{
+    await f.session.start();const key=f.events[0].rooms[0].key;
+    await f.session.action(key,1,'photo',{image:png.toString('base64')});
+    assert.equal(f.events.findLast(event=>event.type==='reader-action').phase,'accepted');
+    assert.equal(f.events.findLast(event=>event.source==='sent').messages.at(-1).mine,true);
+    assert.equal(Object.hasOwn(completeBody.chatLog,'chatId'),false);
+    assert.equal(f.f.calls.filter(call=>call.method==='WRITE').length,0);
+  }finally{f.session.close();}
+});
+
+const deferredUpload=()=>{let resolve;return {promise:new Promise(done=>{resolve=done;}),resolve:value=>resolve(value)};};
+function heldUpload(stage){
+  const f=uploadFixture(),begun=deferredUpload(),release=deferredUpload();
+  const hold=async result=>{begun.resolve();await release.promise;return result;};
+  if(stage==='ship'){
+    const request=f.options.carriage.request;f.options.carriage.request=async(...args)=>hold(await request(...args));
+  }else if(stage==='route'){
+    const resolve=f.options.resolve;f.options.resolve=async(...args)=>hold(await resolve(...args));
+  }
+  const createClient=f.options.createClient;
+  f.options.createClient=()=>{
+    const media=createClient();
+    if(stage==='connect'){const connect=media.connect;media.connect=async(...args)=>hold(await connect(...args));}
+    if(stage==='post'){const request=media.request;media.request=async(...args)=>hold(await request(...args));}
+    return media;
+  };
+  return {...f,begun,release};
+}
+
+for(const stage of ['ship','route','connect','post'])test('review: media current-context predicate cancels at '+stage+' with no retry',async()=>{
+  const f=heldUpload(stage);let current=true;
+  const pending=uploadPhoto({...f.options,isCurrent:()=>current});
+  await f.begun.promise;current=false;f.release.resolve();
+  const result=await pending;
+  assert.equal(result.phase,stage==='post'?'unknown':'failed');
+  assert.equal(f.calls.filter(call=>call.method==='POST').length,stage==='post'?1:0);
+  assert.equal(f.bytes.length,0);assert.equal(f.calls.filter(call=>call.method==='SHIP').length,1);assert.equal(f.calls.some(call=>call.method==='WRITE'),false);
+});
+
+for(const stage of ['ship','route','connect','post'])for(const method of ['SYNCLINKDL','LEFT','SYNCMEMT'])test('review: open photo '+stage+' invalidation '+method+' revokes the captured authorization',async()=>{
+  const f=heldUpload(stage),events=[];
+  const carriage=Object.assign(new EventEmitter(),{async connect(){},stopPing(){},disconnect(){},async loginList(){return {status:0,body:{chatDatas:[{c:'123',t:'OM',li:'700',title:'Synthetic open',ll:'10'}]}};},async request(method,body){
+    if(method==='SHIP')return f.options.carriage.request(method,body);
+    f.calls.push({method,body});
+    if(method==='SYNCLINK')return {status:0,body:{ltk:0,ols:[{li:'700',ac:true}],dlis:[]}};
+    if(method==='CHATONROOM')return {status:0,body:{c:'123',li:'700',olu:{userId:'999',lmt:2,opt:0},mt:0}};
+    throw new Error('unexpected synthetic request');
+  }});
+  const bootstrap=()=>Object.assign(new EventEmitter(),{async connect(){},disconnect(){},async request(){return {status:0,body:{ticket:{lsl:['ticket.kakao.com']},wifi:{ports:[443]}}};},async checkin(){return {status:0,host:'carriage.kakao.com',port:443};}});
+  const session=createReaderSession(credential,{messaging:true,booking:bootstrap,ticket:bootstrap,carriage:()=>carriage,media:f.options.createClient,resolveUpload:f.options.resolve,toLong:String,resolve:async h=>h,every:()=>0},event=>events.push(event));
+  try{
+    await session.start();const key=events.find(event=>event.source==='loginlist').rooms[0].key;
+    await session.action(key,1,'context');const pending=session.action(key,2,'photo',{image:png.toString('base64')});await f.begun.promise;
+    carriage.emit('push',{method,status:0,body:method==='SYNCLINKDL'?{li:'700'}:method==='LEFT'?{c:'123',userId:'999'}:{c:'123',li:'700',mids:['999'],mts:[8]}});
+    f.release.resolve();await pending;
+    assert.equal(events.findLast(event=>event.type==='reader-action').phase,stage==='post'?'unknown':'failed');
+    assert.equal(f.calls.filter(call=>call.method==='POST').length,stage==='post'?1:0);
+    assert.equal(f.bytes.length,0);assert.equal(f.calls.filter(call=>call.method==='SHIP').length,1);assert.equal(f.calls.some(call=>call.method==='WRITE'),false);
+  }finally{f.release.resolve();session.close();}
+});
+
+for(const stage of ['ship','route','connect','post'])test('review: abort releases a stalled '+stage+' wait before its transport result returns',async()=>{
+  const f=heldUpload(stage),controller=new AbortController();let timer;
+  try{
+    const pending=uploadPhoto({...f.options,signal:controller.signal});await f.begun.promise;controller.abort();
+    const result=await Promise.race([pending,new Promise((_resolve,reject)=>{timer=setTimeout(()=>reject(new Error('abort did not release pending synthetic operation')),500);})]);
+    assert.equal(result.phase,stage==='post'?'unknown':'failed');
+    assert.equal(f.calls.filter(call=>call.method==='POST').length,stage==='post'?1:0);assert.equal(f.bytes.length,0);
+  }finally{clearTimeout(timer);f.release.resolve();}
+});
 test('image and reply HTTP routes require auth/CSRF, exact fields and valid actual image bytes',async()=>{
   let sent=0,quoted;
   const app=createLocalServer({mode:'live',messaging:true,encode:()=>[[true]],transport:async op=>op==='allowlist'?{httpStatus:200,body:{allowlisted:true}}:op==='generate'?{httpStatus:200,body:{status:0,url:'OFFLINE',remainingSeconds:60}}:{httpStatus:200,body:{status:0,user:{userId:'999'},accessToken:'FAKE'}},readerFactory:()=>({snapshot:()=>({phase:'connected'}),close(){},sendPhoto(){sent++;return true;},sendText(_room,_text,_uuid,replyTo){quoted=replyTo;return true;}})});
   const url=await app.listen(0);try{
-    const home=await fetch(url),cookie=home.headers.get('set-cookie').split(';')[0],status=await(await fetch(url+'/api/status',{headers:{cookie}})).json();
+    const {cookie}=await browserSession(app,url),status=await(await fetch(url+'/api/status',{headers:{cookie}})).json();
     const post=(path,body,origin=url)=>fetch(url+path,{method:'POST',headers:{cookie,origin,'Content-Type':'application/json','X-CSRF-Token':status.csrf},body:JSON.stringify(body)}),image={room,clientId:uuid,image:png.toString('base64')};
     assert.equal((await post('/api/reader/photo',image)).status,409);await app.lab.start();for(let i=0;i<300 && !app.lab.snapshot().credentialInMemory;i++)await new Promise(r=>setTimeout(r,10));
     assert.equal((await post('/api/reader/photo',image,'https://evil.test')).status,403);

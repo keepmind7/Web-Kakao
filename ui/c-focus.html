@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>시안 C · 미니멀 집중형</title>
+<style>
+:root{--bg:#f7f7f8;--panel:#fff;--line:#ececef;--text:#16181d;--muted:#8b8f98;--accent:#3d6bff;--mine:#3d6bff;--theirs:#f0f1f4;font-family:"Pretendard","Apple SD Gothic Neo","Malgun Gothic",system-ui,sans-serif;color:var(--text)}
+*{box-sizing:border-box}[hidden]{display:none!important}body{margin:0;background:var(--bg)}button,input,textarea{font:inherit;color:inherit}button{cursor:pointer;border:0;background:none}
+button:focus-visible,input:focus-visible,textarea:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.app{display:grid;grid-template-columns:320px 1fr;height:100dvh;padding:12px;gap:12px}
+.side,.chat{background:var(--panel);border-radius:22px;box-shadow:0 1px 3px #0000000a,0 8px 30px #0000000a;min-height:0;overflow:hidden}
+/* 목록 */
+.side{display:flex;flex-direction:column}
+.top{display:flex;align-items:center;justify-content:space-between;padding:20px 20px 10px}
+.top h1{margin:0;font-size:24px;letter-spacing:-.8px}
+.pill{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:#1f7a4d;background:#e7f7ee;border-radius:999px;padding:5px 10px}
+.pill::before{content:"";width:7px;height:7px;border-radius:50%;background:#22b06b}
+.search{margin:4px 16px 8px;display:flex;align-items:center;gap:8px;background:var(--bg);border-radius:14px;padding:0 14px;color:var(--muted)}
+.search input{flex:1;border:0;background:none;outline:none;padding:11px 0;font-size:14px}
+.chips{display:flex;gap:6px;padding:4px 16px 10px}
+.chips button{font-size:13px;padding:6px 12px;border-radius:999px;background:var(--bg);color:#5b606a}
+.chips button[aria-pressed=true]{background:var(--accent);color:#fff}
+.rooms{flex:1;overflow-y:auto;padding:0 10px 10px}
+.room{display:flex;gap:12px;align-items:center;width:100%;text-align:left;padding:10px;border-radius:16px}
+.room:hover{background:var(--bg)}.room.on{background:#edf1ff}
+.av{flex:none;width:48px;height:48px;border-radius:50%;display:grid;place-items:center;color:#fff;font-weight:700;font-size:18px;position:relative}
+.av .pin{position:absolute;right:-2px;bottom:-2px;width:18px;height:18px;border-radius:50%;background:#fff;color:var(--accent);font-size:10px;display:grid;place-items:center;box-shadow:0 1px 3px #0002}
+.rc{flex:1;min-width:0}.rc .l1{display:flex;justify-content:space-between;gap:8px}
+.rc b{font-size:15px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.rc time{flex:none;font-size:12px;color:var(--muted)}
+.rc .l2{display:flex;justify-content:space-between;gap:8px;margin-top:4px;align-items:center}
+.rc small{font-size:13px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.room.unread small{color:#3b3f47}
+.badge{flex:none;min-width:20px;height:20px;padding:0 6px;border-radius:999px;background:var(--accent);color:#fff;font-size:11px;font-weight:700;display:grid;place-items:center}
+.me{display:flex;align-items:center;gap:10px;margin:0 10px 10px;padding:10px;border-radius:16px;background:var(--bg);font-size:13px;width:calc(100% - 20px);text-align:left}
+.me .av{width:34px;height:34px;font-size:13px;background:#16181d}.me span{flex:1}.me small{display:block;color:var(--muted);font-size:11px}
+/* 채팅 */
+.chat{display:flex;flex-direction:column;position:relative}
+.head{position:absolute;top:0;left:0;right:0;z-index:2;display:flex;align-items:center;justify-content:center;padding:14px 18px;background:#ffffffcc;backdrop-filter:saturate(1.6) blur(14px);border-bottom:1px solid #0000000a}
+.title{display:flex;flex-direction:column;align-items:center;gap:2px;padding:4px 14px;border-radius:12px}.title:hover{background:#0000000a}
+.title b{font-size:15px}.title small{font-size:11px;color:var(--muted)}
+.head .left,.head .right{position:absolute;display:flex;gap:4px}.head .left{left:14px}.head .right{right:14px}
+.ib{width:36px;height:36px;border-radius:50%;display:grid;place-items:center;color:#5b606a;font-size:17px}.ib:hover{background:#0000000a}
+.scroll{flex:1;overflow-y:auto;padding:84px clamp(16px,8vw,120px) 110px}
+.list{max-width:680px;margin:0 auto;display:flex;flex-direction:column}
+.more{align-self:center;font-size:12px;color:var(--accent);padding:6px 12px;border-radius:999px;margin-bottom:6px}.more:hover{background:#edf1ff}
+.day{align-self:center;font-size:11px;color:var(--muted);margin:14px 0 10px;font-weight:600}
+.who{font-size:11px;color:var(--muted);margin:10px 0 3px 12px}
+.b{max-width:72%;align-self:flex-start;background:var(--theirs);padding:9px 14px;border-radius:20px;font-size:15px;line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere;margin-top:2px}
+.b.mine{align-self:flex-end;background:var(--mine);color:#fff}
+.b.first{border-bottom-left-radius:6px}.b.mine.first{border-bottom-left-radius:20px;border-bottom-right-radius:6px}
+.stamp{font-size:10px;color:var(--muted);margin:3px 12px 4px;display:flex;gap:6px}
+.stamp.mine{align-self:flex-end}.stamp .r{color:var(--accent);font-weight:700}
+.q{font-size:12px;opacity:.75;border-left:2px solid currentColor;padding-left:8px;margin-bottom:5px}
+.photo{width:250px;height:180px;border-radius:20px;align-self:flex-end;margin-top:2px;background:linear-gradient(160deg,#c9d6ff,#e2e2ff 40%,#ffd9c7)}
+/* 입력 */
+.compose{position:absolute;left:0;right:0;bottom:0;padding:12px clamp(16px,8vw,120px) 18px;background:linear-gradient(#fff0,#fff 40%)}
+.wrap{max-width:680px;margin:0 auto}
+.reply{display:flex;align-items:center;gap:10px;font-size:12px;color:var(--muted);padding:0 8px 8px}
+.reply div{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.reply b{color:var(--accent)}
+.box{display:flex;align-items:flex-end;gap:6px;background:#fff;border:1px solid var(--line);border-radius:26px;padding:5px;box-shadow:0 6px 24px #0000000f}
+.box:focus-within{border-color:#c9d4ff}
+.box textarea{flex:1;border:0;outline:none;resize:none;padding:9px 4px;font-size:15px;line-height:1.45;max-height:140px;background:none}
+.send{width:38px;height:38px;border-radius:50%;background:var(--accent);color:#fff;font-size:17px;display:grid;place-items:center}.send:disabled{background:#e6e8ee;color:#a9adb6;cursor:default}
+.locked{text-align:center;font-size:13px;color:#6b6f78;background:var(--bg);border-radius:18px;padding:13px}
+/* 시트 */
+.sheet{position:fixed;inset:0;background:#16181d40;display:grid;place-items:center;z-index:5}
+.sheet section{width:min(400px,92vw);max-height:90vh;overflow:auto;background:#fff;border-radius:24px;padding:24px;box-shadow:0 20px 60px #0003}
+.sheet h3{margin:0 0 4px;font-size:18px;text-align:center}.sheet .sub{text-align:center;color:var(--muted);font-size:13px;margin:0 0 16px}
+.big{width:72px;height:72px;font-size:28px;margin:0 auto 12px}
+.acts{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:14px}
+.acts button{display:flex;flex-direction:column;align-items:center;gap:6px;padding:12px 4px;border-radius:16px;background:var(--bg);font-size:11px;color:#3b3f47}
+.acts button span{font-size:18px}.acts button[aria-pressed=true]{background:#edf1ff;color:var(--accent)}
+.opt{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:12px 2px;border-top:1px solid var(--line);font-size:14px}
+.opt small{display:block;color:var(--muted);font-size:12px;margin-top:2px}
+.sw{appearance:none;flex:none;width:44px;height:26px;border-radius:999px;background:#e1e3e8;position:relative;cursor:pointer;transition:.15s}
+.sw::after{content:"";position:absolute;top:3px;left:3px;width:20px;height:20px;border-radius:50%;background:#fff;box-shadow:0 1px 3px #0003;transition:.15s}
+.sw:checked{background:var(--accent)}.sw:checked::after{left:21px}
+.qr{width:180px;height:180px;margin:10px auto 14px;border-radius:18px;background:repeating-conic-gradient(#16181d 0 25%,#fff 0 50%) 0 0/24px 24px;border:12px solid #fff;box-shadow:0 0 0 1px var(--line)}
+.btn{width:100%;border-radius:14px;padding:12px;font-weight:700;background:var(--accent);color:#fff;margin-top:8px}.btn.ghost{background:var(--bg);color:#3b3f47}
+@media(max-width:760px){.app{grid-template-columns:1fr;padding:0;gap:0}.side,.chat{border-radius:0}.chat{display:none}.app.chatview .side{display:none}.app.chatview .chat{display:flex}.back{display:grid!important}}
+.back{display:none}
+</style></head>
+<body>
+<div class="app" id="app">
+  <aside class="side" aria-label="대화 목록">
+    <div class="top"><h1>대화</h1><span class="pill">실시간</span></div>
+    <label class="search"><span aria-hidden="true">⌕</span><input id="q" type="search" placeholder="검색" aria-label="대화방 검색"></label>
+    <div class="chips" role="group" aria-label="필터"><button data-f="all" aria-pressed="true">전체</button><button data-f="unread" aria-pressed="false">안 읽음</button><button data-f="pinned" aria-pressed="false">고정</button></div>
+    <nav class="rooms" id="rooms"></nav>
+    <button class="me" id="open-account"><div class="av">나</div><span>계정·연결 설정<small>연결됨 · 인증 42분 남음</small></span>›</button>
+  </aside>
+  <section class="chat" aria-label="선택한 대화방">
+    <header class="head">
+      <div class="left"><button class="ib back" id="back" aria-label="목록으로">‹</button></div>
+      <button class="title" id="open-room" aria-label="방 정보와 설정"><b id="h-title"></b><small id="h-sub"></small></button>
+      <div class="right"><button class="ib" aria-label="대화 검색">⌕</button></div>
+    </header>
+    <div class="scroll" id="scroll"><div class="list" id="list"></div></div>
+    <footer class="compose" id="compose"></footer>
+  </section>
+</div>
+<div class="sheet" id="room-sheet" hidden><section aria-label="방 정보" id="room-body"></section></div>
+<div class="sheet" id="account-sheet" hidden>
+  <section aria-label="계정 및 연결 설정">
+    <h3>카카오톡 연결</h3><p class="sub">휴대폰으로 QR을 스캔하고 확인 코드를 입력하세요</p>
+    <div class="qr" aria-label="QR 코드 예시"></div>
+    <div style="text-align:center;font-size:30px;font-weight:700;letter-spacing:10px">4821</div>
+    <p class="sub" style="margin-top:6px">남은 시간 4:32</p>
+    <label class="opt"><span>카카오톡에도 읽음 알리기<small>최신 메시지를 실제로 봤을 때만</small></span><input class="sw" type="checkbox"></label>
+    <label class="opt"><span>브라우저 알림<small>소리·본문 없이</small></span><input class="sw" type="checkbox" checked></label>
+    <label class="opt"><span>개인 설정 저장<small>이름·고정·알림을 이 노트북에</small></span><input class="sw" type="checkbox" checked></label>
+    <button class="btn">대화방 불러오기</button><button class="btn ghost">연결 끊기</button><button class="btn ghost" data-close>닫기</button>
+  </section>
+</div>
+<script src="mock-data.js"></script>
+<script>
+const $=id=>document.getElementById(id),{esc,initial}=MOCK;let sel='minji',filter='all';
+function renderRooms(){$('rooms').innerHTML=MOCK.filter(filter,$('q').value).map(r=>`<button class="room${r.id===sel?' on':''}${r.unread?' unread':''}" data-id="${r.id}"><div class="av" style="background:${r.color}">${esc(initial(r.name))}${r.pinned?'<i class="pin">★</i>':''}</div><div class="rc"><div class="l1"><b>${esc(r.name)}</b><time>${r.time}</time></div><div class="l2"><small>${r.kind==='open'?'읽기 전용 · ':''}${esc(r.preview)}</small>${r.unread?`<span class="badge">${r.unread}</span>`:''}</div></div></button>`).join('');}
+function renderChat(){const r=MOCK.rooms.find(x=>x.id===sel);$('h-title').textContent=r.name;$('h-sub').textContent=MOCK.subtitle(r)+' ›';
+  const h=MOCK.history(sel);let out='<button class="more">이전 메시지 불러오기</button>';
+  h.forEach((m,i)=>{if(m.day){out+=`<div class="day">${m.day}</div>`;return;}const who=m.mine?'@me':m.from,next=h[i+1],last=!next||next.day||(next.mine?'@me':next.from)!==who||next.time!==m.time,prevm=h[i-1],first=!prevm||prevm.day||(prevm.mine?'@me':prevm.from)!==who;
+    if(!m.mine&&first&&r.kind!=='direct')out+=`<div class="who">${esc(m.from)}</div>`;
+    out+=m.photo?'<div class="photo" role="img" aria-label="사진"></div>':`<div class="b${m.mine?' mine':''}${last?' first':''}">${m.quote?`<div class="q">${esc(m.quote.author)}: ${esc(m.quote.text)}</div>`:''}${esc(m.text)}</div>`;
+    if(last)out+=`<div class="stamp${m.mine?' mine':''}">${m.mine&&m.read?`<span class="r">안 읽음 ${m.read}</span>`:''}<span>${m.time}</span></div>`;});
+  $('list').innerHTML=out;
+  $('compose').innerHTML=`<div class="wrap">${r.kind==='open'?'<div class="locked">오픈채팅은 아직 읽기만 할 수 있어요</div>':`<div class="reply"><div><b>답장</b> · 사진 잘 받았어! 내일 봐</div><button class="ib" aria-label="답장 취소">×</button></div><div class="box"><button class="ib" aria-label="사진 첨부">＋</button><textarea rows="1" placeholder="메시지" aria-label="메시지 입력"></textarea><button class="send" disabled aria-label="전송">↑</button></div>`}</div>`;
+  const ta=$('compose').querySelector('textarea');if(ta)ta.oninput=()=>$('compose').querySelector('.send').disabled=!ta.value.trim();
+  $('room-body').innerHTML=`<div class="av big" style="background:${r.color}">${esc(initial(r.name))}</div><h3>${esc(r.name)}</h3><p class="sub">${MOCK.subtitle(r)}</p>
+   <div class="acts"><button aria-pressed="${!!r.pinned}"><span>★</span>고정</button><button><span>🔔</span>알림</button><button><span>✎</span>이름 변경</button><button><span>⌕</span>검색</button></div>
+   <label class="opt"><span>이 방 알림<small>새 메시지 숫자는 계속 표시</small></span><input class="sw" type="checkbox" checked></label>
+   <button class="btn ghost">이전 메시지 불러오기</button><button class="btn ghost" data-close>닫기</button>`;
+  $('scroll').scrollTop=1e9;}
+$('rooms').onclick=e=>{const b=e.target.closest('.room');if(!b)return;sel=b.dataset.id;$('app').classList.add('chatview');renderRooms();renderChat();};
+document.querySelector('.chips').onclick=e=>{const b=e.target.closest('button');if(!b)return;filter=b.dataset.f;document.querySelectorAll('.chips button').forEach(x=>x.setAttribute('aria-pressed',x===b));renderRooms();};
+$('q').oninput=renderRooms;$('back').onclick=()=>$('app').classList.remove('chatview');
+$('open-room').onclick=()=>$('room-sheet').hidden=false;$('open-account').onclick=()=>$('account-sheet').hidden=false;
+document.querySelectorAll('.sheet').forEach(s=>s.onclick=e=>{if(e.target===s||e.target.closest('[data-close]'))s.hidden=true;});
+renderRooms();renderChat();
+</script>
+</body></html>

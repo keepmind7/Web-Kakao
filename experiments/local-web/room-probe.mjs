@@ -16,7 +16,7 @@ export function safeDestination(host, port) {
       && !(a===192 && b===0 && [0,2].includes(c)) && !(a===192 && b===88 && c===99)
       && !(a===198 && [18,19].includes(b)) && !(a===198 && b===51 && c===100) && !(a===203 && b===0 && c===113);
   }
-  if (ip === 6) return /^[23][a-f0-9]{3}:/i.test(host) && !/^2001:0?db8:/i.test(host);
+  if (ip === 6) return /^[23][a-f0-9]{3}:/i.test(host) && !/^2001:0?db8:/i.test(host) && !/^2002:/i.test(host) && !/^2001:(?:0{1,4}:|:)/i.test(host);
   return /^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+kakao\.com$/i.test(host);
 }
 export async function resolvePublicDestination(host, port, resolve = lookup) {
@@ -69,13 +69,17 @@ export async function probeRoomCount(credential, factory, onConnected) {
     if (responseStatus(route) !== 0 || !safeDestination(route.host,route.port)) return {ok:false,stage,status:responseStatus(route)};
     const address = await resolveRoute(route.host,route.port);
     const carriage = track(factory.carriage()); await carriage.connect(address,route.port); stage = 'loginlist';
-    const login = await carriage.loginList(credential);
+    const earlyPush=[];let overflow=false;
+    const capture=packet=>{if(earlyPush.length<200)earlyPush.push(packet);else overflow=true;};
+    if(onConnected)carriage.on('push',capture);
+    let login;try{login=await carriage.loginList(credential);}finally{carriage.off('push',capture);}
+    if(overflow)return {ok:false,stage:'loginlist',status:null};
     if (responseStatus(login) !== 0) return {ok:false,stage,status:responseStatus(login)};
     const list = ['chatDatas','chatInfos','chats','chatRooms','chatList'].map(key => login.body?.[key]).find(Array.isArray);
     if (onConnected) {
       // Persistent read-only reader owns only the carriage after login.
       for (const client of clients.slice(0,-1)) client.disconnect();
-      await onConnected(carriage,login.body);
+      await onConnected(carriage,login.body,earlyPush);
     }
     // Count only. No room identifiers, names, last-message text or sender data
     // leave this worker. Missing list is distinct from a valid empty list.

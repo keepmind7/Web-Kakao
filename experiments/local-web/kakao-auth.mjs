@@ -3,7 +3,8 @@ import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
-export const PROFILE = Object.freeze({ os: 'android', model: 'SM-T733', osVersion: '14', appVersion: '26.1.2' });
+// This client logs in as a companion device, never as a replacement primary phone.
+export const PROFILE = Object.freeze({ os: 'android', model: 'SM-T733', osVersion: '14', appVersion: '26.1.2', subDeviceMode: true });
 const SOURCE = '../../local-only/sources/modern/8dbbd4f7ed6b42542982252250622fa351af00e9/';
 export function checkPinnedSource({ workingCopy = false } = {}) {
   for (const [name, hash] of Object.entries({
@@ -85,13 +86,13 @@ export function createAuthLab({ transport, encodeQr, mode = 'live', now = Date.n
     if (view.roomProbe?.phase === 'running') view.roomProbe = {phase:'failed',stage:'cancelled',connectionVerified:false}; };
   const stopTimer = () => { if (timer !== null) clear(timer); if (deadlineTimer !== null) clear(deadlineTimer); timer = null; deadlineTimer = null; };
   const terminal = (phase, message) => {
-    ++epoch;if (['blocked','error'].includes(phase)) locked = true;
+    ++epoch;if (phase==='blocked') locked = true;
     stopTimer();forget();view = { ...view, phase, message };
     // Abort listeners can synchronously inspect the lab; publish the terminal
     // state and remove credentials before allowing that reentrant observation.
     abort.abort();
   };
-  const canStart = () => !locked && attempts < 3 && ['idle','expired','cancelled'].includes(view.phase);
+  const canStart = () => !locked && attempts < 3 && ['idle','expired','cancelled','error'].includes(view.phase);
   const schedule = (callback, ms) => { timer = later(callback, ms); timer?.unref?.(); };
   function expireCredential(run=epoch) {
     if(run!==epoch || !credentials)return false;
@@ -113,7 +114,7 @@ export function createAuthLab({ transport, encodeQr, mode = 'live', now = Date.n
     view.httpStatus = Number.isInteger(result?.httpStatus) ? result.httpStatus : null;
     view.apiStatus = Number.isInteger(result?.body?.status) ? result.body.status : null;
     if (result?.httpStatus !== 200 || !object(result.body)) {
-      terminal('blocked', `카카오톡 서버 응답을 확인할 수 없어 중단했습니다. (${stage}, HTTP ${view.httpStatus ?? '없음'})`);
+      terminal(result?.httpStatus>=400 && result?.httpStatus<500?'blocked':'error', `카카오톡 서버 응답을 확인할 수 없어 중단했습니다. (${stage}, HTTP ${view.httpStatus ?? '없음'})`);
       return false;
     }
     return true;
@@ -149,6 +150,7 @@ export function createAuthLab({ transport, encodeQr, mode = 'live', now = Date.n
         if(!expireCredential(authenticatedRun))scheduleCredentialExpiry(authenticatedRun);
         return;
       }
+      if(body.status===0){terminal('error','인증 응답의 필수 항목을 확인할 수 없어 중단했습니다.');return;}
       // Do not interpret an arbitrary error plus retry interval as permission to retry.
       // Android upstream explicitly describes -100 as scanned/passcode pending:
       // play2fly/KakaoForge@4b774ea40b1347280fadb685415436584093118b src/auth/login.ts.
@@ -192,6 +194,9 @@ export function createAuthLab({ transport, encodeQr, mode = 'live', now = Date.n
         const allow = await call('allowlist');
         if (run !== epoch) return true;
         if (!responseOK(allow, 'allowlist')) return true;
+        if(typeof allow.body.allowlisted!=='boolean' || Object.hasOwn(allow.body,'status') && !Number.isInteger(allow.body.status)){
+          terminal('error','서버 허용 응답 형식을 확인할 수 없어 중단했습니다.');return true;
+        }
         if (allow.body.allowlisted !== true || (Object.hasOwn(allow.body, 'status') && allow.body.status !== 0)) {
           terminal('blocked', '서버에서 해당 등록 프로필의 허용을 확인하지 못해 중단했습니다.'); return true;
         }
@@ -202,7 +207,7 @@ export function createAuthLab({ transport, encodeQr, mode = 'live', now = Date.n
         if (!responseOK(generated, 'generate')) return true;
         const body = generated.body;
         if (body.status !== 0 || typeof body.url !== 'string' || !body.url.length || body.url.length > 2048 || !/^[\x20-\x7e]+$/.test(body.url) || !seconds(body.remainingSeconds)) {
-          terminal('blocked', '로그인 QR 응답을 확인할 수 없어 중단했습니다.'); return true;
+          terminal(Number.isInteger(body.status) && body.status!==0?'blocked':'error', '로그인 QR 응답을 확인할 수 없어 중단했습니다.'); return true;
         }
         // QR content is opaque, not a browser URL. Never navigate to it or place
         // it in HTML. Preserve exactly the server content, as upstream does.
@@ -228,11 +233,11 @@ export function createAuthLab({ transport, encodeQr, mode = 'live', now = Date.n
         const result = await probe(credentials, {signal:abort.signal});
         expireCredential(run);
         if (run === epoch) {
-          view.roomProbe = result;
-          if (result.connectionVerified) view.message = '대화 서버의 로그인 응답을 확인했습니다. 이번 검사 연결은 종료했으며 상시 수신은 아직 검증하지 않았습니다.';
-          if (result.phase !== 'completed') terminal('blocked','대화 서버 검사가 중단돼 이번 실행의 추가 연결을 막았습니다.');
+          view.roomProbe = object(result)?result:{phase:'failed',stage:'worker',connectionVerified:false};
+          if (result?.connectionVerified) view.message = '대화 서버의 로그인 응답을 확인했습니다. 이번 검사 연결은 종료했으며 상시 수신은 아직 검증하지 않았습니다.';
+          if (['booking','getconf','checkin','loginlist'].includes(result?.stage) && Number.isInteger(result?.status) && result.status!==0) terminal('blocked','대화 서버가 연결을 거부해 이번 실행의 추가 연결을 막았습니다.');
         }
-      } catch { expireCredential(run);if (run === epoch) { view.roomProbe = {phase:'failed',stage:'worker',connectionVerified:false}; terminal('blocked','대화 서버 검사가 중단됐습니다.'); } }
+      } catch { expireCredential(run);if (run === epoch) { view.roomProbe = {phase:'failed',stage:'worker',connectionVerified:false}; } }
       return true;
     },
     withCredential(consumer) {

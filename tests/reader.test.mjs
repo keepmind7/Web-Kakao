@@ -5,6 +5,17 @@ import { createReaderStore,serverId } from '../experiments/local-web/reader-data
 import { createReaderSession,allowedReaderMethod } from '../experiments/local-web/reader-session.mjs';
 import { createReadOnlyReader } from '../experiments/local-web/reader-manager.mjs';
 import { createLocalServer } from '../experiments/local-web/server.mjs';
+
+// Browser control is granted only by the local launcher capability exchange.
+async function browserSession(app,url){
+  const issue=await fetch(url+'/api/local/launch',{method:'POST',headers:{Origin:url,'Content-Type':'application/json','X-Local-Control':app.controlToken},body:'{}'});
+  assert.equal(issue.status,200);assert.equal(issue.headers.get('set-cookie'),null);
+  const {ticket}=await issue.json();assert.match(ticket,/^[a-f0-9]{64}$/);
+  const session=await fetch(url+'/api/local/session',{method:'POST',headers:{Origin:url,'Content-Type':'application/json'},body:JSON.stringify({ticket})});
+  assert.equal(session.status,200);
+  const cookie=session.headers.get('set-cookie');assert.match(cookie,/HttpOnly; SameSite=Strict/);
+  return {cookie:cookie.split(';')[0],response:session};
+}
 import { createAuthLab } from '../experiments/local-web/kakao-auth.mjs';
 import { fork } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -102,14 +113,14 @@ test('PING and MSG denial statuses terminate instead of being treated as healthy
     assert.equal(await session.history(events[0].rooms[0].key,1),false);session.close();
   }
 });
-test('history rejection closes the session without inventing cached history success',async()=>{
+test('history rejection is handled without inventing cached success or closing a healthy session',async()=>{
   const f=factory({historyStatus:-997}),events=[],session=createReaderSession(credential,f.sdk,event=>events.push(event));
-  await session.start();assert.equal(await session.history(events[0].rooms[0].key,1),false);
-  assert.equal(events.at(-1).type,'reader-failed');assert.equal(events.at(-1).status,-997);session.close();
+  await session.start();assert.equal(await session.history(events[0].rooms[0].key,1),true);
+  assert.equal(events.at(-1).type,'reader-request-rejected');assert.equal(events.at(-1).key,events[0].rooms[0].key);assert.equal(events.at(-1).status,-997);assert.equal(events.some(event=>event.type==='reader-failed'),false);session.close();
 });
 test('a successful header with body -203 never produces a history success event',async()=>{
   const f=factory({bodyStatus:-203}),events=[],session=createReaderSession(credential,f.sdk,event=>events.push(event));
-  await session.start();assert.equal(await session.history(events[0].rooms[0].key,1),false);
+  await session.start();assert.equal(await session.history(events[0].rooms[0].key,1),true);
   assert.equal(events.at(-1).status,-203);assert.equal(events.some(event=>event.source==='history'),false);session.close();
 });
 test('a room without a server history bound does not send a guessed SYNCMSG request',async()=>{
@@ -165,7 +176,7 @@ test('a gap probe body denial stops immediately and never retries another method
   const f=factory(),events=[],calls=[];f.sdk.gapProbe=true;
   f.carriage.request=async(method)=>{calls.push(method);return method==='MCHATLOGS'?{status:0,body:{status:-203}}:{status:0,body:{isOK:true}};};
   const session=createReaderSession(credential,f.sdk,event=>events.push(event));await session.start();
-  assert.equal(await session.history(events[0].rooms[0].key,1),false);
+  assert.equal(await session.history(events[0].rooms[0].key,1),true);
   assert.deepEqual(calls,['SYNCMSG','MCHATLOGS']);assert.equal(events.at(-1).status,-203);session.close();
 });
 test('multi-room history requires an explicit matching room ID for both display and cursor',()=>{
@@ -228,7 +239,7 @@ test('server denies reader requests before authentication and protects history a
   const url=await app.listen(0);
   try{
     assert.equal((await fetch(url+'/api/reader/rooms')).status,403);
-    const page=await fetch(url),cookie=page.headers.get('set-cookie').split(';')[0];
+    const {cookie}=await browserSession(app,url);
     let state=await(await fetch(url+'/api/status',{headers:{cookie}})).json();
     const headers={cookie,origin:url,'content-type':'application/json','x-csrf-token':state.csrf};
     const post=(path,body={},extra={})=>fetch(url+path,{method:'POST',headers:{...headers,...extra},body:JSON.stringify(body)});

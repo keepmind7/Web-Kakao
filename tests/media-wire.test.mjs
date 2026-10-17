@@ -13,7 +13,7 @@ import { guardReaderClient } from '../experiments/local-web/reader-protocol.mjs'
 process.env.KAKAO_DEBUG_LOCO='0';
 await import('../local-only/spikes/modern/node_modules/tsx/dist/loader.mjs');
 const {CarriageClient,toLong}=await import('../local-only/spikes/modern/src/kakao/forge-protocol.ts');
-const {BSON}=createRequire(new URL('../local-only/spikes/modern/package.json',import.meta.url))('bson');
+const {BSON,Long,Int32}=createRequire(new URL('../local-only/spikes/modern/package.json',import.meta.url))('bson');
 const MAX_FRAME_BODY=131068;
 function png(width,height){
   const chunk=(type,body)=>{
@@ -35,7 +35,7 @@ function encrypt(key,plain){
 function decrypt(key,frame){
   const cipher=createDecipheriv('aes-128-gcm',key,frame.subarray(0,12));cipher.setAuthTag(frame.subarray(-16));return Buffer.concat([cipher.update(frame.subarray(12,-16)),cipher.final()]);
 }
-async function exercise(data,{offset=0,frameLimit=MAX_FRAME_BODY,abort=false}={}){
+async function exercise(data,{offset=0,frameLimit=MAX_FRAME_BODY,abort=false,readOnSend}={}){
   const Media=guardReaderClient(CarriageClient,null,{messaging:true,media:true}),client=new Media();
   // The sole key inspected belongs to this new synthetic client. It is shared
   // with this test peer only in memory; neither key nor wire bytes are logged.
@@ -67,7 +67,8 @@ async function exercise(data,{offset=0,frameLimit=MAX_FRAME_BODY,abort=false}={}
           const plain=decrypt(key,buffer.subarray(4,4+length));buffer=buffer.subarray(4+length);
           if(!posted){
             const method=plain.subarray(6,17).toString('ascii').replace(/\0.*$/,'');assert.equal(method,'POST');
-            const body=BSON.deserialize(plain.subarray(22));assert.equal(body.s,data.length);assert.equal(String(body.c),'123');assert.equal(String(body.mid),'345');
+            const body=BSON.deserialize(plain.subarray(22),{promoteValues:false});assert.ok(Long.isLong(body.s),'POST size must be BSON int64');assert.equal(String(body.s),String(data.length));assert.equal(body.ex,'{}');assert.equal(body.sp,null);assert.ok(body.scp instanceof Int32);assert.equal(body.scp.valueOf(),1);assert.ok(body.dt instanceof Int32);assert.equal(body.dt.valueOf(),4);assert.equal(body.silence,false);if(readOnSend!==true)assert.equal(body.ns,true);assert.equal(String(body.c),'123');assert.equal(String(body.mid),'345');
+            observed.noSeen=body.ns;
             observed.posts++;posted=true;socket.write(encrypt(key,packet(plain.readInt32LE(0),'POST',{status:0,o:offset})));
             if(abort){controller.abort();return;}
             if(offset===data.length)complete();
@@ -81,17 +82,17 @@ async function exercise(data,{offset=0,frameLimit=MAX_FRAME_BODY,abort=false}={}
   });
   server.listen(0,'127.0.0.1');await once(server,'listening');
   try{
-    const result=await uploadPhoto({carriage:{async request(method){assert.equal(method,'SHIP');return {status:0,body:{k:'SYNTHETIC',vh:'unused.invalid',p:server.address().port}};}},
-      createClient:()=>client,toLong,chatId:'123',userId:'999',messageId:'345',data,signal:controller.signal,
-      resolve:async()=> '127.0.0.1',profile:{os:'android',appVersion:'26.1.2'},timeout:1000,observe:e=>steps.push(e)});
+    const result=await uploadPhoto({carriage:{async request(method,body){assert.equal(method,'SHIP');observed.shipSizeIsLong=Long.isLong(body.s);return {status:0,body:{k:'SYNTHETIC',vh:'unused.invalid',p:server.address().port}};}},
+      createClient:()=>client,toLong,chatId:'123',userId:'999',messageId:'345',data,signal:controller.signal,...(readOnSend===undefined?{}:{readOnSend}),
+      resolve:async()=> '127.0.0.1',profile:{os:'android',appVersion:'26.1.2',subDeviceMode:true},timeout:1000,observe:e=>steps.push(e)});
     await disconnected;assert.deepEqual(observed.errors,[]);
     return {result,observed,steps};
-  }finally{client.disconnect();for(const socket of sockets)socket.destroy();await new Promise(resolve=>server.close(resolve));}
+  }finally{client.disconnect();for(const socket of sockets)socket.destroy();await new Promise(resolve=>server.close(resolve));console.log(JSON.stringify({syntheticMediaPeerCleanup:{serverListening:server.listening,remainingSockets:sockets.size,pending:client.pending?.size??0,handshakes:observed.handshakes,posts:observed.posts}}));}
 }
 
 test('real media transport preserves a small PNG and reassembles fragmented COMPLETE',async()=>{
   const data=png(1,1),{result,observed,steps}=await exercise(data);
-  assert.equal(result.phase,'accepted');assert.equal(observed.handshakes,1);assert.equal(observed.posts,1);assert.equal(observed.oversized,false);
+  assert.equal(result.phase,'accepted');assert.equal(observed.handshakes,1);assert.equal(observed.posts,1);assert.equal(observed.oversized,false);assert.equal(observed.shipSizeIsLong,true);
   assert.deepEqual(Buffer.concat(observed.received),data);assert.equal(steps.at(-1).stage,'received_complete');
 });
 test('a large PNG fits bounded GCM frames and preserves every file byte',async()=>{
@@ -106,4 +107,10 @@ test('resumed media starts at a non-frame-aligned offset without gaps or duplica
 test('transport cancellation after POST ends without a second connection or request',async()=>{
   const {result,observed}=await exercise(png(1,1),{abort:true});
   assert.equal(result.phase,'unknown');assert.equal(observed.posts,1);assert.equal(observed.handshakes,1);assert.equal(observed.received.length,0);
+});
+
+test('real encrypted media POST serializes ns false only for explicit readOnSend true',async()=>{
+  const data=png(1,1),{result,observed}=await exercise(data,{readOnSend:true});
+  assert.equal(result.phase,'accepted');assert.equal(observed.handshakes,1);assert.equal(observed.posts,1);assert.deepEqual(Buffer.concat(observed.received),data);
+  assert.equal(observed.noSeen,false,'actual pinned SDK BSON POST must carry ns:false for the explicit send policy');
 });

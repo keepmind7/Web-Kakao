@@ -5,14 +5,19 @@ import { existsSync,mkdirSync,readFileSync,writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { createLocalServer } from '../experiments/local-web/server.mjs';
 import assert from 'node:assert/strict';
+import { randomBytes } from 'node:crypto';
 
 const chrome=['C:/Program Files/Google/Chrome/Application/chrome.exe','C:/Program Files (x86)/Google/Chrome/Application/chrome.exe'].find(existsSync);
 if(!chrome)throw new Error('Chrome unavailable; browser test not executed');
-const folder=resolve('local-only/phase2-browser',String(Date.now()));mkdirSync(folder,{recursive:true});
+const folder=resolve(process.env.WEB_KAKAO_QA_OUTPUT_ROOT || 'local-only/phase2-browser',String(Date.now()));mkdirSync(folder,{recursive:true});
 const key='r_'+'a'.repeat(24),second='r_'+'b'.repeat(24),payload='<img src=x onerror="globalThis.injected=true">';
 let connected=false,attempts=0,revision=0,historyBusy=false,rejectNextQr=false,allowAuth=false,otherPreview='예시 미리보기 B',statusRequests=0;
 const historyRooms=[],historyPhases=new Map(),messagesByRoom=new Map(),qrGrid=[[true]];
 const localTitles=new Map(),unread=new Map(),contexts=new Map(),outcomes=new Map(),seenCalls=[],sendCalls=[];
+const roomCapabilities=new Map();
+const contextCalls=[],ackCalls=[],fixtureRequests=[];
+const receiptVersions=new Map([[key,1],[second,1]]),pageVersions=new Map([[key,1],[second,1]]);
+let adversarialFixture=false,roomsVersion=1,settingsVersion=1,outboxVersion=1,photoRequests=0;
 const readStates=new Map(),historyGaps=new Map(),latestMissing=new Set();
 let unknownSend=false,unknownPhoto=false,rejectPhoto=false;
 const offlineMessages=new Map();
@@ -24,11 +29,15 @@ let settings=defaultSettings();const roomSettings=new Map(),notificationQueue=[]
 const photoMessage='m_'+'9'.repeat(24),syntheticPhoto=Buffer.from('R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==','base64');
 const syntheticPng=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=','base64');
 const makeMessages=room=>Array.from({length:40},(_,i)=>({key:'m_'+(i+1).toString(16).padStart(24,'0'),text:i===0?payload:('모의 메시지 '+(i+1)+' ').repeat(50),sender:'모의 사용자',mine:i%2===0,canReply:true,at:1800000000000+i*1000}));
-const app=createLocalServer({mode:'live',messaging:true,photoFetcher:async()=>({data:syntheticPhoto,type:'image/gif'}),encode:()=>qrGrid,transport:async op=>op==='allowlist'?{httpStatus:200,body:{allowlisted:true}}:op==='generate'?{httpStatus:200,body:{status:0,url:'OFFLINE-NOT-FOR-LOGIN',remainingSeconds:60}}:rejectNextQr?{httpStatus:200,body:{status:-151}}:allowAuth?{httpStatus:200,body:{status:0,user:{userId:'246810'},accessToken:'FAKE_OFFLINE_TOKEN'}}:{httpStatus:200,body:{status:-150,nextRequestIntervalInSeconds:1}},readerFactory:()=>({
-  snapshot:()=>({phase:connected?'connected':attempts?'disconnected':'idle',attempts,canConnect:!connected,roomCount:connected?2-removedRooms.size:0,revision,historyBusy,pushBatches:0,connectedAt:connected?Date.now():null}),
+const controlToken=randomBytes(32).toString('hex');
+const app=createLocalServer({controlToken,mode:'live',messaging:true,photoFetcher:async()=>({data:syntheticPhoto,type:'image/gif'}),encode:()=>qrGrid,transport:async op=>op==='allowlist'?{httpStatus:200,body:{allowlisted:true}}:op==='generate'?{httpStatus:200,body:{status:0,url:'OFFLINE-NOT-FOR-LOGIN',remainingSeconds:60}}:rejectNextQr?{httpStatus:200,body:{status:-151}}:allowAuth?{httpStatus:200,body:{status:0,user:{userId:'246810'},accessToken:'FAKE_OFFLINE_TOKEN'}}:{httpStatus:200,body:{status:-150,nextRequestIntervalInSeconds:1}},readerFactory:()=>({
+  snapshot:()=>({phase:connected?'connected':attempts?'disconnected':'idle',attempts,canConnect:!connected,roomCount:connected?2-removedRooms.size:0,revision,...(adversarialFixture?{roomsRevision:roomsVersion,settingsRevision:settingsVersion,outboxRevision:outboxVersion,pageRevisions:Object.fromEntries(pageVersions)}:{}),historyBusy,pushBatches:0,connectedAt:connected?Date.now():null}),
   connect(){if(attempts++) {historyPhases.clear();messagesByRoom.clear();contexts.clear();readStates.clear();}connected=true;revision++;return true;},
-  rooms:()=>({revision,rooms:connected?[{key,title:'모의 대화방 A',preview:'예시 미리보기'},{key:second,title:'모의 대화방 B',preview:otherPreview}].filter(row=>!removedRooms.has(row.key)).map(row=>({...row,baseTitle:row.title,title:localTitles.get(row.key) || row.title,localTitle:localTitles.get(row.key) || null,pinOrder:roomSettings.get(row.key)?.pinOrder ?? null,muted:roomSettings.get(row.key)?.muted===true,canSend:true,kind:'DirectChat',unreadLocalCount:unread.get(row.key) || 0,unreadCoverage:'observed'})):[]}),
-  messages:room=>({key:room,messages:messagesByRoom.get(room) || [],latestVisible:!latestMissing.has(room),seenToken:'c'.repeat(48),receiptPhase:contexts.get(room) || 'idle',readSync:readStates.get(room) || {phase:'idle'},outbox:[...outcomes.values()].filter(row=>row.key===room),history:{phase:historyPhases.get(room) || 'idle',gap:historyGaps.get(room)===true,receivedCount:messagesByRoom.get(room)?.length || 0,acceptedCount:messagesByRoom.get(room)?.length || 0}}),
+  rooms:()=>({revision,rooms:connected?[{key,title:'모의 대화방 A',preview:'예시 미리보기'},{key:second,title:'모의 대화방 B',preview:otherPreview}].filter(row=>!removedRooms.has(row.key)).map(row=>({...row,...(adversarialFixture?{lastAt:1800000300000}:{}),baseTitle:row.title,title:localTitles.get(row.key) || row.title,localTitle:localTitles.get(row.key) || null,pinOrder:roomSettings.get(row.key)?.pinOrder ?? null,muted:roomSettings.get(row.key)?.muted===true,canSend:true,kind:'DirectChat',...roomCapabilities.get(row.key),unreadLocalCount:unread.get(row.key) || 0,unreadCoverage:'observed'})):[]}),
+  messages:room=>({key:room,messages:messagesByRoom.get(room) || [],latestVisible:!latestMissing.has(room),seenToken:'c'.repeat(48),receiptPhase:contexts.get(room) || 'idle',...(adversarialFixture?{entryPhase:contexts.get(room) || 'idle',contextRevision:receiptVersions.get(room)}:{}),readSync:readStates.get(room) || {phase:'idle'},outbox:[...outcomes.values()].filter(row=>row.key===room),history:{phase:historyPhases.get(room) || 'idle',gap:historyGaps.get(room)===true,receivedCount:messagesByRoom.get(room)?.length || 0,acceptedCount:messagesByRoom.get(room)?.length || 0}}),
+  view:room=>[key,second].includes(room),
+  outbox:clientId=>clientId?(outcomes.get(clientId) || null):[...outcomes.values()].filter(row=>!row.acknowledged && ['sending','unknown'].includes(row.phase)),
+  acknowledgeOutbox(clientId){const row=outcomes.get(clientId);if(row?.phase!=='unknown')return false;ackCalls.push(clientId);outcomes.set(clientId,{...row,acknowledged:true});outboxVersion++;revision++;return true;},
   rename(room,title){if(title===null)localTitles.delete(room);else localTitles.set(room,title);revision++;return true;},
   settingsSnapshot:()=>enableSettings?settings:null,
   updateSettings(patch){settings={...settings,...patch};revision++;return true;},
@@ -36,13 +45,13 @@ const app=createLocalServer({mode:'live',messaging:true,photoFetcher:async()=>({
   forgetSettings(){settings=defaultSettings();roomSettings.clear();localTitles.clear();revision++;return true;},
   claimNotifications:()=>settings.notifications?notificationQueue.splice(0,5):[],
   photo:(_room,msg)=>msg===photoMessage?'https://talkv.kakao.com/offline-test-only':null,
-  openRoom(room){contexts.set(room,'ready');revision++;return true;},
+  openRoom(room){contextCalls.push(room);if(adversarialFixture)for(const other of [key,second])if(other!==room)contexts.set(other,'idle');contexts.set(room,'ready');pageVersions.set(room,pageVersions.get(room)+1);revision++;return true;},
   seen(room,token,notify){seenCalls.push({room,token,notify});if(notify)readStates.set(room,{phase:'accepted',messageKey:messagesByRoom.get(room).at(-1).key});unread.set(room,0);revision++;return true;},
-  sendText(room,text,clientId,replyTo){if(outcomes.has(clientId))return true;sendCalls.push({room,text,clientId,replyTo});outcomes.set(clientId,{key:room,clientId,phase:'sending'});revision++;setTimeout(()=>{outcomes.set(clientId,{key:room,clientId,phase:unknownSend?'unknown':'accepted'});if(!unknownSend)messagesByRoom.get(room).push({key:'m_'+(5000+sendCalls.length).toString(16).padStart(24,'0'),text,sender:'나',mine:true,at:1800000100000,unreadCount:1,...(replyTo?{reply:{text:messagesByRoom.get(room).find(row=>row.key===replyTo)?.text,sender:'모의 사용자'}}:{})});revision++;},150).unref();return true;},
-  sendPhoto(room,image,clientId){if(rejectPhoto)return false;sendCalls.push({kind:'photo',room,clientId,byteLength:Buffer.from(image,'base64').length});outcomes.set(clientId,{key:room,clientId,phase:unknownPhoto?'unknown':'accepted'});revision++;return true;},
+  sendText(room,text,clientId,replyTo){if(outcomes.has(clientId))return true;sendCalls.push({room,text,clientId,replyTo});outcomes.set(clientId,{key:room,clientId,kind:'send',phase:'sending'});outboxVersion++;pageVersions.set(room,pageVersions.get(room)+1);revision++;setTimeout(()=>{outcomes.set(clientId,{key:room,clientId,kind:'send',phase:unknownSend?'unknown':'accepted'});if(!unknownSend)messagesByRoom.get(room).push({key:'m_'+(5000+sendCalls.length).toString(16).padStart(24,'0'),text,sender:'나',mine:true,at:1800000100000,unreadCount:1,...(replyTo?{reply:{text:messagesByRoom.get(room).find(row=>row.key===replyTo)?.text,sender:'모의 사용자'}}:{})});outboxVersion++;pageVersions.set(room,pageVersions.get(room)+1);revision++;},150).unref();return true;},
+  sendPhoto(room,image,clientId){if(rejectPhoto)return false;sendCalls.push({kind:'photo',room,clientId,byteLength:Buffer.from(image,'base64').length});outcomes.set(clientId,{key:room,clientId,kind:'photo',phase:unknownPhoto?'unknown':'accepted'});outboxVersion++;pageVersions.set(room,pageVersions.get(room)+1);revision++;return true;},
   history(room){if(historyBusy)return false;historyRooms.push(room);historyPhases.set(room,'loading');historyBusy=true;revision++;setTimeout(()=>{if(connected){historyPhases.set(room,'loaded');if(!messagesByRoom.has(room))messagesByRoom.set(room,[...makeMessages(room),...(offlineMessages.get(room) || [])]);historyBusy=false;revision++;}},500).unref();return true;},disconnect(){connected=false;revision++;},close(){connected=false;attempts=0;historyBusy=false;historyPhases.clear();messagesByRoom.clear();localTitles.clear();unread.clear();contexts.clear();outcomes.clear();revision++;},
 })});
-app.server.on('request',req=>{if(req.url==='/api/status')statusRequests++;});
+app.server.on('request',req=>{if(req.url==='/api/status')statusRequests++;if(req.url.startsWith('/api/photo?'))photoRequests++;fixtureRequests.push({method:req.method,path:req.url.split('?')[0],room:new URL(req.url,'http://synthetic.invalid').searchParams.get('room')});});
 const url=await app.listen(0);
 let browser,ws;
 const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
@@ -55,8 +64,8 @@ try{
   while(!page){const pages=await(await fetch(`http://127.0.0.1:${port}/json/list`)).json();page=pages.find(item=>item.url===url+'/');if(!page){if(Date.now()>deadline)throw new Error('page timeout');await sleep(100);}}
   ws=new WebSocket(page.webSocketDebuggerUrl);await new Promise((resolve,reject)=>{ws.addEventListener('open',resolve,{once:true});ws.addEventListener('error',reject,{once:true});});
   let sequence=0;const pending=new Map();
-  ws.addEventListener('message',event=>{const message=JSON.parse(event.data);const item=pending.get(message.id);if(item){pending.delete(message.id);clearTimeout(item.timer);message.error?item.reject(new Error('CDP failure')):item.resolve(message.result);}});
-  const call=(method,params={})=>new Promise((resolve,reject)=>{const id=++sequence;const timer=setTimeout(()=>{pending.delete(id);reject(new Error('CDP timeout'));},5000);pending.set(id,{resolve,reject,timer});ws.send(JSON.stringify({id,method,params}));});
+  ws.addEventListener('message',event=>{const message=JSON.parse(event.data);const item=pending.get(message.id);if(item){pending.delete(message.id);clearTimeout(item.timer);message.error?item.reject(new Error(`CDP ${item.method} failed (${message.error.code}): ${String(message.error.message).slice(0,160)}`)):item.resolve(message.result);}});
+  const call=(method,params={})=>new Promise((resolve,reject)=>{const id=++sequence;const timer=setTimeout(()=>{pending.delete(id);reject(new Error(`CDP ${method} timeout`));},5000);pending.set(id,{method,resolve,reject,timer});ws.send(JSON.stringify({id,method,params}));});
   const evaluate=async expression=>{
     const result=await call('Runtime.evaluate',{expression,returnByValue:true,awaitPromise:true});
     if(result.exceptionDetails)throw new Error(result.exceptionDetails.exception?.description || 'browser evaluation failed');
@@ -64,6 +73,315 @@ try{
   };
   const until=async expression=>{const until=Date.now()+10000;while(!await evaluate(expression)){if(Date.now()>until){console.log(JSON.stringify({syntheticBrowserTimeout:await evaluate("({selectedRoom,pendingSelection,busy,refreshing,ackInFlight,pageKey:currentPage?.key,history:currentPage?.history,readSync:currentPage?.readSync,reader:lastState?.reader,freshness,connectDisabled:el('reader-connect').disabled,messageCount:document.querySelectorAll('#message-list article').length,historyButtonDisabled:el('history-load').disabled})"),historyRooms,statusRequests}));throw new Error('browser assertion timeout: '+expression);}await sleep(100);}};
   const refreshUi=()=>evaluate("(async()=>{while(refreshing || busy)await new Promise(resolve=>setTimeout(resolve,10));await refresh();})()");
+  // Compatibility only for this UI fixture's pre-security baseline. Security
+  // contract tests independently require the new control/ticket bootstrap.
+  const launcher=await fetch(url+'/api/local/launch',{method:'POST',headers:{'Content-Type':'application/json','Origin':url,'X-Local-Control':controlToken},body:'{}'});
+  let sessionCookie,bootstrap;
+  if(launcher.ok){const issued=await launcher.json();const exchange=await fetch(url+'/api/local/session',{method:'POST',headers:{'Content-Type':'application/json','Origin':url},body:JSON.stringify({ticket:issued.ticket})});assert.equal(exchange.status,200,'synthetic ticket exchange must succeed');sessionCookie=exchange.headers.get('set-cookie');bootstrap='control-ticket';}
+  else{assert.equal(launcher.status,403,'only the explicitly known pre-security fixture may use root cookie bootstrap');const root=await fetch(url+'/');sessionCookie=root.headers.get('set-cookie');bootstrap='legacy-root-baseline-only';}
+  assert.ok(sessionCookie?.startsWith('local_auth='),'fixture session cookie unavailable');
+  await call('Network.setCookie',{name:'local_auth',value:sessionCookie.split(';')[0].slice('local_auth='.length),url:url+'/',httpOnly:true,sameSite:'Strict'});await call('Page.reload');
+  writeFileSync(resolve(folder,'synthetic-bootstrap.json'),JSON.stringify({actualAccountUsed:false,mode:bootstrap,secretsRecorded:false},null,2));
+  async function checkAdversarialBrowser(){
+    const results=[],extraSockets=[];let target;
+    const ackBaseline=[...ackCalls];
+    const pollingAtEntry=await evaluate('pollTimer!==null');
+    const check=async(name,fn)=>{try{const observed=await fn();results.push({name,passed:true,...(observed?{observed}:{})});lifecycleChecks.push(name);}catch(error){results.push({name,passed:false,error:String(error.message).slice(0,1500)});}};
+    const touch=(room=key)=>{pageVersions.set(room,pageVersions.get(room)+1);revision++;};
+    const ready="typeof lastState!=='undefined' && lastState?.reader?.phase==='connected' && !busy && !refreshing && !ackInFlight && !pendingSelection";
+    const stopPolling="clearTimeout(pollTimer);pollTimer=null;clearTimeout(queuedRefreshTimer);queuedRefreshTimer=null;refreshPending=false;showAccount(false);Object.defineProperty(document,'hidden',{configurable:true,get:()=>globalThis.testHidden===true});Object.defineProperty(document,'visibilityState',{configurable:true,get:()=>globalThis.testHidden?'hidden':'visible'});globalThis.testHidden=false;globalThis.testFocus=true;document.hasFocus=()=>globalThis.testFocus;el('read-sync').checked=false;";
+    async function secondTab(){
+      target=await call('Target.createTarget',{url:url+'/'});
+      const targets=await(await fetch(`http://127.0.0.1:${port}/json/list`)).json();const remote=targets.find(row=>row.id===target.targetId);assert.ok(remote,'test-owned second target must exist');
+      const socket=new WebSocket(remote.webSocketDebuggerUrl);extraSockets.push(socket);await new Promise((resolve,reject)=>{socket.addEventListener('open',resolve,{once:true});socket.addEventListener('error',reject,{once:true});});
+      let sequence=0;const pending=new Map();socket.addEventListener('message',event=>{const message=JSON.parse(event.data),entry=pending.get(message.id);if(!entry)return;pending.delete(message.id);clearTimeout(entry.timer);message.error?entry.reject(new Error('second target CDP error')):entry.resolve(message.result);});
+      const tabCall=(method,params={})=>new Promise((resolve,reject)=>{const id=++sequence,timer=setTimeout(()=>{pending.delete(id);reject(new Error('second target timeout'));},5000);pending.set(id,{resolve,reject,timer});socket.send(JSON.stringify({id,method,params}));});
+      const evalTab=async expression=>{const result=await tabCall('Runtime.evaluate',{expression,returnByValue:true,awaitPromise:true});if(result.exceptionDetails)throw new Error(result.exceptionDetails.exception?.description || 'second target evaluation failed');return result.result?.value;};
+      const wait=async expression=>{const end=Date.now()+10000;while(!await evalTab(expression)){if(Date.now()>end)throw new Error('second target condition timeout');await sleep(50);}};
+      await wait(ready);await evalTab(stopPolling);return {evaluate:evalTab,until:wait,refresh:()=>evalTab("(async()=>{while(refreshing || busy)await new Promise(resolve=>setTimeout(resolve,10));await refresh();clearTimeout(pollTimer);pollTimer=null;})()")};
+    }
+    try{
+      adversarialFixture=true;enableSettings=true;settings=defaultSettings();settingsVersion++;roomsVersion++;
+      outcomes.clear();contexts.clear();removedRooms.clear();
+      for(const room of [key,second]){messagesByRoom.set(room,makeMessages(room));historyPhases.set(room,'loaded');roomCapabilities.set(room,{kind:'DirectChat',canSend:true,canText:true,canReply:true,canPhoto:true,canRead:true,canContext:true});touch(room);}
+      await refreshUi();await evaluate(stopPolling);const tab=await secondTab();
+      const before=contextCalls.length;
+      await evaluate(`void selectRoom('${key}')`);await until(ready);await refreshUi();
+      await tab.evaluate(`void selectRoom('${second}')`);await tab.until(ready);await tab.refresh();
+      await check('two foreground tabs independently enter A and B once',async()=>{assert.deepEqual(contextCalls.slice(before),[key,second]);return {automaticContexts:contextCalls.length-before};});
+      const afterInitial=contextCalls.length;
+      for(let n=0;n<10;n++){await refreshUi();await tab.refresh();}
+      await check('ten alternating polls in two foreground tabs add zero context requests',async()=>{assert.equal(contextCalls.length-afterInitial,0);return {rounds:10,additionalContexts:contextCalls.length-afterInitial};});
+      await evaluate('globalThis.testHidden=true;globalThis.testFocus=false');await tab.evaluate('globalThis.testHidden=true;globalThis.testFocus=false');contexts.clear();touch(key);touch(second);
+      const background=contextCalls.length;for(let n=0;n<3;n++){await refreshUi();await tab.refresh();}
+      await check('hidden and unfocused tabs automatically enter zero rooms',async()=>{assert.equal(contextCalls.length-background,0);return {additionalContexts:contextCalls.length-background};});
+      await evaluate('globalThis.testHidden=false;globalThis.testFocus=false');contexts.set(key,'idle');touch(key);const unfocused=contextCalls.length;for(let n=0;n<3;n++)await refreshUi();
+      await check('a visible but unfocused tab automatically enters zero rooms',async()=>{assert.equal(contextCalls.length-unfocused,0);return {additionalContexts:contextCalls.length-unfocused};});
+      await evaluate('globalThis.testHidden=true;globalThis.testFocus=true');contexts.set(key,'idle');touch(key);const hidden=contextCalls.length;for(let n=0;n<3;n++)await refreshUi();
+      await check('a hidden but focused tab automatically enters zero rooms',async()=>{assert.equal(contextCalls.length-hidden,0);return {additionalContexts:contextCalls.length-hidden};});
+      // A genuine receipt generation change permits exactly one fresh attempt;
+      // changing another tab's active room alone did not create a generation.
+      await evaluate('globalThis.testHidden=false;globalThis.testFocus=true');receiptVersions.set(key,receiptVersions.get(key)+1);contexts.set(key,'idle');touch(key);
+      const changed=contextCalls.length;for(let n=0;n<4;n++)await refreshUi();
+      await check('a genuine receipt context revision allows exactly one new automatic entry',async()=>{assert.equal(contextCalls.length-changed,1);return {additionalContexts:contextCalls.length-changed};});
+      await call('Target.closeTarget',{targetId:target.targetId});target=null;for(const socket of extraSockets)socket.close();
+      // Disable context for independent request/DOM checks: those checks should
+      // not incidentally send or depend on room-entry scheduling.
+      for(const room of [key,second])roomCapabilities.set(room,{...roomCapabilities.get(room),canContext:false});roomsVersion++;touch(key);await refreshUi();
+      const selected=await evaluate('selectedRoom');assert.equal(selected,key,'the primary test target must remain A');
+      const baseRequests=fixtureRequests.length;readStates.set(key,{phase:'accepted',messageKey:messagesByRoom.get(key).at(-1).key});touch(key);await refreshUi();
+      await check('receipt-only selected page revision avoids room list and settings requests',async()=>{const rows=fixtureRequests.slice(baseRequests);assert.equal(rows.filter(row=>row.path==='/api/reader/rooms').length,0);assert.equal(rows.filter(row=>row.path==='/api/preferences').length,0);assert.equal(rows.filter(row=>row.path==='/api/reader/messages' && row.room===key).length,1);return {rooms:0,settings:0,selectedPages:1};});
+      const unrelated=fixtureRequests.length;touch(second);await refreshUi();await refreshUi();
+      await check('another room page revision does not refetch selected page rooms or settings',async()=>{const rows=fixtureRequests.slice(unrelated);assert.equal(rows.filter(row=>['/api/reader/rooms','/api/preferences','/api/reader/messages'].includes(row.path)).length,0);return {unrelatedPageRequests:0};});
+      const messageRows=[{key:photoMessage,text:'[사진]',sender:'모의 사용자',mine:false,at:1800000300000,photos:[{src:`/api/photo?room=${key}&message=${photoMessage}&index=0`,width:1,height:1}]},{key:'m_'+'8'.repeat(24),text:'사진 뒤의 합성 글',sender:'나',mine:true,canReply:true,at:1800000301000,unreadCount:2}];
+      messagesByRoom.set(key,messageRows);touch(key);await refreshUi();await until("document.querySelector('.photo-open img')?.naturalWidth===1");await evaluate("globalThis.retainedPhoto=document.querySelector('.photo-open img')");
+      const beforePhotos=photoRequests;messageRows.push({key:'m_'+'7'.repeat(24),text:'새 합성 글',sender:'모의 사용자',mine:false,at:1800000302000});touch(key);await refreshUi();await sleep(150);
+      await check('new text retains existing photo img identity with zero extra photo GET',async()=>{assert.equal(await evaluate("document.querySelector('.photo-open img')===globalThis.retainedPhoto"),true);assert.equal(photoRequests-beforePhotos,0);return {additionalPhotoGets:photoRequests-beforePhotos};});
+      const beforeReceiptPhotos=photoRequests;messageRows[1].unreadCount=1;touch(key);await refreshUi();await sleep(150);
+      await check('receipt change retains existing photo img identity with zero extra photo GET',async()=>{assert.equal(await evaluate("document.querySelector('.photo-open img')===globalThis.retainedPhoto"),true);assert.equal(photoRequests-beforeReceiptPhotos,0);return {additionalPhotoGets:photoRequests-beforeReceiptPhotos};});
+      // Real rendered CSS, composited through ancestors. Small text is held to
+      // 4.5 even if bold; transparent badges/quotes use their actual backdrops.
+      await evaluate('globalThis.testFocus=false');unread.set(key,3);roomsVersion++;roomCapabilities.set(key,{...roomCapabilities.get(key),kind:'OpenMultiChat'});touch(key);await refreshUi();
+      for(const mode of ['light','dark'])await check(`${mode} remaining small text contrast is at least 4.5`,async()=>{
+        await evaluate(`el('theme-mode').value='${mode}';el('theme-mode').dispatchEvent(new Event('change'));`);
+        const samples=await evaluate(`(()=>{const rgba=value=>{const n=value.match(/[\\d.]+/g)?.map(Number);return n?[n[0],n[1],n[2],n[3]??1]:[0,0,0,0];};const blend=(f,b)=>[...f.slice(0,3).map((v,i)=>v*f[3]+b[i]*(1-f[3])),1];const bg=node=>{const chain=[],box=node.getBoundingClientRect();for(let n=node;n;n=n.parentElement){const r=n.getBoundingClientRect();if(n===node || box.left>=r.left && box.right<=r.right && box.top>=r.top && box.bottom<=r.bottom)chain.unshift(n);}return chain.reduce((back,n)=>blend(rgba(getComputedStyle(n).backgroundColor),back),[255,255,255,1]);};const lum=rgb=>rgb.slice(0,3).map(x=>{x/=255;return x<=.04045?x/12.92:((x+.055)/1.055)**2.4;}).reduce((s,v,i)=>s+v*[.2126,.7152,.0722][i],0);const selectors=['.room-item.selected .room-preview','.room-item.selected .room-time','.unread-badge','.avatar','.message:not(.mine)>.muted','.message.mine>.muted','.message-read','.send-status'];return selectors.flatMap(selector=>[...document.querySelectorAll(selector)].filter(n=>n.textContent.trim() && n.getClientRects().length).map(n=>{const s=getComputedStyle(n),back=bg(n),front=blend(rgba(s.color),back),a=lum(front),b=lum(back);return {selector,size:parseFloat(s.fontSize),ratio:(Math.max(a,b)+.05)/(Math.min(a,b)+.05)};}));})()`);
+        assert.ok(samples.some(row=>row.selector==='.unread-badge'),'contrast fixture must expose the unread badge');assert.ok(samples.some(row=>row.selector==='.avatar'),'contrast fixture must expose avatars');assert.ok(samples.some(row=>row.selector==='.message-read'),'contrast fixture must expose read-count text');
+        const failures=samples.filter(row=>row.size<18.667 && row.ratio<4.5);writeFileSync(resolve(folder,`synthetic-adversarial-contrast-${mode}.json`),JSON.stringify({mode,samples,failures,actualAccountUsed:false},null,2));assert.deepEqual(failures,[]);return {samples:samples.length,minimumRatio:Math.min(...samples.map(row=>row.ratio))};
+      });
+      // Use a real fixture send once, then reload. Only opaque outbox metadata
+      // may restore a warning; the fixture deliberately does not store drafts.
+      await evaluate("showAccount(false);globalThis.testHidden=false;globalThis.testFocus=true;el('compose-text').value='새로고침 결과 불명 합성';el('compose-text').dispatchEvent(new Event('input'))");
+      unknownSend=true;const beforeSend=sendCalls.length;await until("!busy && !refreshing && !ackInFlight && !el('send-message').disabled && (el('send-message').click(),true)");await sleep(250);await refreshUi();await until("pendingSend?.phase==='unknown'");const unknownId=sendCalls.at(-1).clientId;outboxVersion++;
+      await call('Page.reload');await until(ready);await evaluate(stopPolling);await refreshUi();
+      const warning="(()=>{const nodes=[el('send-status'),el('outbox-status'),el('outbox-warning'),...document.querySelectorAll('[data-outbox-warning]')].filter(Boolean);return nodes.some(n=>n.getClientRects().length && /결과|미확인|확인할/.test(n.textContent));})()";
+      await check('unknown text outbox warning survives reload with no automatic resend',async()=>{assert.equal(await evaluate(warning),true);assert.equal(sendCalls.length-beforeSend,1);return {actualSyntheticSends:sendCalls.length-beforeSend};});
+      // Retained accepted metadata must never erase a new draft, even if the
+      // new draft happens to equal an older send's text.
+      const acceptedId='00000000-0000-4000-8000-000000000042';outcomes.set(acceptedId,{key,clientId:acceptedId,kind:'send',phase:'accepted',messageKey:'m_'+'6'.repeat(24)});outboxVersion++;revision++;
+      await evaluate("el('compose-text').value='새 초안은 보존';el('compose-text').dispatchEvent(new Event('input'))");for(let n=0;n<3;n++)await refreshUi();
+      await check('old accepted outbox state does not delete a newly composed draft',async()=>{assert.equal(await evaluate("el('compose-text').value"),'새 초안은 보존');assert.equal(sendCalls.length-beforeSend,1);return {draftPreserved:true};});
+      removedRooms.add(key);roomsVersion++;revision++;await refreshUi();
+      await until("!busy && !refreshing && !el('reader-disconnect').disabled && (el('reader-disconnect').click(),true)");await until("lastState.reader.phase==='disconnected' && !busy && !refreshing && !el('reader-connect').disabled");roomsVersion++;await evaluate("el('reader-connect').click()");await until(ready);await refreshUi();
+      await check('unknown outbox survives removed room and reconnect without resend',async()=>{assert.equal(await evaluate(warning),true);assert.equal(outcomes.get(unknownId)?.phase,'unknown');assert.equal(sendCalls.length-beforeSend,1);return {warningForAbsentRoom:true,actualSyntheticSends:sendCalls.length-beforeSend};});
+      assert.deepEqual(ackCalls,ackBaseline,'no acknowledgement occurs before the explicit action');
+      await evaluate("globalThis.confirm=()=>true;const ack=document.querySelector('[data-outbox-ack]') || el('outbox-ack') || el('send-reset');ack?.click();");await sleep(150);await refreshUi();
+      await check('explicit unknown acknowledgement reaches outbox ack once and never sends',async()=>{assert.deepEqual(ackCalls,[...ackBaseline,unknownId]);assert.equal(ackCalls.length-ackBaseline.length,1);assert.equal(sendCalls.length-beforeSend,1);return {previousAcknowledgements:ackBaseline.length,acknowledgements:ackCalls.length-ackBaseline.length,additionalSends:0};});
+    }finally{
+      if(target)await call('Target.closeTarget',{targetId:target.targetId}).catch(()=>{});for(const socket of extraSockets)socket.close();
+      adversarialFixture=false;unknownSend=false;removedRooms.clear();outcomes.clear();contexts.clear();roomCapabilities.clear();settings=defaultSettings();revision++;
+      const pollingRestored=await evaluate('scheduleRefresh();pollTimer!==null');assert.equal(pollingRestored,true);
+      writeFileSync(resolve(folder,'synthetic-adversarial.json'),JSON.stringify({passed:results.length>0 && results.every(row=>row.passed),checks:results,polling:{scheduledAtEntry:pollingAtEntry,scheduledAfterSection:pollingRestored},actualAccountUsed:false,externalNetworkUsed:false},null,2));
+    }
+    assert.ok(results.length>=16,'adversarial fixture must execute its independent checks');assert.deepEqual(results.filter(row=>!row.passed).map(row=>({name:row.name,error:row.error})),[],'independent adversarial browser contracts failed');
+  }
+  async function checkThemeBrowser(){
+    assert.ok(['light','dark'].includes(await evaluate('document.documentElement.dataset.theme')),'the running app must apply a theme before interaction');
+    assert.equal(await evaluate("Boolean(el('theme-toggle') && el('theme-mode'))"),true);
+    const originalMode=await evaluate("el('theme-mode').value");
+    try{
+      await call('Emulation.setEmulatedMedia',{features:[{name:'prefers-color-scheme',value:'light'}]});
+      await evaluate("el('theme-mode').value='system';el('theme-mode').dispatchEvent(new Event('change'))");
+      assert.equal(await evaluate('document.documentElement.dataset.theme'),'light');
+      await call('Emulation.setEmulatedMedia',{features:[{name:'prefers-color-scheme',value:'dark'}]});
+      await until("document.documentElement.dataset.theme==='dark'");
+      await evaluate("el('theme-toggle').click()");
+      assert.equal(await evaluate('document.documentElement.dataset.theme'),'light');
+      assert.equal(await evaluate("localStorage.getItem('web-kakao-theme')"),'light');
+      await call('Emulation.setEmulatedMedia',{features:[{name:'prefers-color-scheme',value:'light'}]});
+      await call('Emulation.setEmulatedMedia',{features:[{name:'prefers-color-scheme',value:'dark'}]});await sleep(60);
+      assert.equal(await evaluate('document.documentElement.dataset.theme'),'light','manual mode must ignore OS changes');
+      await call('Page.reload');await sleep(200);
+      await until("document.readyState==='complete' && document.documentElement.dataset.theme==='light' && document.querySelectorAll('.room-item').length===2");
+      assert.equal(await evaluate("el('theme-mode').value"),'light');
+      assert.deepEqual(await evaluate('Object.keys(localStorage)'),['web-kakao-theme'],'the UI stores only its theme string in browser storage');
+      lifecycleChecks.push('theme follows system changes and manual toggle survives reload without browser account storage');
+      await call('Page.enable');
+      const blocked=await call('Page.addScriptToEvaluateOnNewDocument',{source:"globalThis.syntheticStorageBlocked=true;Object.defineProperty(window,'localStorage',{configurable:true,get(){throw new DOMException('Synthetic storage unavailable','SecurityError');}});"});
+      try{
+        await call('Page.reload');await sleep(200);await until("document.readyState==='complete' && document.documentElement.dataset.theme==='dark' && document.querySelectorAll('.room-item').length===2");
+        assert.equal(await evaluate('globalThis.syntheticStorageBlocked'),true,'the storage-denial script must actually run before the app');
+        assert.equal(await evaluate("(()=>{try{void localStorage;return 'available';}catch(error){return error.name;}})()"),'SecurityError');
+        writeFileSync(resolve(folder,'synthetic-storage-state.json'),JSON.stringify({injectedBeforeDocument:true,actualStorageAccess:'SecurityError',initialTheme:'dark',initialMode:'system',actualAccountUsed:false},null,2));
+        assert.equal(await evaluate("el('theme-mode').value"),'system');
+        await evaluate("el('theme-toggle').click()");assert.equal(await evaluate('document.documentElement.dataset.theme'),'light');
+        await evaluate("el('theme-mode').value='system';el('theme-mode').dispatchEvent(new Event('change'))");
+        await call('Emulation.setEmulatedMedia',{features:[{name:'prefers-color-scheme',value:'light'}]});await until("document.documentElement.dataset.theme==='light'");
+        await call('Emulation.setEmulatedMedia',{features:[{name:'prefers-color-scheme',value:'dark'}]});await until("document.documentElement.dataset.theme==='dark'");
+        lifecycleChecks.push('blocked browser storage preserves initial system theme toggle and live OS changes');
+      }catch(error){writeFileSync(resolve(folder,'synthetic-storage-state.json'),JSON.stringify(await evaluate("(()=>{let storage;try{storage=localStorage.getItem('web-kakao-theme');}catch(error){storage=error.name;}return {blocked:globalThis.syntheticStorageBlocked,storage,theme:document.documentElement.dataset.theme,mode:el('theme-mode')?.value,systemDark:matchMedia('(prefers-color-scheme: dark)').matches,rooms:document.querySelectorAll('.room-item').length};})()"),null,2));throw error;}
+      finally{await call('Page.removeScriptToEvaluateOnNewDocument',{identifier:blocked.identifier});await call('Page.reload');await sleep(200);await until("document.readyState==='complete' && document.querySelectorAll('.room-item').length===2");}
+    }finally{
+      await evaluate(`el('theme-mode').value='${originalMode}';el('theme-mode').dispatchEvent(new Event('change'))`);
+      await call('Emulation.setEmulatedMedia',{features:[]});
+    }
+  }
+  async function checkMobileAndThemes(){
+    const saved={messages:messagesByRoom.get(key),read:readStates.get(key),unread:unread.get(key),latest:latestMissing.has(key)};
+    const visual=[],colors={};let seq=0;
+    const shot=async name=>{const image=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:false});writeFileSync(resolve(folder,name+'.png'),Buffer.from(image.data,'base64'));};
+    await evaluate("showAccount(false);globalThis.testHidden=false;globalThis.testFocus=false;document.hasFocus=()=>globalThis.testFocus;el('read-sync').checked=false;");
+    await evaluate(`void selectRoom('${key}')`);
+    await until(`currentPage?.key==='${key}' && currentPage.messages.length>0 && !busy && !refreshing && !ackInFlight && !pendingSelection`);
+    messagesByRoom.set(key,[{key:'m_'+(9100).toString(16).padStart(24,'0'),text:'안녕하세요. 브라우저에서 대화를 이어가고 있어요.',sender:'모의 사용자',mine:false,canReply:true,at:1800000000000},{key:'m_'+(9101).toString(16).padStart(24,'0'),text:'A형 화면을 적용했어요. 다크 모드도 확인해 주세요.',sender:'나',mine:true,canReply:true,at:1800000001000,unreadCount:1},{key:'m_'+(9102).toString(16).padStart(24,'0'),text:'방 목록으로 돌아가도 작성 중인 메시지는 유지됩니다.',sender:'모의 사용자',mine:false,canReply:true,at:1800000002000},{key:photoMessage,text:'[사진]',sender:'모의 사용자',mine:false,at:1800000003000,photos:[{src:`/api/photo?room=${key}&message=${photoMessage}&index=0`,width:1,height:1}]},{key:'m_'+(9104).toString(16).padStart(24,'0'),text:'답장과 사진 미리보기도 확인할 수 있어요.',sender:'나',mine:true,canReply:true,at:1800000004000,reply:{text:'방 목록으로 돌아가도 작성 중인 메시지는 유지됩니다.',sender:'모의 사용자'}}]);
+    unread.set(key,1);readStates.delete(key);latestMissing.delete(key);revision++;await refreshUi();
+    try{
+      for(const mode of ['light','dark']){
+        await evaluate(`el('theme-mode').value='${mode}';el('theme-mode').dispatchEvent(new Event('change'));showAccount(false)`);
+        for(const width of [1280,430,320]){
+          await call('Emulation.setDeviceMetricsOverride',{width,height:900,deviceScaleFactor:1,mobile:false});
+          await evaluate(`void selectRoom('${key}')`);await until('!busy && !refreshing && !ackInFlight && !pendingSelection');
+          const layout=await evaluate("(()=>{const pane=document.querySelector('.chat-pane'),side=document.querySelector('.sidebar'),compose=el('compose-form'),r=pane.getBoundingClientRect(),c=compose.getBoundingClientRect();return {width:innerWidth,theme:document.documentElement.dataset.theme,overflow:document.documentElement.scrollWidth>innerWidth,chatVisible:r.width>0,sidebarWidth:side.getBoundingClientRect().width,composerInside:c.left>=0 && c.right<=innerWidth && c.bottom<=innerHeight,chatBackground:getComputedStyle(pane).backgroundColor,sideBackground:getComputedStyle(side).backgroundColor};})()");
+          visual.push(layout);assert.equal(layout.theme,mode);assert.equal(layout.overflow,false);assert.equal(layout.chatVisible,true);assert.equal(layout.composerInside,true);
+          if(width===1280){assert.equal(layout.sidebarWidth,340);colors[mode]={chat:layout.chatBackground,side:layout.sideBackground};}
+          await shot(`synthetic-a-${mode}-${width}-chat`);
+          if(width<=760){
+            const sends=sendCalls.length;
+            await evaluate("el('compose-text').value='모바일 보존 초안';el('compose-text').dispatchEvent(new Event('input'));globalThis.mobileFirst=document.querySelector('#message-list article');el('room-list-back').click()");
+            assert.equal(await evaluate("!document.querySelector('.app-shell').classList.contains('mobile-chat') && getComputedStyle(document.querySelector('.chat-pane')).display==='none' && document.querySelector('.sidebar').getBoundingClientRect().width===innerWidth"),true);
+            const reads=seenCalls.length;
+            const newest='m_'+(9200+seq++).toString(16).padStart(24,'0');messagesByRoom.get(key).push({key:newest,text:'목록 뒤의 합성 새 메시지',sender:'모의 사용자',mine:false,at:1800000005000+seq});unread.set(key,1);readStates.delete(key);revision++;
+            await refreshUi();await evaluate("globalThis.mobileFirst=document.querySelector('#message-list article')");
+            const eligibility=await evaluate("(async()=>{userSelected=true;globalThis.testFocus=true;el('read-sync').checked=true;await maybeSeen();await maybeSeen();return {focus:document.hasFocus(),latest:currentPage.latestVisible,readOptIn:el('read-sync').checked,covered:messageViewCovered(),sameRoom:currentPage.key===selectedRoom,busy,ackInFlight};})()");
+            assert.equal(eligibility.focus,true);assert.equal(eligibility.latest,true);assert.equal(eligibility.readOptIn,true);assert.equal(eligibility.sameRoom,true);assert.equal(eligibility.covered,true);assert.equal(seenCalls.length,reads,'a hidden mobile chat must enqueue zero seen/read requests even with read opt-in focus and latest page');assert.equal(unread.get(key),1);assert.equal(sendCalls.length,sends);
+            visual.push({mode,width,hiddenPaneReadEligibility:eligibility,actualHiddenSeenCalls:seenCalls.length-reads});
+            await shot(`synthetic-a-${mode}-${width}-list`);
+            await evaluate(`globalThis.testFocus=false;el('read-sync').checked=false;void selectRoom('${key}')`);await until('!busy && !refreshing && !ackInFlight && !pendingSelection');
+            assert.equal(await evaluate("document.querySelector('.app-shell').classList.contains('mobile-chat') && el('compose-text').value==='모바일 보존 초안' && globalThis.mobileFirst===document.querySelector('#message-list article')"),true,'mobile back/reopen must preserve draft and unchanged message DOM');
+          }
+        }
+        await evaluate('showAccount(true)');await shot(`synthetic-a-${mode}-320-settings`);await evaluate('showAccount(false)');
+        await evaluate("el('rename-room').click()");assert.equal(await evaluate("el('rename-dialog').open"),true);await shot(`synthetic-a-${mode}-320-dialog`);await evaluate("el('rename-cancel').click()");
+      }
+      assert.notEqual(colors.light.chat,colors.dark.chat,'dark theme must change the visible chat color');assert.notEqual(colors.light.side,colors.dark.side,'dark theme must change the visible sidebar color');
+      lifecycleChecks.push('A layout and real theme colors fit 1280 430 and 320 pixel viewports with both mobile panes');
+      lifecycleChecks.push('hidden mobile chat sends zero seen or read requests despite focus latest and read opt-in');
+      lifecycleChecks.push('mobile list back and reopen preserve text draft and unchanged message DOM');
+      // Back during asynchronous bitmap decoding must cancel that preview only.
+      const sends=sendCalls.length;
+      await evaluate(`globalThis.mobileBitmapDecoder=createImageBitmap;globalThis.mobileBitmapReady=new Promise(resolve=>globalThis.mobileBitmapStarted=resolve);globalThis.createImageBitmap=async(...args)=>{const value=await globalThis.mobileBitmapDecoder(...args);globalThis.mobileHeldBitmap=value;globalThis.mobileBitmapStarted();await new Promise(resolve=>globalThis.mobileReleaseBitmap=resolve);return value;};void prepareImage(new File([Uint8Array.from(atob('${syntheticPng.toString('base64')}'),c=>c.charCodeAt(0))],'synthetic-mobile.png',{type:'image/png'}));`);
+      await until('Boolean(globalThis.mobileReleaseBitmap)');await evaluate("el('room-list-back').click();globalThis.mobileReleaseBitmap();globalThis.createImageBitmap=globalThis.mobileBitmapDecoder");
+      await until("globalThis.mobileHeldBitmap.width===0 && !imagePreparing");
+      assert.equal(await evaluate("imageDraft===null && !el('image-send-dialog').open && el('compose-text').value==='모바일 보존 초안'"),true);assert.equal(sendCalls.length,sends);
+      lifecycleChecks.push('mobile back cancels in-flight photo preparation without sending or deleting text draft');
+      await evaluate(`void selectRoom('${key}')`);await until('!busy && !refreshing && !ackInFlight && !pendingSelection');
+      await evaluate("el('room-actions-toggle').focus();el('room-actions-toggle').dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowDown',bubbles:true,cancelable:true}))");
+      assert.equal(await evaluate("!el('room-actions-menu').hidden && document.activeElement===el('rename-room')"),true);
+      await evaluate("globalThis.mobileMenuKeys=[];for(const type of ['keydown','keypress','keyup','click'])el('rename-room').addEventListener(type,event=>globalThis.mobileMenuKeys.push({type,key:event.key,prevented:event.defaultPrevented,trusted:event.isTrusted}));");
+      // A native Enter includes its carriage-return character event. Omitting
+      // text here sends keydown only and does not exercise button activation.
+      await call('Input.dispatchKeyEvent',{type:'keyDown',key:'Enter',code:'Enter',windowsVirtualKeyCode:13,text:'\r',unmodifiedText:'\r'});await call('Input.dispatchKeyEvent',{type:'keyUp',key:'Enter',code:'Enter',windowsVirtualKeyCode:13});
+      writeFileSync(resolve(folder,'synthetic-room-menu-keyboard.json'),JSON.stringify(await evaluate("({events:globalThis.mobileMenuKeys,renameOpen:el('rename-dialog').open,active:document.activeElement?.id})"),null,2));
+      assert.equal(await evaluate("el('rename-dialog').open"),true);await evaluate("el('rename-cancel').click();el('room-actions-toggle').click();el('room-actions-menu').dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true,cancelable:true}))");
+      assert.equal(await evaluate("el('room-actions-menu').hidden && document.activeElement===el('room-actions-toggle')"),true);
+      lifecycleChecks.push('room actions menu supports keyboard rename and Escape focus restoration');
+      writeFileSync(resolve(folder,'synthetic-a-layout.json'),JSON.stringify({passed:true,visual,colors,actualAccountUsed:false},null,2));
+    }finally{
+      messagesByRoom.set(key,saved.messages);if(saved.read===undefined)readStates.delete(key);else readStates.set(key,saved.read);if(saved.unread===undefined)unread.delete(key);else unread.set(key,saved.unread);if(saved.latest)latestMissing.add(key);else latestMissing.delete(key);revision++;
+      await call('Emulation.clearDeviceMetricsOverride');await evaluate("globalThis.testFocus=false;el('read-sync').checked=false;closeMessageMenu();el('compose-text').value='';el('compose-text').dispatchEvent(new Event('input'));showAccount(false)");await refreshUi();
+    }
+  }
+  async function checkConflicts(){
+    await evaluate(`void selectRoom('${key}')`);
+    await until(`currentPage?.key==='${key}' && currentPage.messages.length>0 && !pendingSelection && !refreshing && !busy && !ackInFlight`);
+    await evaluate("clearTimeout(pollTimer);clearTimeout(queuedRefreshTimer);pollTimer=queuedRefreshTimer=null;refreshPending=false;userSelected=false;globalThis.conflictFetch=fetch;globalThis.conflictMode=null;globalThis.conflictCodes=[];globalThis.fetch=async(path,options={})=>{if((globalThis.conflictMode==='post' && path==='/api/reader/send') || (globalThis.conflictMode==='get' && path==='/api/reader/rooms')){globalThis.conflictMode=null;globalThis.conflictCodes.push(409);return new Response(JSON.stringify({error:'action_not_ready'}),{status:409,headers:{'Content-Type':'application/json'}});}return globalThis.conflictFetch(path,options);};");
+    const sends=sendCalls.length;
+    try{
+      const post=await evaluate("(async()=>{const failures=localFailureVersion;globalThis.conflictMode='post';const accepted=await postLocal('/api/reader/send',{room:selectedRoom,text:'synthetic conflict',clientId:crypto.randomUUID()});return {accepted,failures:localFailureVersion-failures,freshness};})()");
+      assert.equal(post.accepted,false);assert.equal(post.failures,0,'HTTP409 must not mark the local server unavailable');
+      await refreshUi();
+      const get=await evaluate("(async()=>{const failures=localFailureVersion;globalThis.conflictMode='get';let name;try{await localJson('/api/reader/rooms');}catch(error){name=error.name;}return {name,failures:localFailureVersion-failures};})()");
+      assert.equal(get.name,'LocalConflict');assert.equal(get.failures,0);
+      await refreshUi();
+      const refresh=await evaluate("(async()=>{const failures=localFailureVersion;globalThis.conflictMode='get';readerRevision=-1;await refresh();return {failures:localFailureVersion-failures,message:el('message').textContent};})()");
+      assert.equal(refresh.failures,0);assert.equal(refresh.message.includes('로컬 서버에 연결할 수 없습니다'),false);
+      await refreshUi();await until("freshness==='fresh' && !refreshing && !busy");
+      assert.equal(sendCalls.length,sends,'409 recovery must not retry a rejected send');
+      assert.deepEqual(await evaluate('globalThis.conflictCodes'),[409,409,409]);
+      writeFileSync(resolve(folder,'synthetic-conflicts.json'),JSON.stringify({post,get,refresh,actualSendCalls:sendCalls.length-sends,actualAccountUsed:false},null,2));
+      lifecycleChecks.push('HTTP409 POST and GET recover status without a server outage or automatic send retry');
+    }finally{await evaluate('globalThis.fetch=globalThis.conflictFetch;scheduleRefresh();');}
+  }
+  async function checkHeaderLayout(){
+    const results=[],panelWasHidden=await evaluate("el('account-panel').hidden");await evaluate('showAccount(false)');
+    try{
+      for(const width of [640,1280,850,581,580,430,320]){
+        await call('Emulation.setDeviceMetricsOverride',{width,height:900,deviceScaleFactor:1,mobile:false});
+        await evaluate("document.querySelector('.app-shell').classList.add('mobile-chat')");
+        const layout=await evaluate("(()=>{const header=document.querySelector('.chat-header'),bounds=header.getBoundingClientRect();return {width:innerWidth,overflow:document.documentElement.scrollWidth>innerWidth,headerHeight:bounds.height,buttons:[...header.querySelectorAll('button')].filter(button=>button.getClientRects().length && getComputedStyle(button).visibility!=='hidden').map(button=>{const r=button.getBoundingClientRect(),range=document.createRange();range.selectNodeContents(button);return {id:button.id,height:r.height,lines:range.getClientRects().length,inside:r.left>=bounds.left && r.right<=bounds.right && r.top>=bounds.top && r.bottom<=bounds.bottom};})};})()");
+        results.push(layout);writeFileSync(resolve(folder,'synthetic-header-layout.json'),JSON.stringify(results,null,2));
+        if([640,430].includes(width)){const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:false});writeFileSync(resolve(folder,`synthetic-header-${width}.png`),Buffer.from(shot.data,'base64'));}
+        assert.equal(layout.overflow,false,`header viewport ${width} must not overflow horizontally`);
+        assert.ok(layout.buttons.length>=3 && layout.buttons.every(button=>button.lines===1 && button.height<=46 && button.inside),`visible header controls at ${width} must stay compact on one text line and inside the header`);
+      }
+      lifecycleChecks.push('compact header controls keep one-line labels and stay inside seven viewport widths');
+    }finally{await call('Emulation.clearDeviceMetricsOverride');await evaluate(`document.querySelector('.app-shell').classList.remove('mobile-chat');showAccount(${!panelWasHidden})`);}
+  }
+  async function checkEmptyOpenContext(){
+    const saved=[messagesByRoom.get(key),historyPhases.get(key),contexts.get(key),roomCapabilities.get(key)],reads=seenCalls.length,sends=sendCalls.length;
+    try{
+      messagesByRoom.set(key,[]);historyPhases.set(key,'loaded');contexts.delete(key);
+      roomCapabilities.set(key,{kind:'OpenMultiChat',canSend:false,canText:false,canReply:false,canPhoto:false,canRead:false,canContext:true});revision++;
+      await refreshUi();await evaluate(`void selectRoom('${key}')`);
+      await until(`selectedRoom==='${key}' && currentPage?.history?.phase==='loaded' && !busy && !refreshing && !pendingSelection`);
+      await refreshUi();await refreshUi();
+      assert.equal(contexts.get(key),'ready','an explicitly selected empty existing open room must request context');
+      assert.equal(seenCalls.length,reads);assert.equal(sendCalls.length,sends);
+      lifecycleChecks.push('empty existing open room can request context without sending or notifying read');
+    }finally{
+      for(const [map,value] of [[messagesByRoom,saved[0]],[historyPhases,saved[1]],[contexts,saved[2]],[roomCapabilities,saved[3]]]){if(value===undefined)map.delete(key);else map.set(key,value);}
+      revision++;await refreshUi();
+    }
+  }
+  async function checkCapabilities(){
+    roomCapabilities.set(key,{kind:'OpenMultiChat',canSend:true,canText:true,canPhoto:false,canReply:false,canRead:false,canContext:false});revision++;
+    await refreshUi();
+    await evaluate(`showAccount(false);globalThis.testHidden=false;globalThis.testFocus=true;document.hasFocus=()=>true;el('read-sync').checked=true;void selectRoom('${key}')`);
+    await until(`selectedRoom==='${key}' && currentPage?.messages?.length>0 && !busy && !refreshing && !ackInFlight`);
+    assert.equal(await evaluate("!el('compose-text').disabled && el('attach-image').disabled"),true,'text permission must not enable photos');
+    await evaluate("document.querySelector('#message-list article').dispatchEvent(new MouseEvent('contextmenu',{bubbles:true,cancelable:true,clientX:300,clientY:200}))");
+    assert.equal(await evaluate("el('message-menu-reply').hidden"),true,'text permission must not enable reply');
+    await evaluate("closeMessageMenu();userSelected=true;document.querySelector('.chat-scroll').scrollTop=document.querySelector('.chat-scroll').scrollHeight");
+    const reads=seenCalls.filter(call=>call.notify).length,sends=sendCalls.length;
+    readStates.delete(key);revision++;await refreshUi();await evaluate('maybeSeen()');
+    assert.equal(seenCalls.filter(call=>call.notify).length,reads,'canRead=false must issue zero remote notifications');
+    lifecycleChecks.push('open text permission does not enable photo reply or remote read');
+    roomCapabilities.set(key,{kind:'OpenMultiChat',canSend:false,canText:false,canPhoto:true,canReply:false,canRead:false,canContext:false});revision++;
+    await refreshUi();assert.equal(await evaluate("el('compose-text').disabled && !el('attach-image').disabled"),true,'photo permission is independent of text');
+    await evaluate(`prepareImage(new File([Uint8Array.from(atob('${syntheticPng.toString('base64')}'),c=>c.charCodeAt(0))],'synthetic-capability.png',{type:'image/png'}))`);
+    assert.equal(await evaluate("el('image-send-dialog').open && !el('image-send').disabled"),true);
+    await evaluate("el('image-cancel').click();el('read-sync').checked=false");assert.equal(sendCalls.length,sends);
+    lifecycleChecks.push('open photo-only preview and cancel sends zero messages');
+    roomCapabilities.delete(key);revision++;await refreshUi();
+    // Two event handlers can run after HTTP enqueue but before the next page
+    // refresh. Hold that stale view deliberately rather than relying on timing.
+    await evaluate("userSelected=false;clearTimeout(pollTimer);pollTimer=null");
+    messagesByRoom.get(key).push({key:'m_'+'f'.repeat(24),text:'합성 읽음 중복 경계',sender:'모의 사용자',mine:false,at:1800000200000});unread.set(key,1);readStates.delete(key);revision++;
+    await refreshUi();const beforeSeen=seenCalls.length;
+    await evaluate("(async()=>{userSelected=true;el('read-sync').checked=false;const pane=document.querySelector('.chat-scroll');pane.scrollTop=pane.scrollHeight;await maybeSeen();await maybeSeen();})()");
+    assert.equal(seenCalls.length,beforeSeen+1,'same stale view must enqueue seen once');
+    await refreshUi();await evaluate('scheduleRefresh()');
+    lifecycleChecks.push('stale view after HTTP enqueue cannot submit duplicate seen requests');
+  }
+  async function checkSelectionBusy(){
+    await refreshUi();await evaluate("clearTimeout(pollTimer);pollTimer=null;userSelected=false");
+    messagesByRoom.delete(second);historyPhases.delete(second);
+    // Status can still say idle while another history request holds the worker.
+    // Record the explicit rejection, then let a new revision release the queue.
+    historyBusy=true;revision++;
+    await evaluate("globalThis.selectionResponses=[];globalThis.selectionFetch=fetch;globalThis.fetch=async(...args)=>{const response=await globalThis.selectionFetch(...args);if(String(args[0])==='/api/reader/history')globalThis.selectionResponses.push(response.status);return response;}");
+    try{
+      await evaluate(`void selectRoom('${second}')`);
+      await until("globalThis.selectionResponses.includes(409) && !busy && !refreshing");
+      assert.equal(await evaluate(`pendingSelection?.key==='${second}'`),true,'explicitly rejected history must retain the latest room selection');
+      const before=historyRooms.filter(room=>room===second).length;
+      historyBusy=false;revision++;await refreshUi();await evaluate('scheduleRefresh()');
+      const expectedMessages=makeMessages(second).length+(offlineMessages.get(second)?.length || 0);
+      await until(`currentPage?.messages?.length===${expectedMessages} && !busy && !refreshing`);
+      assert.equal(historyRooms.filter(room=>room===second).length,before+1);
+      assert.equal(await evaluate('pendingSelection'),null);
+      lifecycleChecks.push('history 409 retains latest selection until a new worker revision and accepts it once');
+    }finally{historyBusy=false;await evaluate('globalThis.fetch=globalThis.selectionFetch;scheduleRefresh()');}
+  }
   async function checkLifecycle(){
   await evaluate("globalThis.testFocus=true;document.hasFocus=()=>globalThis.testFocus;");
   // All lifecycle traffic stays on the injected synthetic loopback server.
@@ -184,13 +502,21 @@ try{
   await until("document.querySelectorAll('.room-item').length===2");
   assert.equal(await evaluate("document.getElementById('title').textContent"),'대화 서버 연결됨');
   assert.equal(await evaluate("getComputedStyle(document.querySelector('.app-shell')).display"),'grid');
-  if(process.env.WEB_KAKAO_QA_LIFECYCLE_ONLY==='1'){await checkLifecycle();console.log(JSON.stringify({passed:true,scope:'synthetic lifecycle only',checks:lifecycleChecks,actualAccountUsed:false,artifacts:folder}));}
+  if(process.env.WEB_KAKAO_QA_ADVERSARIAL_ONLY==='1'){await checkAdversarialBrowser();console.log(JSON.stringify({passed:true,scope:'synthetic adversarial browser only',checks:lifecycleChecks,actualAccountUsed:false,artifacts:folder}));}
+  else if(process.env.WEB_KAKAO_QA_UI_ONLY==='1'){await checkMobileAndThemes();await checkThemeBrowser();await checkHeaderLayout();console.log(JSON.stringify({passed:true,scope:'synthetic A UI theme and mobile only',checks:lifecycleChecks,actualAccountUsed:false,artifacts:folder}));}
+  else if(process.env.WEB_KAKAO_QA_THEME_ONLY==='1'){await checkThemeBrowser();console.log(JSON.stringify({passed:true,scope:'synthetic theme only',checks:lifecycleChecks,actualAccountUsed:false,artifacts:folder}));}
+  else if(process.env.WEB_KAKAO_QA_CONFLICTS_ONLY==='1'){await checkConflicts();console.log(JSON.stringify({passed:true,scope:'synthetic HTTP409 only',checks:lifecycleChecks,actualAccountUsed:false,artifacts:folder}));}
+  else if(process.env.WEB_KAKAO_QA_HEADER_ONLY==='1'){await checkHeaderLayout();console.log(JSON.stringify({passed:true,scope:'synthetic header layout only',checks:lifecycleChecks,actualAccountUsed:false,artifacts:folder}));}
+  else if(process.env.WEB_KAKAO_QA_OPEN_EMPTY_ONLY==='1'){await checkEmptyOpenContext();console.log(JSON.stringify({passed:true,scope:'synthetic empty open context only',checks:lifecycleChecks,actualAccountUsed:false,artifacts:folder}));}
+  else if(process.env.WEB_KAKAO_QA_SELECTION_ONLY==='1'){await checkSelectionBusy();console.log(JSON.stringify({passed:true,scope:'synthetic selection only',checks:lifecycleChecks,actualAccountUsed:false,artifacts:folder}));}
+  else if(process.env.WEB_KAKAO_QA_CAPABILITIES_ONLY==='1'){await checkCapabilities();console.log(JSON.stringify({passed:true,scope:'synthetic capabilities only',checks:lifecycleChecks,actualAccountUsed:false,artifacts:folder}));}
+  else if(process.env.WEB_KAKAO_QA_LIFECYCLE_ONLY==='1'){await checkLifecycle();console.log(JSON.stringify({passed:true,scope:'synthetic lifecycle only',checks:lifecycleChecks,actualAccountUsed:false,artifacts:folder}));}
   else {
   // An initial default highlight is not an explicitly opened room or read intent.
   assert.equal(historyRooms.length,0);assert.equal(await evaluate('!userSelected && reconnectRoom===null'),true);
   for(let i=0;i<2;i++){
     const defaultSeen=seenCalls.length,defaultSends=sendCalls.length;
-    await evaluate("document.getElementById('reader-disconnect').click()");await until("lastState.reader.phase==='disconnected' && !busy && !refreshing && !el('reader-connect').disabled");
+   await evaluate("document.getElementById('reader-disconnect').click()");await until("lastState.reader.phase==='disconnected' && !busy && !refreshing && !el('reader-connect').disabled");
     await evaluate("document.getElementById('reader-connect').click()");
     await until("lastState.reader.phase==='connected' && document.querySelectorAll('.room-item').length===2 && !refreshing && !busy");
     assert.equal(await evaluate('!userSelected && reconnectRoom===null && currentPage.messages.length===0'),true);
@@ -336,7 +662,7 @@ try{
       await evaluate(`document.getElementById('${target==='account-panel'?'account-close':target}').${target==='account-panel'?'click()':'close()'}`);
       await refreshUi();
       const resumeDeadline=Date.now()+4000;while(seenCalls.length===beforeCovered){if(Date.now()>resumeDeadline)throw new Error('read did not resume after '+target);await sleep(50);}
-      assert.equal(seenCalls.length,beforeCovered+1);assert.equal(seenCalls.at(-1).notify,notify);assert.equal(unread.get(key),0);assert.equal(sendCalls.length,beforeCoveredSend);
+      assert.equal(seenCalls.length,beforeCovered+1,`${target} readSync=${notify} close must enqueue one seen request`);assert.equal(seenCalls.at(-1).notify,notify);assert.equal(unread.get(key),0);assert.equal(sendCalls.length,beforeCoveredSend);
     }
   }
   await refreshUi();
@@ -445,6 +771,10 @@ try{
   await evaluate("document.getElementById('photo-close').click()");await until("!document.getElementById('photo-dialog').open && !document.getElementById('photo-full').hasAttribute('src')");
   const image=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true});writeFileSync(resolve(folder,'synthetic-reader.png'),Buffer.from(image.data,'base64'));
   await call('Emulation.setDeviceMetricsOverride',{width:580,height:900,deviceScaleFactor:1,mobile:false});
+  // Reconnect restores a room without opening the mobile conversation. At
+  // this narrow width, explicitly open it before measuring real hover points.
+  await evaluate("document.querySelector('.room-item.selected').click()");
+  await until("document.querySelector('.app-shell').classList.contains('mobile-chat') && !busy && !refreshing && !ackInFlight && !pendingSelection");
   await evaluate("document.querySelectorAll('#message-list article.mine').item(document.querySelectorAll('#message-list article.mine').length-1).scrollIntoView({block:'center'})");await sleep(200);
   const narrowHover=await evaluate("(()=>{const all=document.querySelectorAll('#message-list article.mine'),r=all[all.length-1].getBoundingClientRect();return {x:r.left+r.width/2,y:r.top+10};})()");
   await call('Input.dispatchMouseEvent',{type:'mouseMoved',...narrowHover});await until("!document.getElementById('message-menu').hidden");
@@ -455,7 +785,9 @@ try{
   await until("document.getElementById('chat-title').textContent==='모의 대화방 B' && !document.getElementById('history-load').disabled");
   await evaluate("document.getElementById('pin-room').click()");
   await evaluate("document.getElementById('compose-text').value='재접속 초안';document.getElementById('compose-text').dispatchEvent(new Event('input'))");
-  await evaluate("document.getElementById('reader-disconnect').click()");await until("lastState.reader.phase==='disconnected' && !busy && !refreshing && !el('reader-connect').disabled");
+  // A room selection can enqueue history between separate CDP evaluations.
+  // Click once in the same task that observes this manual control enabled.
+  await until("!busy && !refreshing && !settingsBusy && !pendingSelection && !el('reader-disconnect').disabled && (el('reader-disconnect').click(),true)");await until("lastState.reader.phase==='disconnected' && !busy && !refreshing && !el('reader-connect').disabled");
   offlineMessages.set(second,['offline-A','offline-B','offline-C'].map((text,i)=>({key:'m_'+(100+i).toString(16).padStart(24,'0'),text,sender:'모의 사용자',mine:false,at:1800000200000+i*1000})));
   const beforeReconnectHistory=historyRooms.length,beforeReconnectSeen=seenCalls.length;
   await evaluate("document.getElementById('reader-connect').click()");
@@ -505,17 +837,38 @@ try{
   await call('Page.reload');await until("typeof personalSettings!=='undefined' && personalSettings?.persist===true && roomFilter==='pinned' && document.querySelectorAll('.room-item').length===1");
   assert.equal(await evaluate("document.querySelector('.room-item strong').textContent.startsWith('모의 대화방 B')"),true);
   await checkLifecycle();
+  await checkCapabilities();
+  await checkSelectionBusy();
+  await checkHeaderLayout();
+  await checkEmptyOpenContext();
+  await checkConflicts();
+  await checkMobileAndThemes();
+  await checkThemeBrowser();
+  await checkAdversarialBrowser();
   await evaluate("if(document.getElementById('account-panel').hidden)document.getElementById('account-toggle').click()");assert.equal(await evaluate("document.getElementById('account-panel').hidden"),false);
   await evaluate("document.getElementById('cancel').click()");await until("document.getElementById('reader-panel').hidden && document.getElementById('message-list').childElementCount===0");
   assert.equal(await evaluate("document.getElementById('chat-title').textContent"),'대화방을 선택해 주세요');
   assert.equal(await evaluate("pinnedRooms.size===0 && roomFilter==='all' && messageQuery==='' && document.getElementById('message-search-bar').hidden && document.getElementById('message-action-status').hidden"),true);
   assert.equal(await evaluate('reconnectRoom===null && selectedRoom===null && !userSelected && imageDraft===null && !imagePreparing'),true);
-  rejectNextQr=true;
-  await until("!document.getElementById('start').disabled");await evaluate("document.getElementById('start').click()");
-  await until("document.getElementById('diagnostic').textContent.includes('-151')");
-  assert.equal(await evaluate("document.getElementById('message').textContent.includes('지원하지 않는 인증 응답')"),true);
-  assert.equal(await evaluate("document.getElementById('reader-status').textContent"),'인증이 완료되지 않았습니다.');
-  assert.equal(await evaluate("document.getElementById('start').disabled && document.getElementById('qr').hidden"),true);
+  const finalQrBefore=app.lab.snapshot(),finalStartBefore=fixtureRequests.filter(row=>row.method==='POST' && row.path==='/api/start').length,finalStatusBefore=statusRequests;
+  let finalQrPassed=false;
+  try{
+    rejectNextQr=true;
+    await until("!document.getElementById('start').disabled");await evaluate("document.getElementById('start').click()");
+    await until("document.getElementById('diagnostic').textContent.includes('-151')");
+    assert.equal(await evaluate("document.getElementById('message').textContent.includes('지원하지 않는 인증 응답')"),true);
+    assert.equal(await evaluate("document.getElementById('reader-status').textContent"),'인증이 완료되지 않았습니다.');
+    assert.equal(await evaluate("document.getElementById('start').disabled && document.getElementById('qr').hidden"),true);
+    const finalAuth=app.lab.snapshot();assert.equal(finalAuth.phase,'blocked');assert.equal(finalAuth.stage,'poll');assert.equal(finalAuth.apiStatus,-151);
+    assert.equal(finalAuth.attempts-finalQrBefore.attempts,1);assert.equal(finalAuth.requests.poll-finalQrBefore.requests.poll,1);
+    assert.equal(fixtureRequests.filter(row=>row.method==='POST' && row.path==='/api/start').length-finalStartBefore,1);
+    assert.equal(finalAuth.authEvents.filter(event=>event.operation==='poll' && event.status===-151).length,1);
+    finalQrPassed=true;
+  }finally{
+    const auth=app.lab.snapshot();let ui;
+    try{ui=await evaluate("({phase:lastState?.phase??null,stage:lastState?.stage??null,apiStatus:lastState?.apiStatus??null,attempts:lastState?.attempts??null,requests:lastState?.requests??null,busy,refreshing,pollTimerScheduled:pollTimer!==null,diagnosticHasTarget:el('diagnostic').textContent.includes('-151')})");}catch{ui={observationUnavailable:true};}
+    writeFileSync(resolve(folder,'synthetic-final-qr.json'),JSON.stringify({passed:finalQrPassed,rejectNextQr,server:{phase:auth.phase,stage:auth.stage,apiStatus:auth.apiStatus,attempts:auth.attempts,requests:auth.requests,credentialInMemory:auth.credentialInMemory},ui,finalStartRequests:fixtureRequests.filter(row=>row.method==='POST' && row.path==='/api/start').length-finalStartBefore,statusRequestsDuringFinal:statusRequests-finalStatusBefore,pollRequestsDuringFinal:auth.requests.poll-finalQrBefore.requests.poll,finalMinus151Responses:auth.authEvents.filter(event=>event.operation==='poll' && event.status===-151).length,actualAccountUsed:false,rawValuesRecorded:false},null,2));
+  }
   console.log(JSON.stringify({passed:true,scope:'synthetic offline browser only',checks:['QR caching','room selection queue','DOM and scroll retention','hidden polling','text-only rendering','unread badge and total','local rename and reset','receipt count disappears on read','hidden/unfocused/scrolled room is not acknowledged','visible latest message acknowledgement','optional server read sync','IME Enter does not send','double-click sends once','unknown send preserves draft without retry','room pin ordering and filters retain selection and drafts','literal message search and result navigation','search does not acknowledge incoming messages','clipboard success and denial without OS clipboard access','pins survive transport reconnect and clear on account close','reconnect restores selected room and draft','offline messages fetched once without load button or read notification','cancel purges account data','QR -151 neutral message','all dialogs and account overlay block read and closing resumes eligible read','rejected photo draft is invalidated on reconnect','in-flight image preparation is canceled on reconnect and fresh selection remains usable','default automatic room does not become a reconnect target','changed and removed room targets stay isolated across reconnects','account close clears reconnect intent',...lifecycleChecks],visibleRequests,hiddenRequests,screenshot:folder+'/synthetic-reader.png',actualAccountUsed:false}));
   }
 }finally{

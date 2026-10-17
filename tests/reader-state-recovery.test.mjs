@@ -180,3 +180,179 @@ test('token and notification queues stay bounded while an older token cannot era
   const first=state.issue(rooms[0].key,message(1));for(let i=0;i<200;i++)state.issue(rooms[0].key,message(1));assert.equal(state.hasToken(first),false);
   const older=state.issue(rooms[0].key,message(1));state.receive(rooms[0].key,[incoming(2)]);state.seen(rooms[0].key,state.issue(rooms[0].key,message(2)));state.receive(rooms[0].key,[incoming(3)]);state.seen(rooms[0].key,older);assert.equal(state.decorate(rooms[0]).unreadLocalCount,1);
 });
+
+test('A-B-A re-enters and reuses only the matching room response token with Integer opt',async()=>{
+  const f=fixture(rows(2));let token=0;
+  f.reply=(method,body)=>method==='CHATONROOM'?{status:0,body:{c:String(body.chatId),o:String(++token===1?'900719925474099399':token)}}:undefined;
+  const {session,events,rooms:known}=await sessionFixture(f);
+  try{
+    await session.action(known[0].key,1,'context');
+    await session.action(known[0].key,2,'context');
+    await session.action(known[1].key,3,'context');
+    await session.action(known[0].key,4,'context');
+    const calls=f.calls.filter(call=>call.method==='CHATONROOM');
+    assert.equal(calls.length,3);assert.deepEqual(calls.map(call=>String(call.body.token)),['0','0','900719925474099399']);
+    for(const call of calls)assert.equal(call.body.opt,0);
+    const result=events.findLast(event=>event.type==='reader-action');
+    assert.equal(result.entryPhase,'acknowledged');assert.equal(result.receiptPhase,'unavailable');
+  }finally{session.close();}
+});
+
+test('manager exposes acknowledged entry independently of unavailable receipt members and re-enters A-B-A',async()=>{
+  const f=fixture(rows(2));f.reply=(method,body)=>method==='CHATONROOM'?{status:0,body:{c:String(body.chatId)}}:undefined;
+  const {reader}=await managerFixture(f),[a,b]=reader.rooms().rooms;
+  try{
+    assert.equal(reader.openRoom(a.key),true);await until(()=>!reader.snapshot().operationBusy);
+    assert.equal(reader.messages(a.key).entryPhase,'acknowledged');assert.equal(reader.messages(a.key).receiptPhase,'unavailable');
+    assert.equal(reader.openRoom(a.key),true);assert.equal(f.calls.length,1);
+    reader.openRoom(b.key);await until(()=>!reader.snapshot().operationBusy);
+    assert.equal(reader.messages(a.key).entryPhase,'idle');
+    reader.openRoom(a.key);await until(()=>!reader.snapshot().operationBusy);
+    assert.equal(f.calls.length,3);assert.equal(reader.messages(a.key).entryPhase,'acknowledged');
+  }finally{reader.close();}
+});
+
+function openStore(){
+  const store=createReaderStore({chatDatas:[{c:'123',t:'OM',li:'700',ll:'3',displayMembers:[{userId:'111',nickName:'Participant'}]},{c:'124',t:'OD',li:'701',title:'Explicit title'},{c:'125',t:'UNKNOWN',li:'702'}]},'999');
+  const key=store.rooms()[0].key;
+  return {store,key,link:{li:'700',ln:'Verified link name',ac:true,otk:8,ex:true},context:{c:'123',li:'700',o:'900719925474099399',olu:{userId:'999',lmt:2,opt:9,pv:'0'},notiRead:false,mt:0}};
+}
+test('known active member link plus exact own context enables separable open actions and verified names',()=>{
+  const {store,key,link,context}=openStore();
+  assert.equal(store.canAction(key,'context'),false);
+  assert.deepEqual(store.syncLinks({ltk:4,ols:[link,{li:'701',ln:'Other link name',ac:true},{li:'999',ln:'Not a member',ac:true}],dlis:[]}).length,2);
+  assert.equal(store.rooms().length,3);assert.equal(store.rooms()[0].title,'Verified link name');assert.equal(store.rooms()[1].title,'Explicit title');
+  assert.equal(store.canAction(key,'context'),true);assert.equal(store.canAction(key,'send'),false);
+  assert.equal(store.entrySnapshot(key,context,store.receiptVersion(key)),true);
+  for(const action of ['context','send','reply','photo','read'])assert.equal(store.canAction(key,action),true,action);
+  assert.equal(store.entryToken(key),'900719925474099399');assert.equal(store.entryOption(key),9);
+  assert.equal(store.rooms()[0].canRead,true,'notiRead is display state, not outgoing-read permission');
+  assert.equal(store.rooms().some(row=>row.title==='Not a member'),false);
+  assert.equal(/\"700\"|\"900719925474099399\"|\"rawType\"|\"olu\"/.test(JSON.stringify(store.rooms())),false);
+});
+
+test('open permissions fail closed for unknown own roles, foreign user, mute, expiry, deletion and invalid cursor',()=>{
+  for(const mutation of [context=>{context.olu.lmt=8;},context=>{context.olu.userId='111';},context=>{delete context.olu.lmt;},context=>{context.olu.opt=1.5;}]){
+    const {store,key,link,context}=openStore();store.syncLinks({ltk:0,ols:[link],dlis:[]});mutation(context);
+    assert.equal(store.entrySnapshot(key,context,store.receiptVersion(key)),true);
+    for(const action of ['send','reply','photo','read'])assert.equal(store.canAction(key,action),false);
+  }
+  const {store,key,link,context}=openStore();
+  assert.deepEqual(store.syncLinks({ltk:'0',ols:[link]}),[]);assert.equal(store.canAction(key,'context'),false);
+  store.syncLinks({ltk:0,ols:[link]});context.mt=42;store.entrySnapshot(key,context,store.receiptVersion(key));
+  for(const action of ['send','reply','photo'])assert.equal(store.canAction(key,action),false);assert.equal(store.canAction(key,'read'),true);
+  store.syncLinks({ltk:1,ols:[{...link,isExpired:true}]});assert.equal(store.canAction(key,'context'),false);
+  store.syncLinks({ltk:2,ols:[link],dlis:['700']});for(const action of ['context','send','reply','photo','read'])assert.equal(store.canAction(key,action),false);
+});
+
+test('open session sync is bounded, ordinary WRITE is shared, NOTIREAD carries li and deletion revokes actions',async()=>{
+  const f=fixture([{c:'123',t:'OM',li:'700',title:'Synthetic open',ll:'3',lastLog:{logId:'3',authorId:'111',msg:'Synthetic'}}]);
+  f.reply=(method,body)=>method==='SYNCLINK'?{status:0,body:{ltk:1,ols:[{li:'700',ln:'Synthetic link',ac:true}],dlis:[]}}:method==='CHATONROOM'?{status:0,body:{c:'123',li:'700',o:'8',olu:{userId:'999',lmt:2,opt:3,pv:'0'},mt:0,notiRead:false}}:method==='WRITE'?{status:0,body:{chatId:'123',msgId:body.msgId,logId:'4',authorId:'999',type:1}}:method==='NOTIREAD'?{status:0,body:{}}:undefined;
+  const {session,events,rooms:known}=await sessionFixture(f),key=known[0].key;
+  try{
+    assert.deepEqual(f.calls[0],{method:'SYNCLINK',body:{ltk:0}});assert.equal(known[0].canContext,true);assert.equal(known[0].canText,false);
+    await session.action(key,1,'context');assert.equal(events.findLast(event=>event.type==='reader-rooms').rooms[0].canText,true);
+    const target=events.findLast(event=>event.type==='reader-messages').messages[0].key;
+    await session.action(key,2,'read',{message:target});assert.deepEqual(f.calls.find(call=>call.method==='NOTIREAD').body,{chatId:'123',watermark:'3',li:'700'});
+    await session.action(key,3,'send',{text:'Synthetic text'});assert.equal(events.findLast(event=>event.type==='reader-action').phase,'accepted');
+    f.carriage.emit('push',{method:'SYNCLINKDL',status:0,body:{li:'700'}});
+    assert.equal(events.findLast(event=>event.type==='reader-rooms').rooms[0].canContext,false);
+    assert.equal(await session.action(key,4,'send',{text:'Must be blocked'}),false);
+    assert.equal(f.calls.filter(call=>call.method==='SYNCLINK').length,1);assert.equal(f.calls.filter(call=>call.method==='WRITE').length,1);assert.equal(f.calls.some(call=>call.method==='JOINLINK'),false);
+  }finally{session.close();}
+});
+
+test('link deletion during open CHATONROOM cannot restore an old permission snapshot',async()=>{
+  const held=deferred(),f=fixture([{c:'123',t:'OM',li:'700',title:'Synthetic open',ll:'3'}]);
+  f.reply=method=>method==='SYNCLINK'?{status:0,body:{ltk:0,ols:[{li:'700',ac:true}],dlis:[]}}:method==='CHATONROOM'?held.promise:undefined;
+  const {session,events,rooms:known}=await sessionFixture(f),key=known[0].key;
+  try{
+    const pending=session.action(key,1,'context');f.carriage.emit('push',{method:'SYNCLINKDL',status:0,body:{li:'700'}});
+    held.resolve({status:0,body:{c:'123',li:'700',olu:{userId:'999',lmt:2,opt:0}}});await pending;
+    assert.equal(events.findLast(event=>event.type==='reader-action').entryPhase,'failed');assert.equal(events.findLast(event=>event.type==='reader-rooms').rooms[0].canSend,false);
+    assert.equal(await session.action(key,2,'send',{text:'Synthetic'}),false);
+  }finally{held.resolve({status:0,body:{}});session.close();}
+});
+
+test('a late initial SYNCLINK cannot revive a link deleted while that request was pending',()=>{
+  const {store,key,link,context}=openStore(),versions=store.linkSyncSnapshot();
+  store.linkUpdate('SYNCLINKDL',{li:'700'});
+  assert.deepEqual(store.syncLinks({ltk:5,ols:[link],dlis:[]},versions),[]);
+  assert.equal(store.canAction(key,'context'),false);
+  assert.equal(store.entrySnapshot(key,context,store.receiptVersion(key)),true);
+  assert.equal(store.canSend(key),false);
+});
+
+test('open role and profile changes revoke the context and require a fresh matching own member',()=>{
+  for(const method of ['SYNCMEMT','SYNCLINKPF']){
+    const {store,key,link,context}=openStore();store.syncLinks({ltk:0,ols:[link]});store.entrySnapshot(key,context,store.receiptVersion(key));
+    assert.equal(store.canSend(key),true);
+    assert.deepEqual(store.linkUpdate(method,{c:'123',li:'701',olu:{userId:'999',lmt:8}}),[],'contradictory scope must not touch a room');
+    const version=store.receiptVersion(key);assert.equal(store.linkUpdate(method,{c:'123',li:'700',olu:{userId:'999',lmt:8}}).length,1);
+    assert.equal(store.canSend(key),false);assert.equal(store.canAction(key,'context'),true);
+    assert.equal(store.entrySnapshot(key,context,version),false);
+    context.olu.lmt=8;assert.equal(store.entrySnapshot(key,context,store.receiptVersion(key)),true);assert.equal(store.canSend(key),false);
+  }
+});
+
+test('membership invalidation during supplemental read inspection prevents a stale NOTIREAD',async()=>{
+  const held=deferred(),begun=deferred(),f=fixture([{c:'123',t:'DirectChat',title:'Synthetic',ll:'3',lastLog:{logId:'3',authorId:'111',msg:'Synthetic'}}]);
+  f.sdk.readProbe=true;
+  f.reply=method=>{if(method==='CHATINFO'){begun.resolve();return held.promise;}};
+  const {session,events,rooms:known}=await sessionFixture(f),key=known[0].key;
+  try{
+    await session.action(key,1,'context');const target=events.findLast(event=>event.type==='reader-messages').messages[0].key;
+    const pending=session.action(key,2,'read',{message:target});await begun.promise;
+    f.carriage.emit('push',{method:'NEWMEM',status:0,body:{c:'123'}});
+    held.resolve({status:0,body:{chatInfo:{c:'123',lastSeenLogId:'0'}}});await pending;
+    assert.equal(f.calls.some(call=>call.method==='NOTIREAD'),false);
+    assert.equal(events.findLast(event=>event.type==='reader-action').phase,'failed');assert.equal(events.some(event=>event.type==='reader-failed'),false);
+  }finally{held.resolve({status:0,body:{}});session.close();}
+});
+
+test('link metadata batches reject duplicates and alias conflicts without choosing a permissive array order',()=>{
+  for(const ols of [
+    [{li:'700',ac:true},{li:'700',ac:false}],
+    [{li:'700',ac:false},{li:'700',ac:true}],
+    [{li:'700',ac:true},{li:'999',linkId:'700',ac:true}],
+  ]){
+    const {store,key,link}=openStore();store.syncLinks({ltk:0,ols:[link]});assert.equal(store.canAction(key,'context'),true);
+    store.syncLinks({ltk:1,ols});assert.equal(store.canAction(key,'context'),false);
+    assert.equal(store.missingOpenLinkIds().includes('700'),false,'ambiguous known metadata is not an absent-link retry target');
+    const fresh=openStore();fresh.store.infoLinks({ols},['700'],fresh.store.linkSyncSnapshot());assert.equal(fresh.store.canAction(fresh.key,'context'),false);
+  }
+});
+
+test('optional INFOLINK rejection, throw and wrong method keep startup connected with actions disabled',async()=>{
+  for(const mode of ['rejected','throw','wrong-method']){
+    const f=fixture([{c:'123',t:'OM',li:'700',title:'Synthetic open'}]);
+    f.reply=method=>{
+      if(method==='SYNCLINK')return {status:0,body:{ltk:0}};
+      if(method==='INFOLINK'){
+        if(mode==='throw')throw new Error('synthetic optional metadata timeout');
+        return {status:mode==='rejected'?-203:0,method:mode==='wrong-method'?'SYNCLINK':'INFOLINK',body:{ols:[{li:'700',ac:true}]}};
+      }
+    };
+    const {session,events,rooms:known}=await sessionFixture(f);
+    try{
+      assert.equal(known[0].canContext,false);assert.equal(known[0].canText,false);
+      assert.equal(f.calls.filter(call=>call.method==='INFOLINK').length,1);
+      assert.equal(f.calls.some(call=>['CHATONROOM','NOTIREAD','WRITE','SHIP','JOINLINK'].includes(call.method)),false);
+      assert.equal(events.some(event=>event.type==='reader-failed'),false);
+    }finally{session.close();}
+  }
+});
+
+test('initial INFOLINK waiting on the transport cannot revive metadata after a deletion push',async()=>{
+  const held=deferred(),begun=deferred(),f=fixture([{c:'123',t:'OM',li:'700',title:'Synthetic open'}]);
+  f.reply=method=>method==='SYNCLINK'?{status:0,body:{ltk:0}}:method==='INFOLINK'?(begun.resolve(),held.promise):undefined;
+  const events=[],session=createReaderSession(credential,f.sdk,event=>events.push(event));let pending;
+  try{
+    pending=session.start();await begun.promise;
+    f.carriage.emit('push',{method:'SYNCLINKDL',status:0,body:{li:'700'}});
+    held.resolve({status:0,body:{ols:[{li:'700',ln:'Stale synthetic link',ac:true}]}});
+    assert.equal((await pending).ok,true);
+    const room=events.findLast(event=>event.type==='reader-rooms').rooms[0];assert.equal(room.canContext,false);assert.equal(room.canSend,false);
+    assert.notEqual(room.title,'Stale synthetic link');assert.equal(f.calls.filter(call=>call.method==='INFOLINK').length,1);
+  }finally{held.resolve({status:0,body:{ols:[]}});await pending;session.close();}
+});

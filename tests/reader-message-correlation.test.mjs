@@ -136,3 +136,98 @@ test('writeAccepted checks all provided room aliases without mutating foreign-ro
   for(const body of [{logId:'1',c:'456'},{logId:'1',chatId:'123',roomId:'456'},{chatId:'123',chatLog:{logId:'1',c:'456'}}])assert.equal(store.writeAccepted(key,body,'synthetic'),null);
   assert.equal(store.current(key).messages.length,0);assert.ok(store.writeAccepted(key,{chatId:'123',logId:'1'},'synthetic'));
 });
+
+test('a completed CHATONROOM response cannot settle a later A-B-A entry by method fallback',async()=>{
+  const client=make(),first=client.request('CHATONROOM',{chatId:'123'});
+  const old={packetId:1,method:'CHATONROOM',status:0,body:{c:'123',o:'20'}};
+  client.finishPacket(old);await first;
+  const middle=client.request('CHATONROOM',{chatId:'456'});
+  client.finishPacket({packetId:2,method:'CHATONROOM',status:0,body:{c:'456'}});await middle;
+  const next=client.request('CHATONROOM',{chatId:'123'});
+  client.finishPacket(old);assert.equal(client.pending.has(3),true);
+  client.finishPacket({packetId:3,method:'CHATONROOM',status:0,body:{c:'123',o:'21'}});await next;
+});
+
+test('review: late NOTIREAD A ACK never completes B without exact or matching independent room identity',async()=>{
+  const client=make(),first=client.request('NOTIREAD',{chatId:'123',watermark:'10'});
+  const old={packetId:1,method:'NOTIREAD',status:0,body:{}};client.finishPacket(old);await first;
+  const next=client.request('NOTIREAD',{chatId:'456',watermark:'20'});
+  try{
+    for(const packet of [old,{packetId:900,method:'NOTIREAD',status:0,body:{}},{packetId:2,method:'NOTIREAD',status:0,body:{c:'123'}},{packetId:2,method:'NOTIREAD',status:0,body:{c:'456',chatInfo:{chatId:'123'}}}]){
+      client.finishPacket(packet);assert.equal(client.pending.has(2),true);
+    }
+    client.finishPacket({packetId:901,method:'NOTIREAD',status:0,body:{c:'456'}});await next;
+  }finally{for(const [packetId,item] of client.pending){client.pending.delete(packetId);item.resolve({packetId,method:item.method,status:0,body:{}});}await next;}
+});
+
+test('review: uncorrelated response-only failures cannot become pushes or terminate another room session',async()=>{
+  for(const method of ['CHATONROOM','CHATINFO','NOTIREAD']){
+    const client=make(),next=client.request(method,{chatId:'456'});let pushes=0;
+    client.on('push',()=>pushes++);
+    try{
+      client.finishPacket({packetId:900,method,status:-203,body:{status:-203,c:'123'}});
+      client.finishPacket({packetId:1,method,status:-203,body:{status:-203,c:'123'}});
+      assert.equal(client.pending.has(1),true);assert.equal(pushes,0);
+      client.finishPacket({packetId:1,method,status:0,body:{c:'456'}});assert.equal((await next).status,0);
+    }finally{for(const [packetId,item] of client.pending){client.pending.delete(packetId);item.resolve({packetId,method:item.method,status:0,body:{}});}await next;}
+  }
+});
+
+test('review: stale nonzero A entry/read replies leave B session connected until its own exact response',async()=>{
+  const carriage=Object.assign(make(),{async connect(){},disconnect(){},stopPing(){},async loginList(){return {status:0,body:{chatDatas:[{c:'123',t:'DirectChat',title:'Synthetic A'},{c:'456',t:'DirectChat',title:'Synthetic B'}]}};}}),events=[];
+  const bootstrap=()=>Object.assign(new EventEmitter(),{async connect(){},disconnect(){},async request(){return {status:0,body:{ticket:{lsl:['synthetic.kakao.com']},wifi:{ports:[443]}}};},async checkin(){return {status:0,host:'synthetic.kakao.com',port:443};}});
+  const session=createReaderSession({userId:'999',accessToken:'SYNTHETIC',deviceUUID:'SYNTHETIC'},{messaging:true,booking:bootstrap,ticket:bootstrap,carriage:()=>carriage,toLong:String,resolve:async host=>host,every:()=>0},event=>events.push(event));let pending;
+  try{
+    await session.start();const key=events[0].rooms[1].key;
+    pending=session.action(key,1,'context');
+    carriage.finishPacket({packetId:1,method:'CHATONROOM',status:-203,body:{c:'123',status:-203}});
+    assert.equal(carriage.pending.has(1),true);assert.equal(events.some(event=>event.type==='reader-failed'),false);
+    carriage.finishPacket({packetId:1,method:'CHATONROOM',status:0,body:{c:'456'}});await pending;
+    carriage.emit('push',{method:'MSG',status:0,body:{chatId:'456',chatLog:{logId:'20',authorId:'111',msg:'Synthetic'}}});
+    const message=events.findLast(event=>event.type==='reader-messages').messages[0].key;
+    pending=session.action(key,2,'read',{message});await Promise.resolve();
+    carriage.finishPacket({packetId:900,method:'NOTIREAD',status:-203,body:{c:'123',status:-203}});
+    assert.equal(carriage.pending.has(2),true);assert.equal(events.some(event=>event.type==='reader-failed'),false);
+    carriage.finishPacket({packetId:2,method:'NOTIREAD',status:0,body:{}});await pending;
+    assert.equal(events.findLast(event=>event.type==='reader-action').phase,'accepted');assert.equal(events.some(event=>event.type==='reader-failed'),false);
+  }finally{for(const [packetId,item] of carriage.pending){carriage.pending.delete(packetId);item.resolve({packetId,method:item.method,status:0,body:{c:'456'}});}await pending;session.close();}
+});
+
+function settleCorrelationPending(client){for(const [packetId,item] of client.pending){client.pending.delete(packetId);item.resolve({packetId,method:item.method,status:0,body:{}});}}
+
+for(const method of ['CHATONROOM','CHATINFO','NOTIREAD']){
+  for(const [name,body] of [
+    ['nested id only',{chatInfo:{id:'123'}}],
+    ['outer correct and nested id conflicting',{c:'456',chatInfo:{id:'123'}}],
+  ])test('alias: '+method+' exact packet rejects '+name,async()=>{
+    const client=make(),waiting=client.request(method,{chatId:'456'});
+    try{
+      client.finishPacket({packetId:1,method,status:0,body});assert.equal(client.pending.has(1),true);
+      client.finishPacket({packetId:1,method,status:0,body:{chatInfo:{id:'456'}}});await waiting;
+    }finally{settleCorrelationPending(client);await waiting;}
+  });
+
+  test('alias: '+method+' method fallback rejects conflicting chatInfo.id',async()=>{
+    const client=make(),waiting=client.request(method,{chatId:'456'});
+    try{
+      client.finishPacket({packetId:900,method,status:0,body:{c:'456',chatInfo:{id:'123'}}});assert.equal(client.pending.has(1),true);
+      client.finishPacket({packetId:1,method,status:0,body:{c:'456'}});await waiting;
+    }finally{settleCorrelationPending(client);await waiting;}
+  });
+
+  for(const packetId of [1,900])test('alias: '+method+' accepts matching chatInfo.id via '+(packetId===1?'exact packet':'unique fallback'),async()=>{
+    const client=make(),waiting=client.request(method,{chatId:'456'});
+    try{
+      client.finishPacket({packetId,method,status:0,body:{chatInfo:{id:'456'}}});assert.equal(client.pending.has(1),false);await waiting;
+    }finally{settleCorrelationPending(client);await waiting;}
+  });
+
+  test('alias: '+method+' keeps chatLog.id and log.id as message identities',async()=>{
+    for(const packetId of [1,900]){
+      const client=make(),waiting=client.request(method,{chatId:'456'});
+      try{
+        client.finishPacket({packetId,method,status:0,body:{c:'456',chatLog:{id:'123'},log:{id:'777'}}});assert.equal(client.pending.has(1),false);await waiting;
+      }finally{settleCorrelationPending(client);await waiting;}
+    }
+  });
+}

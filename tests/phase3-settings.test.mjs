@@ -1,7 +1,7 @@
-import test from 'node:test';
+import test,{after} from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync,readdirSync,readFileSync,writeFileSync } from 'node:fs';
-import { resolve,join } from 'node:path';
+import { mkdirSync,mkdtempSync,readdirSync,readFileSync,writeFileSync,rmSync } from 'node:fs';
+import { resolve,join,sep } from 'node:path';
 import { EventEmitter } from 'node:events';
 import { createPreferenceStore,preferenceId } from '../experiments/local-web/preferences.mjs';
 import { createRoomState } from '../experiments/local-web/reader-room-state.mjs';
@@ -9,26 +9,41 @@ import { createReaderStore } from '../experiments/local-web/reader-data.mjs';
 import { createReadOnlyReader } from '../experiments/local-web/reader-manager.mjs';
 import { photoAttachments,photoUrl,fetchPhoto,imageType,createPhotoCache } from '../experiments/local-web/photos.mjs';
 import { createLocalServer } from '../experiments/local-web/server.mjs';
-const folder=()=>mkdtempSync(join(resolve('local-only'),'settings-test-'));
+
+// Browser control is granted only by the local launcher capability exchange.
+async function browserSession(app,url){
+  const issue=await fetch(url+'/api/local/launch',{method:'POST',headers:{Origin:url,'Content-Type':'application/json','X-Local-Control':app.controlToken},body:'{}'});
+  assert.equal(issue.status,200);assert.equal(issue.headers.get('set-cookie'),null);
+  const {ticket}=await issue.json();assert.match(ticket,/^[a-f0-9]{64}$/);
+  const session=await fetch(url+'/api/local/session',{method:'POST',headers:{Origin:url,'Content-Type':'application/json'},body:JSON.stringify({ticket})});
+  assert.equal(session.status,200);
+  const cookie=session.headers.get('set-cookie');assert.match(cookie,/HttpOnly; SameSite=Strict/);
+  return {cookie:cookie.split(';')[0],response:session};
+}
+const output=resolve('local-only/qa-adversarial-20261017/fixtures'),directories=[];
+const folder=()=>{mkdirSync(output,{recursive:true});const path=mkdtempSync(join(output,'settings-test-'));directories.push(path);return path;};
+// Persistence behavior uses synthetic files; Windows ACL enforcement has separate mocked contracts.
+const syntheticFolder=path=>path;
+after(()=>{for(const path of directories){assert.ok(resolve(path).startsWith(output+sep));rmSync(path,{recursive:true,force:true});}});
 const room='r_'+'a'.repeat(24),message='m_'+'b'.repeat(24),secret=Buffer.alloc(32,9),privateUrl='https://talkv.kakao.com/synthetic/private-photo';
 const incoming=(key=message)=>({key,incoming:true,afterBaseline:true,userMessage:true});
 test('explicit persistence survives a new store without writing raw account or room IDs',()=>{
-  const directory=folder(),store=createPreferenceStore({folder:directory}),profile=store.account('12345678901234567890');
+  const directory=folder(),store=createPreferenceStore({folder:directory,secureFolder:syntheticFolder}),profile=store.account('12345678901234567890');
   const key=preferenceId(profile.key(),'room','12345678901234567890','99998888777766665555');
   assert.equal(profile.setRoom(key,{title:'합성 이름',pinOrder:2,muted:true}),true);assert.equal(readdirSync(directory).length,0);
   assert.equal(profile.set({persist:true,notifications:true,readSync:true,roomFilter:'pinned'}),true);
   const json=readdirSync(directory).filter(path=>path.endsWith('.json'));assert.equal(json.length,1);
   const raw=readFileSync(join(directory,json[0]),'utf8');for(const value of ['12345678901234567890','99998888777766665555','accessToken','password','messages'])assert.equal(raw.includes(value),false);
-  profile.close();const next=createPreferenceStore({folder:directory}).account('12345678901234567890');
+  profile.close();const next=createPreferenceStore({folder:directory,secureFolder:syntheticFolder}).account('12345678901234567890');
   assert.equal(next.snapshot().persist,true);assert.equal(next.snapshot().readSync,true);assert.equal(next.room(key).title,'합성 이름');
 });
 test('account settings isolate identities and disabling storage deletes only that account file',()=>{
-  const directory=folder(),store=createPreferenceStore({folder:directory}),one=store.account('111'),two=store.account('222');
+  const directory=folder(),store=createPreferenceStore({folder:directory,secureFolder:syntheticFolder}),one=store.account('111'),two=store.account('222');
   one.set({persist:true,notifications:true});two.set({persist:true,readSync:true});assert.equal(readdirSync(directory).filter(p=>p.endsWith('.json')).length,2);
   assert.equal(one.set({persist:false}),true);assert.equal(one.snapshot().notifications,true);assert.equal(two.snapshot().readSync,true);
   assert.equal(readdirSync(directory).filter(p=>p.endsWith('.json')).length,1);
-  assert.equal(createPreferenceStore({folder:directory}).account('111').snapshot().notifications,false);
-  assert.equal(createPreferenceStore({folder:directory}).account('222').snapshot().readSync,true);
+  assert.equal(createPreferenceStore({folder:directory,secureFolder:syntheticFolder}).account('111').snapshot().notifications,false);
+  assert.equal(createPreferenceStore({folder:directory,secureFolder:syntheticFolder}).account('222').snapshot().readSync,true);
 });
 test('storage failure is reported without committing or losing in-memory settings',()=>{
   const profile=createPreferenceStore({folder:folder(),secureFolder:()=>{throw new Error('fixture');}}).account('111');
@@ -36,10 +51,10 @@ test('storage failure is reported without committing or losing in-memory setting
   assert.equal(profile.snapshot().persist,false);assert.equal(profile.snapshot().readSync,true);assert.equal(profile.snapshot().storageError,true);
 });
 test('damaged settings or installation keys do not expose another account or stop memory-only use',()=>{
-  const directory=folder(),one=createPreferenceStore({folder:directory}).account('111');one.set({persist:true});
+  const directory=folder(),one=createPreferenceStore({folder:directory,secureFolder:syntheticFolder}).account('111');one.set({persist:true});
   const path=readdirSync(directory).find(p=>p.endsWith('.json'));writeFileSync(join(directory,path),'{bad');
-  const damaged=createPreferenceStore({folder:directory}).account('111');assert.equal(damaged.snapshot().storageError,true);assert.equal(damaged.snapshot().notifications,false);
-  writeFileSync(join(directory,'identity.key'),'bad');const broken=createPreferenceStore({folder:directory}).account('111');
+  const damaged=createPreferenceStore({folder:directory,secureFolder:syntheticFolder}).account('111');assert.equal(damaged.snapshot().storageError,true);assert.equal(damaged.snapshot().notifications,false);
+  writeFileSync(join(directory,'identity.key'),'bad');const broken=createPreferenceStore({folder:directory,secureFolder:syntheticFolder}).account('111');
   assert.equal(broken.snapshot().storageAvailable,false);assert.equal(broken.set({readSync:true}),true);assert.equal(broken.set({persist:true}),false);
 });
 test('settings accept only bounded names and known options, with separate HMAC domains',()=>{
@@ -49,7 +64,7 @@ test('settings accept only bounded names and known options, with separate HMAC d
   assert.notEqual(id,preferenceId(secret,'room','222','111'));assert.notEqual(id,preferenceId(secret,'account','111','222'));
 });
 test('a changed installation key is not overwritten by an older running session',()=>{
-  const directory=folder(),profile=createPreferenceStore({folder:directory}).account('111');
+  const directory=folder(),profile=createPreferenceStore({folder:directory,secureFolder:syntheticFolder}).account('111');
   const replacement=Buffer.alloc(32,7);writeFileSync(join(directory,'identity.key'),replacement);
   assert.equal(profile.set({persist:true}),false);assert.equal(readFileSync(join(directory,'identity.key')).equals(replacement),true);
 });
@@ -111,7 +126,7 @@ test('new settings and photo routes preserve authentication, CSRF and private UR
   const url=await app.listen(0);
   try{
     assert.equal((await fetch(url+'/api/preferences')).status,403);
-    const home=await fetch(url+'/'),cookie=home.headers.get('set-cookie').split(';')[0],state=await(await fetch(url+'/api/status',{headers:{cookie}})).json();
+    const {cookie}=await browserSession(app,url),state=await(await fetch(url+'/api/status',{headers:{cookie}})).json();
     const post=(path,body,origin=url)=>fetch(url+path,{method:'POST',headers:{cookie,Origin:origin,'Content-Type':'application/json','X-CSRF-Token':state.csrf},body:JSON.stringify(body)});
     await post('/api/start',{});await new Promise(resolve=>setTimeout(resolve,2100));
     assert.equal((await post('/api/preferences',{notifications:true},'https://evil.test')).status,403);

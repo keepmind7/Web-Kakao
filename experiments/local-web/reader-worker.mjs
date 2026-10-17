@@ -43,19 +43,20 @@ process.on('message',async message=>{
     }catch(error){diagnostic?.end('startup-fault',error);send({type:'reader-failed',stage:'worker',status:null});}
     return;
   }
+  if(message?.type==='reader-view' && session && roomKeyValid(message.key)){session.view(message.key);return;}
   if(message?.type==='reader-history' && session && roomKeyValid(message.key) && Number.isSafeInteger(message.requestId)){
-    if(operationBusy){send({type:'reader-request-rejected',requestId:message.requestId});return;}
+    if(operationBusy){send({type:'reader-request-rejected',key:message.key,requestId:message.requestId});return;}
     operationBusy=true;bound();
     const accepted=await session.history(message.key,message.requestId);clearTimeout(operationTimer);
     operationBusy=false;
-    if(!accepted)send({type:'reader-request-rejected',requestId:message.requestId});
+    if(!accepted)send({type:'reader-request-rejected',key:message.key,requestId:message.requestId});
   }
   if(message?.type==='reader-action' && session && roomKeyValid(message.key) && Number.isSafeInteger(message.requestId)){
-    if(operationBusy){send({type:'reader-request-rejected',requestId:message.requestId});return;}
+    if(operationBusy){send({type:'reader-request-rejected',key:message.key,requestId:message.requestId});return;}
     operationBusy=true;bound(message.action==='photo'?70000:24000);
     const accepted=await session.action(message.key,message.requestId,message.action,message.payload);
     clearTimeout(operationTimer);operationBusy=false;
-    if(!accepted)send({type:'reader-request-rejected',requestId:message.requestId});
+    if(!accepted)send({type:'reader-request-rejected',key:message.key,requestId:message.requestId});
   }
 });
 send({type:'reader-ready'});
