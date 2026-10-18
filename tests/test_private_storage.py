@@ -124,8 +124,24 @@ class PrivateStorageContracts(unittest.TestCase):
         module = load_private()
         with tempfile.TemporaryDirectory() as tmp:
             project, appdata = Path(tmp) / "한글 설치", Path(tmp) / "AppData"
-            expected = hashlib.sha256(str(project.resolve()).replace("\\", "/").lower().encode()).hexdigest()[:16]
+            expected = hashlib.sha256(os.path.abspath(project).replace("\\", "/").lower().encode()).hexdigest()[:16]
             self.assertEqual(module.data_root(project, appdata), appdata / "WebKakao" / expected)
+
+    def test_install_identity_preserves_lexical_alias_and_nonexistent_project_without_io(self):
+        module = load_private()
+        with tempfile.TemporaryDirectory() as tmp:
+            # A short-name-shaped alias must not be expanded or require a real
+            # project. Python and Node use the same lexical absolute identity.
+            project = Path(tmp) / "SYNTH~1" / "not-created"
+            appdata = Path(tmp) / "AppData"
+            expected = hashlib.sha256(os.path.abspath(project).replace("\\", "/").lower().encode()).hexdigest()[:16]
+            with patch.object(Path, "resolve", side_effect=AssertionError("no alias resolution")), \
+                    patch.object(os.path, "realpath", side_effect=AssertionError("no alias resolution")), \
+                    patch.object(Path, "mkdir", side_effect=AssertionError("no storage writes")), \
+                    patch.object(Path, "open", side_effect=AssertionError("no storage reads")):
+                self.assertEqual(module.data_root(project, appdata), appdata / "WebKakao" / expected)
+            self.assertFalse(project.exists())
+            self.assertFalse(appdata.exists())
 
     @unittest.skipUnless(NODE_PRIVATE.is_file() and NODE.is_file() or STRICT, "Node private-storage calculation not implemented")
     def test_python_and_node_install_roots_agree_without_creating_a_directory(self):

@@ -71,7 +71,7 @@ export function createReadOnlyReader({spawn=fork,now=Date.now,onBlocked=()=>{},g
     for(const row of rooms){const saved=profile?.room(preferenceKeys.get(row.key));if(saved)roomState.settings(row.key,saved);}
     roomState.notifications(profile?.snapshot().notifications===true);
   }
-  function action(key,kind,payload={}){
+  function action(key,kind,payload={},outboxEntry=null){
     const capability={context:'canContext',read:'canRead',photo:'canPhoto',send:payload.replyTo!==undefined?'canReply':'canText'}[kind];
     if(!messaging || phase!=='connected' || pending || !capability || !rooms.some(row=>row.key===key && row[capability]))return false;
     if(activeRoom!==key){if(activeRoom){entries.delete(activeRoom);touch(activeRoom);}entries.delete(key);activeRoom=key;}
@@ -79,6 +79,9 @@ export function createReadOnlyReader({spawn=fork,now=Date.now,onBlocked=()=>{},g
     const requestId=++request;pending={key,requestId,action:kind,clientId:payload.clientId,message:payload.message};
     if(kind==='read')readStates.set(key,{phase:'sending',messageKey:payload.message});
     deadline=setTimeout(()=>fail(kind),kind==='photo'?72000:26000);deadline.unref?.();
+    // Publish only admitted sends, before IPC can fail synchronously. Failure
+    // cleanup must find this entry to preserve its identity as unknown.
+    if(outboxEntry){outbox.set(outboxEntry.clientId,outboxEntry);sendRequests++;outboxRevision++;}
     send({type:'reader-action',key,requestId,action:kind,payload});touch(key);revision++;return true;
   }
   function terminate(){
@@ -153,16 +156,14 @@ export function createReadOnlyReader({spawn=fork,now=Date.now,onBlocked=()=>{},g
       const payloadHash=createHash('sha256').update(JSON.stringify(['text',value,replyTo ?? null])).digest('hex'),existing=outbox.get(clientId) ?? retired.get(clientId);
       if(existing)return existing.key===key && existing.payloadHash===payloadHash;
       if(replyTo!==undefined && !pages.get(key)?.messages.some(row=>row.key===replyTo && row.canReply))return false;
-      if(!capacity() || !action(key,'send',{text:value,clientId,...(replyTo?{replyTo}:{})}))return false;
-      outbox.set(clientId,{key,clientId,payloadHash,kind:'send',phase:'sending',status:null});sendRequests++;outboxRevision++;touch(key);return true;
+      return capacity() && action(key,'send',{text:value,clientId,...(replyTo?{replyTo}:{})},{key,clientId,payloadHash,kind:'send',phase:'sending',status:null});
     },
     sendPhoto(key,value,clientId){
       if(!clientIdValid(clientId))return false;
       const image=decodeImage(value);if(!image)return false;
       const payloadHash=createHash('sha256').update('photo:').update(image.data).digest('hex'),existing=outbox.get(clientId) ?? retired.get(clientId);
       if(existing)return existing.key===key && existing.payloadHash===payloadHash;
-      if(!capacity() || !action(key,'photo',{image:value,clientId}))return false;
-      outbox.set(clientId,{key,clientId,payloadHash,kind:'photo',phase:'sending',status:null});sendRequests++;outboxRevision++;touch(key);return true;
+      return capacity() && action(key,'photo',{image:value,clientId},{key,clientId,payloadHash,kind:'photo',phase:'sending',status:null});
     },
     connect(credential,{signal:authSignal}={}){
       if(!['idle','disconnected'].includes(phase) || consecutiveFailures>=3 || authSignal?.aborted)return false;

@@ -1,0 +1,5 @@
+# Python >= 3.11 is required (interpreter installation is separate).
+# Web-Kakao's Python launcher, preparation tools and tests use only the standard library.
+# There are currently no third-party Python packages to install with pip.
+# Node.js and its locked npm dependencies are prepared by tools/prepare_*.py;
+# see README.md. Browsers and optional REA/JDK/JADX/ADB tools are not pip dependencies.

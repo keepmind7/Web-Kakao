@@ -22,6 +22,7 @@ class BrowserOpenTests(unittest.TestCase):
         self.url, self.ticket = "http://127.0.0.1:46321", "b" * 64
         self.environment = {"ProgramFiles": str(self.folder / "Program Files"),
                             "ProgramFiles(x86)": str(self.folder / "Program Files x86"),
+                            "ProgramW6432": str(self.folder / "Program Files native64"),
                             "LOCALAPPDATA": str(self.folder / "Local App Data"),
                             "BROWSER": "cmd /c SYNTHETIC_MUST_NOT_EXECUTE",
                             "PATH": str(self.folder / "hostile-path")}
@@ -122,6 +123,20 @@ class BrowserOpenTests(unittest.TestCase):
 
     def test_chrome_localappdata_install_is_allowed_without_path_search(self):
         self.explicit("chrome", "LOCALAPPDATA")
+
+    def test_32bit_python_finds_64bit_chrome_in_programw6432(self):
+        # On Windows x64, a 32-bit Python sees both ProgramFiles aliases as x86.
+        # Every path is synthetic; no installed browser or process is used.
+        aliases = {"ProgramFiles": self.environment["ProgramFiles(x86)"],
+                   "ProgramFiles(x86)": self.environment["ProgramFiles(x86)"]}
+        with patch.dict(os.environ, aliases):
+            self.explicit("chrome", "ProgramW6432")
+
+    def test_32bit_python_finds_64bit_edge_in_programw6432(self):
+        aliases = {"ProgramFiles": self.environment["ProgramFiles(x86)"],
+                   "ProgramFiles(x86)": self.environment["ProgramFiles(x86)"]}
+        with patch.dict(os.environ, aliases):
+            self.explicit("edge", "ProgramW6432")
 
     def test_explicit_oserror_after_ticket_does_not_expose_fragment(self):
         self.installed("chrome")

@@ -180,7 +180,7 @@ def find_browser(name):
              "edge": Path("Microsoft/Edge/Application/msedge.exe")}
     if name not in tails:
         return None
-    for variable in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
+    for variable in ("ProgramFiles", "ProgramW6432", "ProgramFiles(x86)", "LOCALAPPDATA"):
         value = os.environ.get(variable)
         if not value or not Path(value).is_absolute():
             continue

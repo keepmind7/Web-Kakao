@@ -26,10 +26,29 @@ class ToolCase(unittest.TestCase):
                             'missing PC helper: ' + filename)
         self.prepare = importlib.import_module('tools.prepare_rea_windows')
         self.runner = importlib.import_module('tools.rea_pc')
-        # All writes stay in this test-owned temporary tree.
-        self.temporary = tempfile.TemporaryDirectory(prefix='rea-pc-test-')
-        self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name)
+        # The production Ghidra temp restriction covers the entire absolute
+        # path. A dotted Windows username is an invalid *analysis fixture*, so
+        # choose an existing dot-free temporary parent without relaxing it.
+        candidates = [Path(tempfile.gettempdir())]
+        if os.name == 'nt':
+            candidates.append(Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'Temp')
+        parent = next((path.resolve() for path in candidates
+                       if '.' not in str(path.resolve()) and path.is_dir()), None)
+        self.assertIsNotNone(parent, 'REA fixture requires a writable dot-free temporary parent')
+        self.temporary = tempfile.TemporaryDirectory(prefix='webkakao-rea-test-', dir=parent)
+        created = Path(self.temporary.name)
+        self.assertEqual(created.parent.resolve(), parent)
+        self.assertNotIn('.', str(created.resolve()))
+        self.root = created
+
+        def cleanup_owned_tree():
+            # Validate the exclusive random test tree before recursive cleanup.
+            self.prepare.checked_path(created, parent)
+            if created.parent != parent or not created.name.startswith('webkakao-rea-test-'):
+                raise ValueError('unsafe_test_cleanup')
+            self.temporary.cleanup()
+
+        self.addCleanup(cleanup_owned_tree)
 
     def archive(self, entries):
         archive = self.root / 'asset.zip'
@@ -329,6 +348,21 @@ class ArchiveTests(ToolCase):
 
 
 class RunnerTests(ToolCase):
+    def test_dotted_project_temp_is_rejected_before_any_engine_or_output(self):
+        self.root = self.root / 'synthetic.user'
+        self.root.mkdir()
+        self.fixture()
+        with self.assertRaisesRegex(ValueError, 'runtime_requires_dot_free_project_temp'):
+            self.runner.load_runtime(self.root)
+        with patch.object(self.runner, 'ROOT', self.root), \
+                patch.object(self.runner.subprocess, 'Popen', side_effect=AssertionError('must not spawn')) as spawn, \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as failure:
+            self.runner.main(['doctor', '--label', 'dotted'])
+        self.assertEqual(failure.exception.code, 2)
+        spawn.assert_not_called()
+        self.assertFalse((self.root / 'local-only/rea-evidence').exists())
+        self.assertFalse((self.root / 'local-only/rea-temp').exists())
+
     def test_unhealthy_zero_exit_is_a_failed_receipt(self):
         self.fixture()
         code, receipt, _, _ = self.invoke(['doctor', '--label', 'unhealthy'],
