@@ -5,7 +5,10 @@ let refreshing=false,hasAccount=false,readerGeneration=0,readerRevision=-1,selec
 let pendingSelection=null,reconnectRoom=null,readerInstance=null;
 let roomsRevision=-1,outboxRevision=-1,outboxEpoch=0,viewPin=null,viewPinEpoch=0,outboxAcknowledging=false,acknowledgingClientId=null;
 let localAuthorizationRequired=false,foregroundFocused=document.hasFocus();
-const pageRevisions=new Map(),contextDispatches=new Set();
+// Port-scoped session from the launch ticket exchange; sessionStorage only survives reload in this tab.
+let localSession=null;try{const saved=sessionStorage.getItem('webKakaoLocalSession');if(/^[a-f0-9]{64}$/.test(saved ?? ''))localSession=saved;}catch{}
+const pageRevisions=new Map(),contextDispatches=new Set(),contextRetryAt=new Map();
+let photoDownload=null,photoDownloadEpoch=0;
 let restoredOutbox=[];
 let renderedRooms=null,renderedMessages=null,renderedMessageRoom=null,renderedQr=null;
 let userSelected=false,currentPage=null,ackInFlight=false,pendingSend=null,uncertainPhoto=null,renameTarget=null;
@@ -19,16 +22,18 @@ const replyDrafts=new Map();let imageDraft=null,imagePreparing=false,imageEpoch=
 let messageMenuTarget=null,messageMenuTimer=null;
 let freshness='checking',resumeEpoch=0,localFailureVersion=0,messageRequestId=0;
 let refreshPending=false,queuedRefreshTimer=null,pollTimer=null,lastPollAt=Date.now(),wasHidden=document.hidden;
+let presenceController=null,presenceRetryTimer=null,presenceEpoch=0,presencePhase='idle',presencePageActive=true;
 function requestStamp(){return {generation:readerGeneration,action:actionEpoch,resume:resumeEpoch};}
 function stampCurrent(stamp){return stamp.generation===readerGeneration && stamp.action===actionEpoch && stamp.resume===resumeEpoch;}
 function staleResult(){const error=new Error('Stale local response');error.name='StaleLocalResult';return error;}
 function unavailable(){localFailureVersion++;freshness='unavailable';readerRevision=-1;renderComposer();}
 function invalidateViewPin(){viewPin=null;viewPinEpoch++;}
-function requireLocalAuthorization(){localAuthorizationRequired=true;csrf=null;unavailable();}
+function requireLocalAuthorization(){localAuthorizationRequired=true;csrf=null;stopTabPresence();unavailable();}
 function renderLocalAuthorization(){
   el('title').textContent='브라우저 접근 승인 필요';
   el('message').textContent='로컬 도구의 open 명령으로 브라우저를 다시 열어 주세요. 작성 중인 내용은 유지됩니다.';
-  el('connection-label').textContent='브라우저 접근 승인 필요';
+  el('qr-attempts').hidden=true;
+  el('connection-label').textContent='브라우저 접근 승인 필요';el('connection-dot').dataset.state='error';el('session-meter').hidden=true;
   for(const id of ['start','cancel','room-check','reader-connect','reader-disconnect','history-load','rename-room','pin-room','mute-room','room-actions-toggle','read-sync','browser-notifications','persist-preferences','forget-preferences','compose-text','send-message','attach-image','image-send','send-reset','rename-reset'])el(id).disabled=true;
   for(const button of el('rename-form').querySelectorAll('button[type="submit"]'))button.disabled=true;
 }
@@ -40,15 +45,75 @@ function requestDeadline(path){
 async function localRequest(path,options={},bodyType='json',isCurrent=()=>true){
   const stamp=requestStamp(),controller=new AbortController();let timer;
   const instanceId=lastState?.reader?.instanceId,method=(options.method || 'GET').toUpperCase();
-  if(['GET','POST'].includes(method) && /^\/api\/(?:reader|preferences|notifications)(?:[/?]|$)/.test(path) && typeof instanceId==='string' && /^[a-f0-9]{24}$/.test(instanceId)){
-    const headers=new Headers(options.headers);headers.set('X-Reader-Instance',instanceId);options={...options,headers};
-  }
+  const headers=new Headers(options.headers);if(localSession)headers.set('X-Local-Session',localSession);
+  if(['GET','POST'].includes(method) && /^\/api\/(?:reader|preferences|notifications)(?:[/?]|$)/.test(path) && typeof instanceId==='string' && /^[a-f0-9]{24}$/.test(instanceId))headers.set('X-Reader-Instance',instanceId);
+  options={...options,headers};
   // Abort alone does not release a lock when a transport/body reader ignores it.
   // Race covers both response headers and the complete response body.
   const deadline=new Promise((resolve,reject)=>{timer=setTimeout(()=>{const error=new Error('Local request timed out');error.name='TimeoutError';controller.abort();reject(error);},requestDeadline(path));});
   try{const result=await Promise.race([(async()=>{const response=await fetch(path,{cache:'no-store',...options,signal:controller.signal});const data=bodyType==='text'?await response.text():await response.json();return {response,data};})(),deadline]);if(!stampCurrent(stamp) || !isCurrent())throw staleResult();if(result.response.status===403){const error=new Error('Local browser authorization required');error.name='LocalAuthorizationRequired';throw error;}return result;}
   catch(error){if(!stampCurrent(stamp) || !isCurrent())throw staleResult();if(error.name==='LocalAuthorizationRequired')requireLocalAuthorization();else if(error.name!=='StaleLocalResult')unavailable();throw error;}
   finally{clearTimeout(timer);}
+}
+function tabGraceLabel(){
+  const ms=lastState?.tabPresence?.graceMs;
+  return Number.isSafeInteger(ms) && ms>0 ? ms%60000===0?`${ms/60000}분`:`${Math.ceil(ms/1000)}초` : '잠시';
+}
+function renderTabPresenceNote(){
+  const note=el('tab-presence-note');
+  note.hidden=localAuthorizationRequired || lastState?.sessionPolicy!=='tab-open';
+  if(note.hidden)return;
+  const text=presencePhase==='active'?`탭 연결 유지 중 · 모든 웹카카오 탭을 닫으면 ${tabGraceLabel()} 후 종료됩니다.`
+    :presencePhase==='limited'?'연결을 유지할 수 있는 탭은 최대 4개입니다. 다른 웹카카오 탭을 닫아 주세요.'
+    :'탭 연결을 확인하고 있습니다. 연결이 복구되지 않으면 로그인이 종료될 수 있습니다.';
+  if(note.textContent!==text)note.textContent=text;
+}
+function stopTabPresence(){
+  presenceEpoch++;clearTimeout(presenceRetryTimer);presenceRetryTimer=null;
+  const previous=presenceController;presenceController=null;presencePhase='idle';previous?.abort();
+  renderTabPresenceNote();
+}
+function ensureTabPresence(){
+  if(lastState?.sessionPolicy!=='tab-open' || localAuthorizationRequired || !localSession || !csrf || !presencePageActive){
+    if(presenceController || presenceRetryTimer!==null)stopTabPresence();
+    renderTabPresenceNote();return;
+  }
+  if(presenceController || presenceRetryTimer!==null)return;
+  void connectTabPresence();
+}
+async function connectTabPresence(){
+  const controller=new AbortController(),epoch=++presenceEpoch;
+  presenceController=controller;presencePhase='connecting';renderTabPresenceNote();
+  if(lastState)renderSessionMeter(lastState);
+  // Only the headers have a deadline. An established stream must survive a
+  // hidden/background tab without depending on the page's polling timers.
+  const handshake=setTimeout(()=>controller.abort(),12000);
+  let stream;
+  try{
+    const response=await fetch('/api/presence',{method:'POST',cache:'no-store',credentials:'omit',redirect:'error',
+      headers:{'X-Local-Session':localSession,'X-CSRF-Token':csrf,'Content-Type':'application/json'},body:'{}',signal:controller.signal});
+    clearTimeout(handshake);
+    if(epoch!==presenceEpoch)return;
+    if(response.status===403){requireLocalAuthorization();renderLocalAuthorization();return;}
+    if(response.status===429){presencePhase='limited';return;}
+    if(!response.ok || !/^text\/event-stream(?:;|$)/i.test(response.headers.get('content-type') ?? '') || !response.body)throw new Error('Local tab stream unavailable');
+    presencePhase='active';renderTabPresenceNote();if(lastState)renderSessionMeter(lastState);
+    stream=response.body.getReader();
+    while(epoch===presenceEpoch){const part=await stream.read();if(part.done)break;}
+  }catch{/* Only the local tab stream is retried; no account operation is repeated. */}
+  finally{
+    clearTimeout(handshake);controller.abort();stream?.releaseLock();
+    if(epoch===presenceEpoch){
+      presenceController=null;
+      if(presencePhase!=='limited')presencePhase='retrying';
+      renderTabPresenceNote();if(lastState)renderSessionMeter(lastState);
+      if(presencePageActive && !localAuthorizationRequired && lastState?.sessionPolicy==='tab-open'){
+        const grace=lastState?.tabPresence?.graceMs;
+        const delay=Number.isSafeInteger(grace) && grace>0?Math.min(1000,Math.max(100,Math.floor(grace/4))):1000;
+        presenceRetryTimer=setTimeout(()=>{presenceRetryTimer=null;ensureTabPresence();},delay);
+      }
+    }
+  }
 }
 function scheduleQueuedRefresh(){
   if(!refreshPending || busy || refreshing || queuedRefreshTimer!==null)return;
@@ -98,7 +163,7 @@ function openRoomActions(keyboard=false){
   closeMessageMenu();el('room-actions-menu').hidden=false;el('room-actions-toggle').setAttribute('aria-expanded','true');
   if(keyboard)el('room-actions-menu').querySelector('button:not([disabled])')?.focus();
 }
-function mobileRoomListShown(){return window.matchMedia('(max-width: 760px)').matches && !document.querySelector('.app-shell').classList.contains('mobile-chat');}
+function mobileRoomListShown(){return window.matchMedia('(max-width: 560px)').matches && !document.querySelector('.app-shell').classList.contains('mobile-chat');}
 function returnToRoomList(){
   if(selectedRoom)drafts.set(selectedRoom,el('compose-text').value);
   userSelected=false;closeMessageMenu();closeRoomActions();clearImageDraft();
@@ -140,10 +205,10 @@ function imageSendReady(image=imageDraft){
   return Boolean(image && imageContextReady(image.room,image.generation) && !busy && !ackInFlight && !pendingSend && !uncertainPhoto
     && !imagePreparing && lastState.reader.operationBusy!==true);
 }
-async function postLocal(path,body){
+async function postLocal(path,body,onConflict){
   if(!csrf)return false;
-  const {response}=await localRequest(path,{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify(body)});
-  if(response.status===409){readerRevision=-1;queueRefresh();return false;}
+  const {response,data}=await localRequest(path,{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify(body)});
+  if(response.status===409){onConflict?.(data);readerRevision=-1;queueRefresh();return false;}
   if(!response.ok){unavailable();return false;}
   return true;
 }
@@ -179,9 +244,12 @@ function renderComposer(){
   el('send-message').disabled=!writable || replyBlocked || busy || ackInFlight || Boolean(pendingSend) || lastState?.reader?.operationBusy===true || !el('compose-text').value.trim();
   el('send-status').textContent=pendingSend?.phase==='unknown'?(pendingSend.kind==='photo'?'사진 전송 결과를 확인할 수 없습니다. 휴대폰에서 도착 여부를 확인해 주세요.':'전송 결과를 확인할 수 없습니다. 대화에서 도착 여부를 확인해 주세요.')
     :pendingSend?(pendingSend.kind==='photo'?'사진을 보내고 있습니다…':'메시지를 보내고 있습니다…'):recovered?(recovered.phase==='sending'?'이전 전송의 결과를 확인하고 있습니다. 다시 보내지 마세요.':'이전 '+(recovered.kind==='photo'?'사진':'메시지')+' 전송 결과가 미확인입니다. 휴대폰에서 도착 여부를 확인해 주세요.')+(recoveredOutbox().length>1?` (미확인 ${recoveredOutbox().length}건)`:''):freshness!=='fresh'?(freshness==='checking'?'연결 상태를 확인하고 있습니다…':'로컬 서버 연결을 확인해 주세요. 입력한 내용은 유지됩니다.'):replyBlocked?'이 방에서는 답장을 보낼 수 없습니다. 답장 선택을 취소해 주세요.':uncertainPhoto?'사진 전송 결과는 미확인입니다. 가능한 다른 대화 기능은 계속 사용할 수 있습니다.':sendNotes.get(selectedRoom) || (!ready?'계정을 연결하고 대화방을 선택해 주세요.':!writable?(roomCan('photo',room)?'이 방에서는 사진을 보낼 수 있습니다.':'이 방은 현재 읽기 전용입니다.'):'');
-  el('send-reset').hidden=pendingSend?.phase!=='unknown' && !uncertainPhoto && recovered?.phase!=='unknown';
+  const needsDeliveryCheck=pendingSend?.phase==='unknown' || Boolean(uncertainPhoto) || recovered?.phase==='unknown';
+  el('send-reset').hidden=!needsDeliveryCheck;
+  el('send-status').classList.toggle('delivery-warning',needsDeliveryCheck);
+  if(needsDeliveryCheck)el('send-status').textContent='전송 결과를 확인할 수 없습니다. 모바일 카카오톡에서 도착 여부를 확인한 뒤 아래 버튼으로 경고를 닫아 주세요. 자동으로 다시 보내지 않습니다.';
   el('send-reset').disabled=outboxAcknowledging;
-  el('send-reset').textContent='전송 결과를 확인했어요';
+  el('send-reset').textContent='모바일 확인 후 경고 닫기';
   const count=room?.unreadLocalCount || 0;
   el('new-messages').hidden=!count || nearBottom();el('new-messages').textContent=`새 메시지 ${count>99?'99+':count}개 ↓`;
   if(localAuthorizationRequired)renderLocalAuthorization();
@@ -208,7 +276,10 @@ async function refreshPendingSend(){
       if(pending.kind==='photo'){clearImageDraft();}
       else{drafts.delete(pending.room);if(selectedRoom===pending.room && el('compose-text').value===pending.text)el('compose-text').value='';if(replyDrafts.get(pending.room)?.key===pending.replyTo)replyDrafts.delete(pending.room);}
       sendNotes.set(pending.room,'서버에 전송했습니다.');
-    }else sendNotes.set(pending.room,'전송하지 못했습니다. 연결 상태를 확인해 주세요.');
+    }else{
+      const status=outcome.status,rejected=Number.isInteger(status) && status!==0 && status>=-2147483648 && status<=2147483647;
+      sendNotes.set(pending.room,outcome.phase==='failed' && outcome.reason==='open_member_unverified'?'본인 참여 정보를 확인하지 못해 전송하지 않았습니다. 입력한 내용은 유지됩니다.':rejected?`서버가 전송 요청을 거절했습니다. (코드 ${status})`:'전송하지 못했습니다. 입력한 내용은 유지됩니다.');
+    }
     outboxEpoch++;restoredOutbox=restoredOutbox.filter(entry=>entry.clientId!==pending.clientId);
     pendingSend=null;
     renderComposer();
@@ -279,10 +350,18 @@ async function advanceRoom(){
   if(!stampCurrent(beforePin) || roomBeforePin!==selectedRoom || document.hidden || !document.hasFocus() || messageViewCovered() || !userSelected)return;
   const needsEntry=currentPage?.entryPhase!==undefined?currentPage.entryPhase==='idle':currentPage?.receiptPhase==='idle';
   const contextKey=JSON.stringify([readerGeneration,readerAttempt,selectedRoom,contextGeneration()]);
-  if(lastState.messaging===true && roomCan('context') && currentPage?.key===selectedRoom && (currentPage.messages?.length || ['OpenDirectChat','OpenMultiChat'].includes(roomNow()?.kind)) && needsEntry && !contextDispatches.has(contextKey) && currentPage.history?.phase!=='loading'){
+  if(lastState.messaging===true && roomCan('context') && currentPage?.key===selectedRoom && (currentPage.messages?.length || ['OpenDirectChat','OpenMultiChat'].includes(roomNow()?.kind)) && needsEntry && !contextDispatches.has(contextKey) && (contextRetryAt.get(contextKey) ?? 0)<=performance.now() && currentPage.history?.phase!=='loading'){
     const key=selectedRoom,stamp=requestStamp();ackInFlight=true;renderComposer();
-    contextDispatches.add(contextKey);
-    try{if(await postLocal('/api/reader/context',{room:key}) && stampCurrent(stamp) && key===selectedRoom)pageRevisions.delete(key);}finally{ackInFlight=false;renderComposer();}
+    contextRetryAt.delete(contextKey);contextDispatches.add(contextKey);
+    try{
+      if(await postLocal('/api/reader/context',{room:key},data=>{
+        // Only an explicit local cooldown is safe to retry. A protocol refusal,
+        // ambiguous response or changed account keeps the original suppression.
+        if(stampCurrent(stamp) && data?.error==='context_rate_limited' && Number.isInteger(data.retryAfterMs) && data.retryAfterMs>0 && data.retryAfterMs<=60001){
+          contextDispatches.delete(contextKey);contextRetryAt.set(contextKey,performance.now()+data.retryAfterMs);
+        }
+      }) && stampCurrent(stamp) && key===selectedRoom)pageRevisions.delete(key);
+    }finally{ackInFlight=false;renderComposer();}
     return;
   }
   await maybeSeen();
@@ -342,7 +421,8 @@ function render(state) {
   if(accountEnded || (nextAttempt!==null && nextAttempt!==readerAttempt)){
     closeMessageMenu();
     closeRoomActions();document.querySelector('.app-shell').classList.remove('mobile-chat');
-    seenDispatches.clear();contextDispatches.clear();pageRevisions.clear();roomsRevision=-1;outboxRevision=-1;invalidateViewPin();
+    seenDispatches.clear();contextDispatches.clear();contextRetryAt.clear();pageRevisions.clear();roomsRevision=-1;outboxRevision=-1;invalidateViewPin();
+    if(accountEnded)cancelPhotoDownload();
     if(accountEnded){reconnectRoom=null;renameTarget=null;outboxEpoch++;outboxAcknowledging=false;acknowledgingClientId=null;settingsBusy=false;notificationBusy=false;ackInFlight=false;}
     if(hasAccount || nextAttempt!==readerAttempt || instanceChanged)readerGeneration++;
     const staleImageRoom=imageDraft?.room || (imagePreparing?selectedRoom:null);
@@ -360,13 +440,27 @@ function render(state) {
   readerAttempt=nextAttempt;
   hasAccount=Boolean(state.credentialInMemory);
   if (state.csrf) csrf = state.csrf;
+  ensureTabPresence();renderTabPresenceNote();
   el('title').textContent = labels[state.phase] || '연결 상태 확인';
   el('message').textContent = state.message;
   if(state.phase==='blocked' && state.stage==='poll' && Number.isInteger(state.apiStatus))el('message').textContent=`지원하지 않는 인증 응답을 받아 중단했습니다. (상태 ${state.apiStatus})`;
+  if(!state.canStart && ['cancelled','expired','error'].includes(state.phase)){
+    const reason=state.startBlockedReason ?? (state.sessionBlocked?'server_denied':state.attemptLimit!==null && state.attempts>=3?'attempt_limit':null);
+    if(reason==='attempt_limit'){
+      el('title').textContent='QR 발급 횟수 제한';
+      el('message').textContent='이번 서버 실행에서 QR 발급을 3회 시도했습니다. 로컬 세션을 지워도 횟수는 초기화되지 않습니다. 다시 시도하려면 로컬 서버를 종료한 뒤 시작해 주세요.';
+    }else if(reason==='server_denied'){
+      el('title').textContent='연결 시도 중단';
+      el('message').textContent='이전 인증 요청을 서버가 거절해 추가 시도를 중단했습니다. 로컬 세션을 지워도 이 차단은 해제되지 않습니다. 표시된 오류와 휴대폰의 연결 기기를 확인해 주세요.';
+    }
+  }
   el('mode').textContent = state.mode === 'live' ? '실제 서버 인증 실험 · 이 노트북에서만 접근' : '모의 화면 · 실제 카카오톡 로그인 아님';
   el('start').disabled = busy || !state.canStart || !csrf;
   el('start').textContent = state.phase === 'idle' ? 'QR 로그인 시작' : '새 QR 발급';
   el('cancel').disabled = busy || ['idle','cancelled'].includes(state.phase) || !csrf;
+  const attempts=state.attempts,attemptsKnown=Number.isSafeInteger(attempts) && attempts>=0;
+  el('qr-attempts').hidden=!attemptsKnown;
+  if(attemptsKnown){const note=state.attemptLimit===null?`QR 발급 시도 ${attempts}회 · 수동 발급 횟수 제한 없음`:`QR 발급 시도 ${attempts}/3 · 남은 ${Math.max(0,3-attempts)}회`;if(el('qr-attempts').textContent!==note)el('qr-attempts').textContent=note;}
   el('room-panel').hidden = !state.roomProbe;
   el('room-check').disabled = busy || !state.canProbe || !csrf;
   const probe = state.roomProbe;
@@ -395,7 +489,9 @@ function render(state) {
   el('reader-connect').textContent=state.reader?.attempts ? '대화 서버 다시 연결' : '대화방 불러오기';
   el('reader-disconnect').disabled=busy || !['connecting','connected'].includes(state.reader?.phase);
   const reader=state.reader;
-  el('connection-label').textContent=reader?.phase==='connected'?'● 대화 서버 연결됨':reader?.phase==='connecting'?'대화 서버 연결 중…':hasAccount?'인증됨 · 대화 연결 대기':labels[state.phase] || '연결 상태 확인';
+  el('connection-label').textContent=reader?.phase==='connected'?'대화 서버 연결됨':reader?.phase==='connecting'?'대화 서버 연결 중…':hasAccount?'인증됨 · 대화 연결 대기':labels[state.phase] || '연결 상태 확인';
+  el('connection-dot').dataset.state=reader?.phase==='connected'?'connected':reader?.phase==='connecting'?'connecting':['blocked','disconnected'].includes(reader?.phase)?'error':'idle';
+  renderSessionMeter(state);
   el('sidebar-empty').hidden=roomsCache.length>0;
   if(hasAccount && reader?.phase==='connected'){
     el('title').textContent='대화 서버 연결됨';el('message').textContent='아래에서 대화방을 선택하고 메시지 조회를 눌러 주세요.';
@@ -410,6 +506,33 @@ function render(state) {
   el('history-load').textContent=reader?.historyBusy?'불러오는 중…':'메시지 불러오기';
   el('history-load').disabled=busy || !selectedRoom || roomsCache.find(room=>room.key===selectedRoom)?.historyAvailable===false || reader?.phase!=='connected' || reader?.historyBusy===true;
   renderComposer();
+}
+// Finite deadlines are retained only for older servers and bounded fixtures.
+const SESSION_LIMIT_MS=60*60*1000;
+const clock=ms=>{const s=Math.max(0,Math.floor(ms/1000));return `${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`;};
+function renderSessionMeter(state){
+  const meter=el('session-meter'),deadline=state.credentialDeadline,reader=state.reader;
+  const bar=meter.querySelector('[role="progressbar"]');
+  if(state.sessionPolicy==='tab-open'){
+    bar.hidden=true;meter.hidden=!hasAccount;
+    if(!hasAccount)return;
+    meter.dataset.level=presencePhase==='active'?'ok':'warn';
+    const parts=[presencePhase==='active'?'탭이 열려 있는 동안 로그인 유지':'탭 연결 확인 중 · 복구되지 않으면 연결이 종료될 수 있습니다'];
+    if(reader?.phase==='connected' && Number.isFinite(reader.connectedAt))parts.push(`연결 ${Math.max(0,Math.floor(((state.serverNow ?? Date.now())-reader.connectedAt)/60000))}분째`);
+    if(reader?.phase==='connected' && Number.isFinite(reader.lastActivityAt)){const quiet=Math.max(0,Math.round(((state.serverNow ?? Date.now())-reader.lastActivityAt)/1000));parts.push(quiet>90?`응답 지연 ${quiet}초`:`마지막 응답 ${quiet}초 전`);}
+    el('session-meter-text').textContent=parts.join(' · ');return;
+  }
+  bar.hidden=false;
+  if(!hasAccount || !Number.isFinite(deadline)){meter.hidden=true;return;}
+  const now=Date.now(),skew=Number.isFinite(state.serverNow)?state.serverNow-now:0,left=deadline-(now+skew);
+  const parts=[`남은 연결 시간 ${clock(left)}`];
+  if(reader?.phase==='connected' && Number.isFinite(reader.connectedAt))parts.push(`연결 ${Math.max(0,Math.floor((now+skew-reader.connectedAt)/60000))}분째`);
+  if(reader?.phase==='connected' && Number.isFinite(reader.lastActivityAt)){const quiet=Math.max(0,Math.round((now+skew-reader.lastActivityAt)/1000));parts.push(quiet>90?`응답 지연 ${quiet}초`:`마지막 응답 ${quiet}초 전`);}
+  meter.dataset.level=left<=5*60000?'danger':left<=10*60000?'warn':'ok';
+  const percent=Math.max(0,Math.min(100,Math.round(left/SESSION_LIMIT_MS*100)));
+  el('session-meter-fill').style.width=percent+'%';meter.querySelector('[role="progressbar"]').setAttribute('aria-valuenow',String(percent));
+  el('session-meter-text').textContent=parts.join(' · ')+(left<=5*60000?' · 곧 QR 재인증이 필요합니다':'');
+  meter.hidden=false;
 }
 async function localJson(path,isCurrent=()=>true){
   const stamp=requestStamp(),{response,data}=await localRequest(path,{},'json',isCurrent);
@@ -439,7 +562,7 @@ function renderRooms(){
     const copy=document.createElement('span');copy.className='room-copy';copy.append(title,preview);
     const when=document.createElement('span');when.className='room-time';when.textContent=room.lastAt?new Date(room.lastAt).toLocaleTimeString('ko-KR',{hour:'2-digit',minute:'2-digit'}):'';
     const side=document.createElement('span');side.className='room-side';side.append(when);
-    if(room.unreadLocalCount>0){const badge=document.createElement('span');badge.className='unread-badge';badge.textContent=room.unreadLocalCount>99?'99+':String(room.unreadLocalCount)+(room.unreadCoverage==='partial'?'+':'');badge.setAttribute('aria-label',`이 웹에서 확인하지 않은 새 메시지 ${room.unreadLocalCount}개`);side.append(badge);}
+    if(room.unreadLocalCount>0){const badge=document.createElement('span');badge.className='unread-badge';badge.textContent=room.unreadLocalCount>99?'99+':String(room.unreadLocalCount)+(room.unreadCoverage==='partial'?'+':'');badge.setAttribute('aria-label',`확인하지 않은 메시지 ${room.unreadLocalCount}개`);side.append(badge);}
     button.append(avatar,copy,side);button.addEventListener('click',()=>selectRoom(room.key));fragment.append(button);
   }
   if(!filtered.length && roomsCache.length){const empty=document.createElement('p');empty.className='sidebar-empty';empty.textContent=query?'검색 결과가 없습니다.':roomFilter==='unread'?'안 읽은 대화방이 없습니다.':'고정한 대화방이 없습니다.';fragment.append(empty);}
@@ -488,12 +611,12 @@ function updateMessageItem(item,message){
   const body=message.text || '[본문 없음]';if(text.textContent!==body)text.textContent=body;
   const nodes=[author];
   if(message.reply){
-    const quote=item.querySelector(':scope > .message-quote') || document.createElement('blockquote');quote.className='message-quote';
+    const quote=item.querySelector(':scope > .message-quote') || document.createElement('blockquote');quote.className=message.reply.verified===false?'message-quote unverified':'message-quote';quote.title=message.reply.verified===false?'이 웹에 원본 메시지가 없어 작성자와 내용을 확인할 수 없습니다':'';
     const name=quote.querySelector('strong') || document.createElement('strong'),content=quote.querySelector('span') || document.createElement('span');
     name.textContent=message.reply.sender || '원본 메시지';content.textContent=message.reply.text || '[본문 없음]';reconcileChildren(quote,[name,content]);nodes.push(quote);
   }
   nodes.push(text);
-  const photos=(message.photos || []).filter(photo=>typeof photo?.src==='string' && /^\/api\/photo\?room=r_[a-f0-9]{24}&message=m_[a-f0-9]{24}&index=(?:[0-9]|[12][0-9])$/.test(photo.src));
+  const photos=(message.photos || []).filter(photo=>typeof photo?.src==='string' && /^\/api\/photo\?room=r_[a-f0-9]{24}&message=m_[a-f0-9]{24}&index=(?:[0-9]|[12][0-9])&cap=[a-f0-9]{64}$/.test(photo.src));
   text.className=photos.length?'sr-only':'';
   if(photos.length){
     const gallery=item.querySelector(':scope > .photo-gallery') || document.createElement('div');gallery.className='photo-gallery';
@@ -509,7 +632,7 @@ function updateMessageItem(item,message){
         button.addEventListener('click',()=>{
           const current=messageForItem(item,item.dataset.room),src=button.dataset.photoSrc;
           if(!current?.photos?.some(row=>row.src===src))return;
-          if(fallback.hidden){el('photo-error').hidden=true;el('photo-full').src=src;el('photo-dialog').showModal();}
+          if(fallback.hidden){cancelPhotoDownload();el('photo-error').hidden=true;el('photo-full').src=src;el('photo-download').disabled=false;el('photo-dialog').showModal();}
           else{image.hidden=false;fallback.hidden=true;image.src=src;}
         });
         button.append(image,fallback);image.src=photo.src;
@@ -758,6 +881,7 @@ el('compose-form').addEventListener('submit',async event=>{
   const replyTo=replyDrafts.get(selectedRoom)?.key;
   if(replyTo && !roomCan('reply',room))return;
   if(replyTo && !currentPage?.messages?.some(message=>message.key===replyTo && message.canReply)){sendNotes.set(selectedRoom,'원본 메시지를 다시 불러오거나 답장을 취소해 주세요.');renderComposer();return;}
+  sendNotes.delete(selectedRoom);
   const pending={room:selectedRoom,text,replyTo,kind:'text',clientId:crypto.randomUUID(),phase:'sending',focusInput:['compose-text','send-message'].includes(document.activeElement?.id)};pendingSend=pending;renderComposer();
   try{
     const accepted=await postLocal('/api/reader/send',{room:pending.room,text:pending.text,clientId:pending.clientId,...(pending.replyTo?{replyTo:pending.replyTo}:{})});
@@ -771,7 +895,7 @@ el('send-reset').addEventListener('click',async()=>{
   if(outboxAcknowledging)return;
   if(pendingSend?.phase==='unknown'){
     const pending=pendingSend;
-    if(window.confirm('대화에서 전송 결과를 확인하셨나요? 다시 보내면 같은 내용이 중복될 수 있습니다.') && await acknowledgeUnknown(pending) && pendingSend===pending){pendingSend=null;renderComposer();}
+    if(window.confirm('모바일 카카오톡에서 도착 여부를 확인하셨나요? 이 버튼은 경고만 닫으며 메시지를 다시 보내지 않습니다. 직접 다시 보내면 같은 내용이 중복될 수 있습니다.') && await acknowledgeUnknown(pending) && pendingSend===pending){pendingSend=null;renderComposer();}
   }else if(uncertainPhoto){
     const pending=uncertainPhoto,stamp=requestStamp();
     if(window.confirm('휴대폰에서 사진의 도착 여부를 확인하셨나요? 이 버튼은 사진을 다시 보내지 않습니다.')){
@@ -838,6 +962,7 @@ el('image-send-dialog').addEventListener('cancel',()=>{clearImageDraft();renderC
 el('image-send').addEventListener('click',async()=>{
   const image=imageDraft;
   if(!imageSendReady(image)){renderComposer();return;}
+  sendNotes.delete(image.room);
   const pending={room:image.room,kind:'photo',clientId:crypto.randomUUID(),phase:'sending',focusInput:true};pendingSend=pending;el('image-send-dialog').close();renderComposer();
   try{const accepted=await postLocal('/api/reader/photo',{room:image.room,image:image.image,clientId:pending.clientId});if(pendingSend!==pending || !hasAccount)return;if(!accepted){pendingSend=null;sendNotes.set(image.room,'사진을 보내지 못했습니다. ＋에서 미리보기를 다시 확인할 수 있습니다.');}readerRevision=-1;await refresh();}
   catch{markSendUnknown(pending);}
@@ -872,16 +997,43 @@ el('browser-notifications').addEventListener('change',async()=>{
   await saveSettings({notifications:el('browser-notifications').checked});
 });
 el('photo-close').addEventListener('click',()=>el('photo-dialog').close());
-el('photo-dialog').addEventListener('close',()=>el('photo-full').removeAttribute('src'));
+function cancelPhotoDownload(){
+  photoDownloadEpoch++;const previous=photoDownload;photoDownload=null;previous?.controller.abort();
+  el('photo-download').textContent='다운로드';
+}
+el('photo-dialog').addEventListener('close',()=>{cancelPhotoDownload();el('photo-full').removeAttribute('src');el('photo-download').disabled=true;});
+// Download only on explicit click; the photo is fetched from the same local URL and never stored by the page.
+el('photo-download').addEventListener('click',async()=>{
+  const src=el('photo-full').getAttribute('src'),button=el('photo-download');
+  if(photoDownload || !hasAccount || !el('photo-dialog').open || !src || !/^\/api\/photo\?/.test(src))return;
+  const download={controller:new AbortController(),epoch:photoDownloadEpoch,generation:readerGeneration,src};photoDownload=download;
+  const current=()=>photoDownload===download && photoDownloadEpoch===download.epoch && readerGeneration===download.generation && hasAccount && el('photo-dialog').open && el('photo-full').getAttribute('src')===download.src;
+  const timeout=setTimeout(()=>download.controller.abort(),30000);
+  button.disabled=true;button.textContent='받는 중…';
+  try{
+    const headers=localSession?{'X-Local-Session':localSession}:{};
+    const response=await fetch(src,{cache:'no-store',headers,signal:download.controller.signal});
+    if(!current() || download.controller.signal.aborted)return;
+    if(!response.ok)throw new Error('photo_download_failed');
+    const blob=await response.blob();if(!current() || download.controller.signal.aborted)return;
+    const ext={'image/jpeg':'jpg','image/png':'png','image/webp':'webp','image/gif':'gif'}[blob.type] ?? 'jpg';
+    const stamp=new Date().toISOString().replace(/[-:]/g,'').replace('T','-').slice(0,15);
+    const url=URL.createObjectURL(blob),link=document.createElement('a');
+    link.href=url;link.download=`kakao-photo-${stamp}.${ext}`;document.body.append(link);link.click();link.remove();
+    setTimeout(()=>URL.revokeObjectURL(url),10000);
+  }catch{if(current()){el('photo-error').textContent='사진을 받지 못했습니다. 잠시 후 다시 시도해 주세요.';el('photo-error').hidden=false;}}
+  finally{clearTimeout(timeout);const visible=current();if(photoDownload===download)photoDownload=null;if(visible){button.textContent='다운로드';button.disabled=false;}}
+});
 for(const dialog of document.querySelectorAll('dialog'))dialog.addEventListener('close',()=>requestAnimationFrame(()=>void maybeSeen()));
-el('photo-full').addEventListener('error',()=>{el('photo-error').hidden=false;});
+el('photo-full').addEventListener('error',()=>{el('photo-error').textContent='사진을 불러오지 못했습니다. 만료됐거나 지원하지 않는 형식일 수 있습니다.';el('photo-error').hidden=false;el('photo-download').disabled=true;});
 el('new-messages').addEventListener('click',()=>{const scroll=document.querySelector('.chat-scroll');scroll.scrollTop=scroll.scrollHeight;requestAnimationFrame(()=>void maybeSeen());});
 document.querySelector('.chat-scroll').addEventListener('scroll',()=>{closeMessageMenu();renderComposer();void maybeSeen();},{passive:true});
 window.addEventListener('blur',()=>{foregroundFocused=false;invalidateViewPin();});
 window.addEventListener('focus',()=>{if(!foregroundFocused)invalidateViewPin();foregroundFocused=true;queueRefresh();});
-window.addEventListener('online',()=>queueRefresh(true));
+window.addEventListener('online',()=>{clearTimeout(presenceRetryTimer);presenceRetryTimer=null;ensureTabPresence();queueRefresh(true);});
 window.addEventListener('offline',()=>{resumeEpoch++;userSelected=false;unavailable();refreshPending=true;scheduleQueuedRefresh();});
-window.addEventListener('pageshow',event=>queueRefresh(event.persisted===true));
+window.addEventListener('pagehide',()=>{presencePageActive=false;stopTabPresence();});
+window.addEventListener('pageshow',event=>{presencePageActive=true;ensureTabPresence();queueRefresh(event.persisted===true);});
 document.addEventListener('keydown',event=>{if(event.key==='Escape' && messageMenuTarget){event.preventDefault();closeMessageMenu(el('message-menu').contains(document.activeElement));}else if(event.key==='Escape' && !el('room-actions-menu').hidden){event.preventDefault();closeRoomActions(true);}else if(event.key==='Escape' && !el('account-panel').hidden){showAccount(false);el('account-toggle').focus();}});
 function scheduleRefresh(){
   clearTimeout(pollTimer);

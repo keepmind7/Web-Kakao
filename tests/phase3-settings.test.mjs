@@ -17,8 +17,8 @@ async function browserSession(app,url){
   const {ticket}=await issue.json();assert.match(ticket,/^[a-f0-9]{64}$/);
   const session=await fetch(url+'/api/local/session',{method:'POST',headers:{Origin:url,'Content-Type':'application/json'},body:JSON.stringify({ticket})});
   assert.equal(session.status,200);
-  const cookie=session.headers.get('set-cookie');assert.match(cookie,/HttpOnly; SameSite=Strict/);
-  return {cookie:cookie.split(';')[0],response:session};
+  assert.equal(session.headers.get('set-cookie'),null);const token=(await session.json()).session;assert.match(token,/^[a-f0-9]{64}$/);
+  return {auth:{'x-local-session':token},token,response:session};
 }
 const output=resolve('local-only/qa-adversarial-20261017/fixtures'),directories=[];
 const folder=()=>{mkdirSync(output,{recursive:true});const path=mkdtempSync(join(output,'settings-test-'));directories.push(path);return path;};
@@ -126,15 +126,15 @@ test('new settings and photo routes preserve authentication, CSRF and private UR
   const url=await app.listen(0);
   try{
     assert.equal((await fetch(url+'/api/preferences')).status,403);
-    const {cookie}=await browserSession(app,url),state=await(await fetch(url+'/api/status',{headers:{cookie}})).json();
-    const post=(path,body,origin=url)=>fetch(url+path,{method:'POST',headers:{cookie,Origin:origin,'Content-Type':'application/json','X-CSRF-Token':state.csrf},body:JSON.stringify(body)});
+    const {auth}=await browserSession(app,url),state=await(await fetch(url+'/api/status',{headers:auth})).json();
+    const post=(path,body,origin=url)=>fetch(url+path,{method:'POST',headers:{...auth,Origin:origin,'Content-Type':'application/json','X-CSRF-Token':state.csrf},body:JSON.stringify(body)});
     await post('/api/start',{});await new Promise(resolve=>setTimeout(resolve,2100));
     assert.equal((await post('/api/preferences',{notifications:true},'https://evil.test')).status,403);
     assert.equal((await post('/api/preferences',{notifications:true,accessToken:'forbidden'})).status,400);assert.equal(writes,0);
     assert.equal((await post('/api/preferences',{notifications:true})).status,200);assert.equal(writes,1);
     const path=`/api/photo?room=${room}&message=${message}&index=0`;
-    assert.equal((await fetch(url+path,{headers:{cookie}})).status,200);
-    assert.equal((await fetch(url+path+'&url='+encodeURIComponent(privateUrl),{headers:{cookie}})).status,400);
-    await post('/api/cancel',{});assert.equal((await fetch(url+path,{headers:{cookie}})).status,409);
+    assert.equal((await fetch(url+path,{headers:auth})).status,200);
+    assert.equal((await fetch(url+path+'&url='+encodeURIComponent(privateUrl),{headers:auth})).status,400);
+    await post('/api/cancel',{});assert.equal((await fetch(url+path,{headers:auth})).status,409);
   }finally{app.lab.cancel();app.server.close();app.server.closeAllConnections();}
 });

@@ -22,7 +22,10 @@ for document in documents:
             issues.append(f"없는 로컬 링크: {document.relative_to(ROOT)} → {link}")
 
 hash_count = 0
-latest_source_manifest = next(path for path in [ROOT / "evidence/phase3/source-manifest.json", ROOT / "evidence/phase2/source-manifest.json", ROOT / "evidence/local-web/source-manifest.json"] if path.exists())
+latest_source_manifest = next((path for path in [ROOT / "evidence/phase3/source-manifest.json", ROOT / "evidence/phase2/source-manifest.json", ROOT / "evidence/local-web/source-manifest.json"] if path.exists()), None)
+if latest_source_manifest is None or not (ROOT / "evidence/experiment-source-manifest.json").is_file():
+    # evidence/ is not tracked; a fresh clone has no local verification records.
+    raise SystemExit("검증 기록(evidence/*source-manifest.json)이 없습니다. 새로 받은 저장소에서는 해시 검증을 할 수 없습니다.")
 for base, manifest in [
     (ROOT, ROOT / "evidence/experiment-source-manifest.json"),
     (ROOT / "tools/vendor/codex_harness", ROOT / "tools/vendor/codex_harness/source-manifest.json"),

@@ -72,6 +72,7 @@ for(const method of ['SYNCMSG','MCHATLOGS'])test('eviction while '+method+' is i
     // A resumed SYNCMSG (or a first gap probe) can lose its cache while awaiting.
     if(method==='SYNCMSG')await session.history(rooms[0].key,1);hold=true;
     const pending=session.history(rooms[0].key,2);await begun.promise;
+    session.view(rooms[1].key); // Navigating away unpins the in-flight room; the active room is otherwise never evicted.
     for(const [i,row] of rooms.slice(1).entries())f.carriage.emit('push',{method:'MSG',status:0,body:{chatId:String(1001+i),chatLog:{logId:'4',authorId:'111',msg:'synthetic push'}}});
     held.resolve({status:0,body:method==='SYNCMSG'?{isOK:true,chatLogs:[]}:{chatLogs:f.logs('1000',[2,3])}});
     await pending;

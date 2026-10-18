@@ -46,16 +46,40 @@ try {
         if (!(Test-Path -LiteralPath $archivePath -PathType Leaf)) { throw 'Bundled Google Platform-Tools ZIP is missing.' }
         if ((Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant() -ne $archiveSha256) { throw 'Google Platform-Tools ZIP checksum mismatch.' }
         $toolsRoot = Join-Path $kitRoot 'platform-tools'
-        if (!(Test-Path -LiteralPath (Join-Path $toolsRoot 'adb.exe') -PathType Leaf)) {
-            Add-Type -AssemblyName System.IO.Compression.FileSystem
-            $archive = [IO.Compression.ZipFile]::OpenRead($archivePath)
+        # Expected file set and hashes come from the checksum-pinned ZIP itself.
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $expectedFiles = @{}
+        $archive = [IO.Compression.ZipFile]::OpenRead($archivePath)
+        try {
+            foreach ($entry in $archive.Entries) {
+                $target = [IO.Path]::GetFullPath((Join-Path $kitRoot $entry.FullName))
+                if ($entry.FullName -eq 'platform-tools/') { continue }
+                if (!$target.StartsWith($toolsRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase) -or $entry.FullName.EndsWith('/')) { throw 'Unsafe ZIP member path.' }
+                $stream = $entry.Open()
+                try { $expectedFiles[$target] = ([BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($stream)) -replace '-', '').ToLowerInvariant() } finally { $stream.Dispose() }
+            }
+        } finally { $archive.Dispose() }
+        $reparse = [IO.FileAttributes]::ReparsePoint
+        function Test-PlatformTools {
+            if (!(Test-Path -LiteralPath $toolsRoot -PathType Container)) { return $false }
+            $items = @(Get-Item -LiteralPath $toolsRoot -Force) + @(Get-ChildItem -LiteralPath $toolsRoot -Recurse -Force)
+            if (@($items | Where-Object { $_.Attributes -band $reparse }).Count) { throw 'Platform-Tools folder contains a link; it will not be used or removed.' }
+            $files = @($items | Where-Object { !$_.PSIsContainer })
+            if ($items.Count -ne $files.Count + 1 -or $files.Count -ne $expectedFiles.Count) { return $false }
+            foreach ($file in $files) {
+                if (!$expectedFiles.ContainsKey($file.FullName) -or (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expectedFiles[$file.FullName]) { return $false }
+            }
+            return $true
+        }
+        if (!(Test-PlatformTools)) {
+            # Missing, extra or modified files: re-extract into a fresh stage, then move into place.
+            if (Test-Path -LiteralPath $toolsRoot) { Remove-Item -LiteralPath $toolsRoot -Recurse -Force }
+            $stage = Join-Path $kitRoot ('.platform-tools-' + [Guid]::NewGuid().ToString('N'))
             try {
-                foreach ($entry in $archive.Entries) {
-                    $target = [IO.Path]::GetFullPath((Join-Path $kitRoot $entry.FullName))
-                    if (!$target.StartsWith($kitRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) { throw 'Unsafe ZIP member path.' }
-                }
-            } finally { $archive.Dispose() }
-            Expand-Archive -LiteralPath $archivePath -DestinationPath $kitRoot
+                Expand-Archive -LiteralPath $archivePath -DestinationPath $stage -Force
+                Move-Item -LiteralPath (Join-Path $stage 'platform-tools') -Destination $toolsRoot
+            } finally { if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force } }
+            if (!(Test-PlatformTools)) { throw 'Platform-Tools verification failed after extraction.' }
         }
         foreach ($name in $binaryHashes.Keys) {
             if ((Get-FileHash -LiteralPath (Join-Path $toolsRoot $name) -Algorithm SHA256).Hash.ToLowerInvariant() -ne $binaryHashes[$name]) { throw ('ADB binary checksum mismatch: ' + $name) }

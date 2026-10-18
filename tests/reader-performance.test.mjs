@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { performance } from 'node:perf_hooks';
 import { createReaderStore, CACHE_LIMIT, MESSAGE_LIMIT } from '../experiments/local-web/reader-data.mjs';
 
-const ownUserId='88888888888888888888888888888';
+const ownUserId='8888888888888888888';
 const firstLogId=9007199254740993n;
 const roomId=index=>String(9907199254740993n+BigInt(index));
 const roomsBody=count=>({chats:Array.from({length:count},(_,index)=>({chatId:roomId(index)}))});
@@ -22,7 +22,7 @@ test('별칭 전체 상한은 캐시 퇴출 후 복구되고 방별 번호는 �
     assert.equal(result.messages.length,MESSAGE_LIMIT);
     assert.equal(result.messages.at(-1).sender,'참여자 250');
   }
-  const extra={logId:String(firstLogId+300n),authorId:'99999999999999999999999999999',msg:'상한 이후 모의 메시지'};
+  const extra={logId:String(firstLogId+300n),authorId:'9111111111111111111',msg:'상한 이후 모의 메시지'};
   assert.equal(store.history(keys[0],{chatLogs:[extra]}).messages.at(-1).sender,'작성자 미확인');
 
   // 새 방을 캐시에 넣으면 가장 오래 사용하지 않은 방의 별칭도 해제된다.

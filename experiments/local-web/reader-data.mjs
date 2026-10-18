@@ -4,15 +4,62 @@ import { photoAttachments } from './photos.mjs';
 import { attachmentObject,replyExtra } from './message-content.mjs';
 
 export const ROOM_LIMIT = 500, MESSAGE_LIMIT = 50, CACHE_LIMIT = 20;
+const INITIAL_UNREAD_LIMIT=20000;
+export function initialUnreadState(row){
+  const count=row?.initialUnreadCount,coverage=row?.initialUnreadCoverage;
+  const valid=count===undefined && !Object.hasOwn(row ?? {},'initialUnreadCount')
+    || Number.isSafeInteger(count) && count>=0 && count<=INITIAL_UNREAD_LIMIT;
+  const partial=!valid || coverage!==undefined && coverage!=='observed';
+  return {initialUnreadCount:partial?0:count ?? 0,initialUnreadCoverage:partial?'partial':'observed'};
+}
 export const roomKeyValid = value => typeof value === 'string' && /^r_[a-f0-9]{24}$/.test(value);
 const object = value => value && typeof value === 'object' && !Array.isArray(value);
 const clean = (value,max=4000) => typeof value === 'string' ? value.slice(0,max) : '';
+// Bound combining-mark stacks; strip controls, bidi overrides and separators from labels.
+const marks = value => value.replace(/(\p{M}{4})\p{M}+/gu,'$1');
+const label = (value,max) => typeof value === 'string' ? marks(value.slice(0,max*4).replace(/[\u0000-\u001f\u007f-\u009f\u200e\u200f\u202a-\u202e\u2066-\u2069\u2028\u2029]/g,'')).slice(0,max) : '';
+// A peer's chosen name must never render as a label this client itself assigns.
+const RESERVED=/^(?:나|참여자\d+|작성자미확인|원본메시지|원본확인불가)$/;
+export function personName(value){const name=label(value,80).trim();return name && RESERVED.test(name.replace(/[\p{Cf}\p{Z}\s\u115f\u1160\u3164\uffa0]/gu,''))?`“${name}”`:name;}
 export function serverId(value) {
   if (typeof value === 'number' && !Number.isSafeInteger(value)) return '';
   try {
     const text = ['string','number','bigint'].includes(typeof value) ? String(value) : object(value) && typeof value.toString === 'function' ? value.toString() : '';
-    return /^[1-9]\d{0,29}$/.test(text) ? text : '';
+    // The SDK's toLong wraps modulo 2^64: accept only positive signed int64 IDs.
+    return /^[1-9]\d{0,18}$/.test(text) && BigInt(text)<=9223372036854775807n ? text : '';
   } catch { return ''; }
+}
+function quoteLogId(raw,attachment){
+  if(typeof raw!=='string')return Object.hasOwn(attachment,'src_logId')?serverId(attachment.src_logId):'';
+  // attachmentObject already validated this JSON object. Scan its top-level
+  // members without converting numeric values through Number or matching text
+  // embedded inside strings/nested objects. Decoded duplicate keys are ambiguous.
+  let index=raw.indexOf('{')+1,id='';const keys=new Set();
+  const whitespace=()=>{while(/\s/.test(raw[index] ?? ''))index++;};
+  const string=()=>{
+    const start=index++;
+    while(index<raw.length){const ch=raw[index++];if(ch==='\\')index++;else if(ch==='"')break;}
+    return raw.slice(start,index);
+  };
+  while(index<raw.length){
+    whitespace();if(raw[index]==='}')break;
+    const key=JSON.parse(string());if(keys.has(key))return '';keys.add(key);
+    whitespace();index++;whitespace();const start=index;let depth=0;
+    while(index<raw.length){
+      const ch=raw[index];
+      if(ch==='"'){string();continue;}
+      if(ch==='{' || ch==='[')depth++;
+      else if(ch==='}' || ch===']'){if(depth===0)break;depth--;}
+      else if(ch===',' && depth===0)break;
+      index++;
+    }
+    if(key==='src_logId'){
+      const value=raw.slice(start,index).trim();
+      id=serverId(value.startsWith('"')?JSON.parse(value):/^[1-9]\d{0,18}$/.test(value)?value:null);
+    }
+    if(raw[index]!==',')break;index++;
+  }
+  return id;
 }
 // Relationships only: raw account, room and message identifiers stay in worker memory.
 export function compareReadPosition(body,roomId,logId){
@@ -34,7 +81,7 @@ const normalKinds=new Set(['DirectChat','MultiChat','MemoChat']);
 const openKinds=new Set(['OpenDirectChat','OpenMultiChat']);
 const kindOf=value=>value==='OD'?'OpenDirectChat':value==='OM'?'OpenMultiChat':normalKinds.has(value) || openKinds.has(value)?value:'unknown';
 const int32=value=>Number.isInteger(value) && value>=-2147483648 && value<=2147483647;
-const signedLinkId=value=>{const id=serverId(value);return id && BigInt(id)<=9223372036854775807n?id:'';};
+const signedLinkId=serverId;
 const fieldsOf=(row,fields)=>fields.filter(field=>object(row) && Object.hasOwn(row,field)).map(field=>row[field]);
 function matchingRoom(body,id,{required=true}={}){
   const ids=[...fieldsOf(body,['chatId','roomId','chatRoomId','c']),...fieldsOf(body?.chatInfo,['chatId','id','roomId','chatRoomId','c'])];
@@ -48,7 +95,7 @@ function timestamp(value) {
   const ms = number < 1e10 ? number*1000 : number;
   return ms >= 315532800000 && ms <= 4102444800000 ? Math.floor(ms) : null;
 }
-const titleText=(...values)=>values.map(value=>clean(value,120).trim()).find(Boolean) || '';
+const titleText=(...values)=>values.map(value=>label(value,120).trim()).find(Boolean) || '';
 function metaTitle(value) {
   if (typeof value === 'string') {
     if (value.length>8192) return '';
@@ -79,7 +126,7 @@ function text(log) {
   const kind=Number(log.type ?? log.msgType ?? log.t ?? 1);
   if (![1,26].includes(kind)) return ({2:'[사진]',27:'[사진 모음]',3:'[동영상]',5:'[음성]',18:'[파일]'})[kind] ?? '[지원하지 않는 메시지]';
   const value=log.message ?? log.msg ?? log.text ?? log.content;
-  return typeof value==='string'?(value.length<=4000?value:[...value].slice(0,4000).join('')):'';
+  return typeof value==='string'?(value.length<=4000?marks(value):[...marks(value.slice(0,64000))].slice(0,4000).join('')):'';
 }
 
 // Raw account/server identifiers stay inside the worker. Browser keys are
@@ -91,6 +138,7 @@ export function createReaderStore(body, ownUserId, salt=randomBytes(32),settings
   const rooms=new Map(),byServerId=new Map(),cache=new Map(),aliases=new Map();
   let duplicates=0,invalidMessages=0,aliasCount=0,pinned=null;
   const opaque=(prefix,id)=>prefix+createHmac('sha256',salt).update(id).digest('hex').slice(0,24);
+  const learn=(room,id,value)=>{const name=clean(value,80).trim();if(id && id!==ownUserId && name && (room.names.has(id) || room.names.size<500))room.names.set(id,name);};
   function addRoom(row,{discovered=false}={}) {
     const serverRoomId=idOfRoom(row);if(!serverRoomId || byServerId.has(serverRoomId) || rooms.size>=ROOM_LIMIT)return null;
     const ids=fieldsOf(row,['chatId','id','roomId','chatRoomId','c']);if(ids.some(id=>serverId(id)!==serverRoomId))return null;
@@ -105,7 +153,11 @@ export function createReaderStore(body, ownUserId, salt=randomBytes(32),settings
     if(Array.isArray(row?.i) && Array.isArray(row?.k))for(let n=0;n<Math.min(row.i.length,row.k.length,500);n++){const id=serverId(row.i[n]),name=clean(row.k[n],80);if(id && name)names.set(id,name);}
     const linkIds=fieldsOf(row,['li','linkId','openLinkId']);
     const linkId=linkIds.length && linkIds.every(value=>serverId(value) && serverId(value)===serverId(linkIds[0]))?serverId(linkIds[0]):null;
-    rooms.set(key,{key,serverRoomId,preferenceKey:settingsSecret?preferenceId(settingsSecret,'room',ownUserId,serverRoomId):null,historyEnd,baseline:discovered?'0':historyEnd,seed,names,kind,rawType,linkId,link:null,ownMember:null,contextVerified:false,token:'0',muteUntil:0,explicitTitle:Boolean(explicitTitle(row)),left:row.left===true,cacheEpoch:0,receiptVersion:0,membershipDirty:false,expectedMembers:Number.isSafeInteger(row.a ?? row.activeMembersCount)?(row.a ?? row.activeMembersCount):null,members:null,watermarks:new Map(),receiptReady:false,
+    const counts=fieldsOf(row,['n','newMessageCount']);
+    const invalidCount=counts.some(value=>!Number.isSafeInteger(value) || value<0 || value>INITIAL_UNREAD_LIMIT || value!==counts[0])
+      || row?.invalidNewMessageCount!==undefined && row.invalidNewMessageCount!==false;
+    const initialUnreadCount=discovered || invalidCount?0:counts[0] ?? 0,initialUnreadCoverage=!discovered && invalidCount?'partial':'observed';
+    rooms.set(key,{key,serverRoomId,preferenceKey:settingsSecret?preferenceId(settingsSecret,'room',ownUserId,serverRoomId):null,historyEnd,baseline:discovered?'0':historyEnd,initialUnreadCount,initialUnreadCoverage,seed,names,kind,rawType,linkId,link:null,ownMember:null,contextVerified:false,token:'0',muteUntil:0,explicitTitle:Boolean(explicitTitle(row)),left:row.left===true,cacheEpoch:0,receiptVersion:0,membershipDirty:false,expectedMembers:Number.isSafeInteger(row.a ?? row.activeMembersCount)?(row.a ?? row.activeMembersCount):null,members:null,watermarks:new Map(),receiptReady:false,
       title:name || `이름 없는 대화방 ${rooms.size+1}`,titleKnown:Boolean(name),preview:text(last).slice(0,160),lastAt:timestamp(last?.sendAt ?? last?.createdAt ?? row?.updatedAt)});
     byServerId.set(serverRoomId,key);
     return key;
@@ -134,12 +186,14 @@ export function createReaderStore(body, ownUserId, salt=randomBytes(32),settings
         if(!roomAliases){roomAliases=new Map();aliases.set(key,roomAliases);}
         roomAliases.set(sender,`참여자 ${roomAliases.size+1}`);aliasCount++;
       }
-      const name=clean(log.senderName ?? log.authorName ?? log.nickname ?? log.sender?.nickname,80) || room.names.get(sender);
+      const name=clean(log.senderName ?? log.authorName ?? log.nickname ?? log.sender?.nickname,80);
       if(messages.has(id))duplicates++;
       const type=Number(log.type ?? log.msgType ?? log.t ?? 1),attachment=type===26?attachmentObject(log.attachment):null;
-      const reply=attachment && typeof attachment.src_message==='string'?{text:clean(attachment.src_message,4000),sender:serverId(attachment.src_userId)===ownUserId?'나':room.names.get(serverId(attachment.src_userId)) || '원본 메시지'}:null;
+      // The quoted author/text are sender-controlled. Keep only the claimed
+      // source log; view() shows the cached original or an unverified label.
+      const quote=attachment && typeof attachment.src_message==='string'?{text:marks(clean(attachment.src_message,4000)),logId:quoteLogId(log.attachment,attachment)}:null;
       const target={id,authorId:sender,type,text:text(log)};
-      messages.set(id,{key:opaque('m_',room.serverRoomId+':'+id),text:text(log),photos:photoAttachments(log),sender:mine?'나':name || roomAliases?.get(sender) || '작성자 미확인',mine,reply,canReply:Boolean(replyExtra(target)),replyTarget:target,at:timestamp(log.sendAt ?? log.createdAt ?? log.created_at)});
+      messages.set(id,{key:opaque('m_',room.serverRoomId+':'+id),text:text(log),photos:photoAttachments(log),authorId:sender,name,mine,quote,canReply:Boolean(replyExtra(target)),replyTarget:target,at:timestamp(log.sendAt ?? log.createdAt ?? log.created_at)});
     }
     const ordered=[...messages.keys()].sort((a,b)=>BigInt(a)<BigInt(b)?-1:BigInt(a)>BigInt(b)?1:0);
     for(const id of ordered.slice(0,Math.max(0,ordered.length-MESSAGE_LIMIT)))messages.delete(id);
@@ -149,6 +203,8 @@ export function createReaderStore(body, ownUserId, salt=randomBytes(32),settings
     const room=rooms.get(key),messages=cache.get(key) ?? new Map();
     if(!room)return {messages:[],latestVisible:false};
     const ordered=knownOrder ?? [...messages.keys()].sort((a,b)=>BigInt(a)<BigInt(b)?-1:BigInt(a)>BigInt(b)?1:0);
+    // Names resolve here so a later MEMBER/CHATONROOM name updates cached rows.
+    const roomAliases=aliases.get(key),senderOf=item=>item.mine?'나':personName(item.name) || personName(room.names.get(item.authorId)) || roomAliases?.get(item.authorId) || '작성자 미확인';
     return {messages:ordered.map(id=>{
       const item=messages.get(id);let unreadCount=null;
       if(item.mine && room.kind==='MemoChat')unreadCount=0;
@@ -156,7 +212,9 @@ export function createReaderStore(body, ownUserId, salt=randomBytes(32),settings
         const peers=[...room.members].filter(member=>member!==ownUserId);
         if(peers.every(member=>room.watermarks.has(member)))unreadCount=peers.filter(member=>BigInt(room.watermarks.get(member))<BigInt(id)).length;
       }
-      const {replyTarget,...publicItem}=item;return {...publicItem,unreadCount};
+      const original=item.quote?.logId?messages.get(item.quote.logId):null;
+      const reply=item.quote?original?{text:original.text,sender:senderOf(original),verified:true}:{text:item.quote.text,sender:'원본 확인 불가',verified:false}:null;
+      const {replyTarget,authorId,name,quote,...publicItem}=item;return {...publicItem,sender:senderOf(item),reply,unreadCount};
     }),latestVisible:Boolean(room.historyEnd && messages.has(room.historyEnd))};
   }
   function watermark(value){
@@ -172,7 +230,7 @@ export function createReaderStore(body, ownUserId, salt=randomBytes(32),settings
     const writable=Boolean(ready && room.muteUntil===0);
     return {canText:normal || writable,canReply:normal || writable,canPhoto:normal || writable,canRead:normal || Boolean(ready),canContext:normal || linkReady,canSend:normal || writable};
   }
-  function invalidate(room){room.receiptVersion++;room.contextVerified=false;room.ownMember=null;room.receiptReady=false;room.membershipDirty=true;}
+  function invalidate(room){room.receiptVersion++;room.contextVerified=false;room.ownMember=null;room.pendingOwnMember=null;room.receiptReady=false;room.membershipDirty=true;}
   function applyLink(row,{deleted=false,eligible}={}){
     if(!object(row))return [];
     const ids=fieldsOf(row,['li','linkId','openLinkId']);
@@ -209,7 +267,7 @@ export function createReaderStore(body, ownUserId, salt=randomBytes(32),settings
     return [...changed];
   }
   return {
-    rooms(){return [...rooms.values()].map(room=>({key:room.key,...(room.preferenceKey?{preferenceKey:room.preferenceKey}:{}),contextRevision:room.receiptVersion,cacheEpoch:room.cacheEpoch,title:room.title,titleKnown:room.titleKnown,preview:room.preview,lastAt:room.lastAt,kind:room.kind,...capabilities(room),historyAvailable:Boolean(room.historyEnd)})).sort((a,b)=>(b.lastAt ?? 0)-(a.lastAt ?? 0));},
+    rooms(){return [...rooms.values()].map(room=>({key:room.key,...(room.preferenceKey?{preferenceKey:room.preferenceKey}:{}),contextRevision:room.receiptVersion,cacheEpoch:room.cacheEpoch,title:room.title,titleKnown:room.titleKnown,preview:room.preview,lastAt:room.lastAt,kind:room.kind,initialUnreadCount:room.initialUnreadCount,initialUnreadCoverage:room.initialUnreadCoverage,...capabilities(room),historyAvailable:Boolean(room.historyEnd)})).sort((a,b)=>(b.lastAt ?? 0)-(a.lastAt ?? 0));},
     pin(key){if(!rooms.has(key))return false;pinned=key;return true;},
     has:key=>rooms.has(key),
     serverRoomId:key=>rooms.get(key)?.serverRoomId,
@@ -225,26 +283,64 @@ export function createReaderStore(body, ownUserId, salt=randomBytes(32),settings
     entryOption:key=>rooms.get(key)?.ownMember?.token>=0?rooms.get(key).ownMember.token:0,
     entrySnapshot(key,response,version){
       const room=rooms.get(key);if(!room || version!==room.receiptVersion || !matchingRoom(response,room.serverRoomId))return false;
-      const row=response?.chatInfo ?? response;
-      room.contextVerified=false;room.ownMember=null;
+      room.contextVerified=false;room.ownMember=null;room.pendingOwnMember=null;
       const links=[...fieldsOf(response,['li','linkId','openLinkId']),...fieldsOf(response?.chatInfo,['li','linkId','openLinkId'])];
       if(openKinds.has(room.kind) && (!room.linkId || links.some(value=>serverId(value)!==room.linkId)))return false;
       const token=response?.o===undefined?'0':watermark(response.o);if(!token)return false;
+      // Pinned chat-on-room.ts: m (<=100 member structs) or mi (ids only).
+      const listed=[...(Array.isArray(response.mi)?response.mi.slice(0,500):[]),...(Array.isArray(response.m)?response.m.slice(0,500).map(member=>member?.userId):[])];
+      room.memberIds=new Set(listed.map(serverId).filter(Boolean));
+      if(Array.isArray(response.m))for(const member of response.m.slice(0,500))learn(room,serverId(member?.userId),member?.nickName ?? member?.nickname);
       // APK CHATONROOM.o -> saved room token -> next CHATONROOM.token. A
       // LOGINLIST/global cursor is deliberately never a token source.
       room.token=token;
       if(openKinds.has(room.kind)){
         // APK25.11.2 iq.o.a: userId Long, lmt/opt Integer, pv Long.
         // context.notiRead controls count display, not this action gate.
-        const member=row.olu,role=member?.lmt,memberToken=member?.opt;
-        const id=serverId(member?.userId);
-        const mute=row.mt===undefined?0:row.mt;
-        if(id!==ownUserId || !int32(role) || ![1,2,4].includes(role) || !int32(mute) || mute<0 || memberToken!==undefined && !int32(memberToken)){
-          return true; // Matching entry ACK is distinct from action permission.
+        const nested=Object.hasOwn(response,'chatInfo');
+        if(nested && !object(response.chatInfo))return true;
+        const contexts=nested?[response,response.chatInfo]:[response];
+        const mutes=contexts.flatMap(row=>fieldsOf(row,['mt']));
+        if(mutes.some(mute=>!int32(mute) || mute<0 || mute!==mutes[0]))return true;
+        const mute=mutes.length?mutes[0]:0;
+        room.muteUntil=mute;
+        const supplied=contexts.flatMap(row=>fieldsOf(row,['olu']));
+        // Missing own metadata permits one exact self lookup, never a default role.
+        if(!supplied.length){
+          if(capabilities(room).canContext)room.pendingOwnMember={version,linkId:room.linkId,attempted:false};
+          return true;
         }
-        room.ownMember={userId:id,role,token:memberToken ?? -1,privilege:member.pv};room.muteUntil=mute;
+        // Every explicit copy must be valid; a nested member cannot hide a root refusal.
+        const members=supplied.map(member=>{
+          if(!object(member) || serverId(member.userId)!==ownUserId || !int32(member.lmt) || ![1,2,4].includes(member.lmt)
+            || member.opt!==undefined && !int32(member.opt))return null;
+          return {userId:ownUserId,role:member.lmt,token:member.opt ?? -1,privilege:member.pv};
+        });
+        if(members.some(member=>!member))return true; // ACK/cache is distinct from permission.
+        const member=members[0];
+        if(members.some(value=>value.userId!==member.userId || value.role!==member.role || value.token!==member.token))return true;
+        room.ownMember=member;
       }
       room.contextVerified=true;return true;
+    },
+    takeOwnMemberLookup(key,version){
+      const room=rooms.get(key),pending=room?.pendingOwnMember;
+      if(!pending || pending.attempted || pending.version!==version || room.receiptVersion!==version || pending.linkId!==room.linkId || !capabilities(room).canContext)return false;
+      pending.attempted=true;return true;
+    },
+    ownMemberSnapshot(key,body,version){
+      const room=rooms.get(key),pending=room?.pendingOwnMember;
+      if(!room || !pending || !pending.attempted)return false;
+      room.pendingOwnMember=null;
+      if(pending.version!==version || room.receiptVersion!==version || pending.linkId!==room.linkId || !capabilities(room).canContext
+        || !object(body) || serverId(body.chatId)!==room.serverRoomId || !matchingRoom(body,room.serverRoomId)
+        || !Array.isArray(body.members) || body.members.length!==1)return false;
+      const member=body.members[0];
+      const links=[...fieldsOf(body,['li','linkId','openLinkId']),...fieldsOf(body.chatInfo,['li','linkId','openLinkId']),...fieldsOf(member,['li','linkId','openLinkId'])];
+      if(!object(member) || serverId(member.userId)!==ownUserId || member.type!==1000 || !int32(member.mt) || ![1,2,4].includes(member.mt)
+        || member.opt!==undefined && !int32(member.opt) || !matchingRoom(member,room.serverRoomId,{required:false}) || links.some(id=>serverId(id)!==room.linkId))return false;
+      // MEMBER.mt is a role; CHATONROOM.mt remains the independent mute gate.
+      room.ownMember={userId:ownUserId,role:member.mt,token:member.opt ?? -1};room.contextVerified=true;return true;
     },
     linkSyncSnapshot:()=>new Map([...rooms.values()].map(room=>[room.key,room.receiptVersion])),
     missingOpenLinkIds(limit=16){
@@ -281,6 +377,18 @@ export function createReaderStore(body, ownUserId, salt=randomBytes(32),settings
       }
       const row=response?.ol ?? response?.openLink ?? response;
       return applyLink(row,{deleted:['SYNCLINKDL','LNKDELETED'].includes(method)}).map(key=>({key,...view(key),receiptInvalidated:true,entryInvalidated:true}));
+    },
+    unnamedMembers(key){
+      const room=rooms.get(key);if(!room)return [];
+      const ids=new Set([...(room.memberIds ?? []),...[...(cache.get(key)?.values() ?? [])].map(item=>item.authorId)]);
+      return [...ids].filter(id=>id && id!==ownUserId && !room.names.has(id)).slice(0,500);
+    },
+    // Pinned member.ts MemberRes {chatId,members}. Only requested IDs are named.
+    applyMembers(key,body,requested){
+      const room=rooms.get(key);if(!room || !object(body) || serverId(body.chatId)!==room.serverRoomId || !Array.isArray(body.members) || !Array.isArray(requested) || body.members.length>requested.length)return false;
+      const wanted=new Set(requested);let changed=false;
+      for(const member of body.members){const id=serverId(member?.userId);if(!wanted.delete(id))continue;const before=room.names.get(id);learn(room,id,member?.nickName ?? member?.nickname);changed ||= room.names.get(id)!==before;}
+      return changed;
     },
     unnamedRooms(limit=8){
       return [...rooms.values()].filter(room=>!room.titleKnown && room.kind!=='MemoChat')
@@ -391,7 +499,7 @@ export function createReaderStore(body, ownUserId, salt=randomBytes(32),settings
     },
     push(body) {
       const logs=logArray(body) ?? (object(body) && serverId(body.logId) ? [body] : []);
-      const updates=new Map();
+      const updates=new Map(),nickname=logs.length===1 && object(body?.chatLog)?body.authorNickname:undefined; // Pinned msg.ts: MSG top-level authorNickname.
       for(const log of logs.slice(0,200)) {
         if(!object(log)){invalidMessages++;continue;}
         const serverRoomId=serverId(body?.chatId ?? body?.c ?? log?.chatId ?? log?.roomId);
@@ -400,11 +508,12 @@ export function createReaderStore(body, ownUserId, salt=randomBytes(32),settings
         const attached=serverId(log.chatId ?? log.roomId ?? log.c);
         if(!logId || (attached && attached!==serverRoomId)){invalidMessages++;continue;}
         const room=rooms.get(key);
+        const sender=serverId(log.authorId ?? log.senderId ?? log.userId ?? log.writerId ?? log.sender?.userId);
+        if(nickname!==undefined)learn(room,sender,nickname);
         if(logId && (!room.historyEnd || BigInt(logId)>BigInt(room.historyEnd)))room.historyEnd=logId;
         const merged=merge(key,[log]);if(!merged?.acceptedCount)continue;
         const at=timestamp(log.sendAt ?? log.createdAt);
         if(at && (!room.lastAt || at>=room.lastAt)){room.lastAt=at;room.preview=text(log).slice(0,160);}
-        const sender=serverId(log.authorId ?? log.senderId ?? log.userId ?? log.writerId ?? log.sender?.userId);
         const kind=Number(log.type ?? log.msgType ?? log.t ?? 1);
         const arrivals=updates.get(key)?.arrivals ?? [];
         arrivals.push({key:opaque('m_',room.serverRoomId+':'+logId),incoming:sender?sender!==ownUserId:null,

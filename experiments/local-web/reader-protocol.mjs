@@ -4,9 +4,9 @@ import { serverId } from './reader-data.mjs';
 
 const WRITE_RESPONSE_LIMIT=2048;
 const ROOM_RESPONSES=new Set(['CHATONROOM','CHATINFO','NOTIREAD']);
-const EXACT_RESPONSES=new Set(['SYNCLINK','INFOLINK']);
+const EXACT_RESPONSES=new Set(['SYNCLINK','INFOLINK','MEMBER']);
 const RECOVERABLE_METHODS=new Set(['CHATONROOM','NOTIREAD','SHIP','PING']);
-const OPTIONAL_METHODS=new Set(['CHATINFO','SYNCLINK','INFOLINK']);
+const OPTIONAL_METHODS=new Set(['CHATINFO','SYNCLINK','INFOLINK','MEMBER']);
 const values=(body,names)=>[body,body?.chatLog,body?.log].flatMap(value=>names.filter(name=>value && Object.hasOwn(value,name)).map(name=>value[name]));
 function writeMatches(packet,request,{fallback=false}={}){
   if(!request)return !fallback;

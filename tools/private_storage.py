@@ -13,6 +13,23 @@ import stat
 import subprocess
 
 
+def _native_security():
+    # Help/import on other platforms must not load a Windows ctypes backend.
+    try:
+        from tools import windows_security
+    except ModuleNotFoundError:
+        import windows_security
+    return windows_security
+
+
+def secure_directory(path):
+    return _native_security().secure_directory(path)
+
+
+def verify_acl(path):
+    return _native_security().verify_acl(path)
+
+
 def data_root(project_root=None, local_app_data=None):
     root = os.path.abspath(project_root if project_root is not None else os.path.join(os.path.dirname(__file__), os.pardir))
     base = local_app_data if local_app_data is not None else os.environ.get("LOCALAPPDATA")
@@ -38,16 +55,7 @@ def ensure_private_directory(path):
             raise ValueError("private_data_path")
     target.mkdir(parents=True, exist_ok=True, mode=0o700)
     if os.name == "nt":
-        script = r"""$ErrorActionPreference='Stop';$p=$env:WEBKAKAO_PRIVATE_DIRECTORY;
-$sid=[System.Security.Principal.WindowsIdentity]::GetCurrent().User;
-$acl=New-Object System.Security.AccessControl.DirectorySecurity;$acl.SetOwner($sid);$acl.SetAccessRuleProtection($true,$false);
-$allowed=@($sid.Value,'S-1-5-18','S-1-5-32-544');foreach($s in $allowed){$id=New-Object System.Security.Principal.SecurityIdentifier($s);$rule=New-Object System.Security.AccessControl.FileSystemAccessRule($id,'FullControl','ContainerInherit,ObjectInherit','None','Allow');$acl.AddAccessRule($rule)};
-Set-Acl -LiteralPath $p -AclObject $acl;$check=Get-Acl -LiteralPath $p;if(!$check.AreAccessRulesProtected){throw 'private_acl'};
-$rules=@($check.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier]));if($rules.Count -ne 3){throw 'private_acl'};foreach($r in $rules){if($r.IdentityReference.Value -notin $allowed -or $r.AccessControlType -ne 'Allow' -or $r.IsInherited -or $r.FileSystemRights -ne 'FullControl'){throw 'private_acl'}}"""
-        subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
-                       env={**os.environ, "WEBKAKAO_PRIVATE_DIRECTORY": str(target)},
-                       check=True, capture_output=True, timeout=10,
-                       creationflags=subprocess.CREATE_NO_WINDOW)
+        secure_directory(target)
     else:
         target.chmod(0o700)
     return target
@@ -66,12 +74,7 @@ def verify_private_file(path, *, max_bytes=1024 * 1024):
         if parent.is_symlink() or is_junction(parent) or not parent.is_dir():
             raise ValueError("private_file_path")
     if os.name == "nt":
-        script = r"""$ErrorActionPreference='Stop';$p=$env:WEBKAKAO_PRIVATE_FILE;$sid=[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value;
-$allowed=@($sid,'S-1-5-18','S-1-5-32-544');$acl=Get-Acl -LiteralPath $p;if($acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $sid){throw 'private_file_owner'};
-$rules=@($acl.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier]));if(!$rules.Count){throw 'private_file_acl'};foreach($r in $rules){if($r.IdentityReference.Value -notin $allowed -or $r.AccessControlType -ne 'Allow'){throw 'private_file_acl'}}"""
-        subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
-                       env={**os.environ, "WEBKAKAO_PRIVATE_FILE": str(path.absolute())}, check=True,
-                       capture_output=True, timeout=10, creationflags=subprocess.CREATE_NO_WINDOW)
+        verify_acl(path)
     elif info.st_mode & 0o077:
         raise ValueError("private_file_acl")
     return True

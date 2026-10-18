@@ -28,6 +28,34 @@ export function imageType(data){
   if(data.toString('ascii',0,4)==='RIFF' && data.toString('ascii',8,12)==='WEBP')return 'image/webp';
   return null;
 }
+// Header-declared pixel size only (PNG IHDR, JPEG SOF, GIF screen, WebP VP8/VP8L/VP8X).
+export function imageDimensions(data){
+  const type=imageType(data);
+  if(type==='image/png')return data.length>=24 && data.toString('ascii',12,16)==='IHDR'?{width:data.readUInt32BE(16),height:data.readUInt32BE(20)}:null;
+  if(type==='image/gif')return {width:data.readUInt16LE(6),height:data.readUInt16LE(8)};
+  if(type==='image/webp'){
+    const chunk=data.toString('ascii',12,16);
+    if(chunk==='VP8 ' && data.length>=30)return {width:data.readUInt16LE(26)&0x3fff,height:data.readUInt16LE(28)&0x3fff};
+    if(chunk==='VP8L' && data.length>=25){const bits=data.readUInt32LE(21);return {width:(bits&0x3fff)+1,height:((bits>>>14)&0x3fff)+1};}
+    if(chunk==='VP8X' && data.length>=30)return {width:data.readUIntLE(24,3)+1,height:data.readUIntLE(27,3)+1};
+    return null;
+  }
+  if(type!=='image/jpeg')return null;
+  let offset=2;
+  while(offset+4<=data.length){
+    if(data[offset++]!==255)return null;
+    while(data[offset]===255)offset++;
+    const marker=data[offset++];if(marker===217 || marker===218)return null;
+    if(marker===1 || marker>=208 && marker<=215)continue;
+    if(offset+2>data.length)return null;const size=data.readUInt16BE(offset);
+    if(size<2 || offset+size>data.length)return null;
+    if([192,193,194,195,197,198,199,201,202,203,205,206,207].includes(marker) && size>=8)return {width:data.readUInt16BE(offset+5),height:data.readUInt16BE(offset+3)};
+    offset+=size;
+  }
+  return null;
+}
+// Decompression-bomb bound for fetched photos; unknown sizes are refused.
+const displayable=data=>{const size=imageDimensions(data);return Boolean(size && size.width>0 && size.height>0 && size.width<=8192 && size.height<=8192 && size.width*size.height<=40000000);};
 export async function fetchPhoto(value,{signal,resolve=lookup,request=https.request,redirects=0,deadlineMs=8000}={}){
   if(!Number.isFinite(deadlineMs) || deadlineMs<=0 || deadlineMs>2147483647)throw new Error('photo_unavailable');
   const controller=new AbortController(),requests=new Set();
@@ -58,7 +86,7 @@ export async function fetchPhoto(value,{signal,resolve=lookup,request=https.requ
         const chunks=[];let size=0;
         response.on('data',chunk=>{size+=chunk.length;if(size>10*1024*1024){req.destroy();fail();}else chunks.push(chunk);});
         response.on('error',fail);response.on('aborted',fail);
-        response.on('end',()=>{const data=Buffer.concat(chunks),type=imageType(data);if(!type){fail();return;}requests.delete(req);accept({data,type});});
+        response.on('end',()=>{const data=Buffer.concat(chunks),type=imageType(data);if(!type || !displayable(data)){fail();return;}requests.delete(req);accept({data,type});});
       });
       requests.add(req);req.on('error',fail);req.end();
     }));
@@ -78,7 +106,7 @@ export function createPhotoCache({fetcher=fetchPhoto}={}){
         if(active>=4)await new Promise(resolve=>waiting.push(resolve));else active++;
         if(current!==epoch)throw new Error('photo_unavailable');
         const item=await fetcher(url,{signal:controller.signal});if(!Buffer.isBuffer(item?.data) || item.data.length>10*1024*1024)throw new Error('photo_unavailable');if(current!==epoch)throw new Error('photo_unavailable');
-        while(entries.size && (entries.size>=64 || bytes+item.data.length>30*1024*1024)){const [key,value]=entries.entries().next().value;bytes-=value.data.length;entries.delete(key);}
+        while(entries.size && bytes+item.data.length>30*1024*1024){const [key,value]=entries.entries().next().value;bytes-=value.data.length;entries.delete(key);}
         entries.set(url,item);bytes+=item.data.length;return item;
       }finally{controllers.delete(controller);if(current===epoch){pending.delete(url);const next=waiting.shift();if(next)next();else active--;}}})();pending.set(url,promise);return promise;
     },

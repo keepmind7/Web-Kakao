@@ -16,7 +16,7 @@ function uploadFault(error){
   return {category,code}; // Never record a raw error message, stack or address.
 }
 
-const signedId=value=>{const id=serverId(value);return id && BigInt(id)<=9223372036854775807n?id:'';};
+const signedId=serverId; // serverId enforces the positive signed int64 range.
 function completeMatches(body,{chatId,userId,messageId,requireLog}){
   const log=body?.chatLog;
   if(requireLog && (!log || Array.isArray(log) || !signedId(log.logId)))return false;
@@ -94,11 +94,13 @@ async function performUpload({carriage,createClient,toLong,chatId,userId,message
     const offset=Number(post.body?.o);
     trace('offset',{offset:Number.isSafeInteger(offset)?offset:null,totalBytes:data.length});
     if(!Number.isSafeInteger(offset) || offset<0 || offset>data.length){trace('offset',{failure:'invalid_offset'});return {phase:'unknown',status:null};}
-    let sent=offset;
+    let sent=offset,frames=0;
     trace('stream');
     // Each writeEncrypted call makes a complete GCM frame. Preserve the file
     // byte sequence while bounding each frame, including nonce and tag.
-    while(sent<data.length){assertLive();const end=Math.min(sent+MAX_UPLOAD_CHUNK_BYTES,data.length);await awaitLive(()=>client.writeEncrypted(data.subarray(sent,end)));sent=end;trace('stream',{sentBytes:sent,totalBytes:data.length});}
+    // One collapsed stream event keeps earlier stage timings in the rolling log.
+    while(sent<data.length){assertLive();const end=Math.min(sent+MAX_UPLOAD_CHUNK_BYTES,data.length);await awaitLive(()=>client.writeEncrypted(data.subarray(sent,end)));sent=end;frames++;}
+    if(frames)trace('stream',{sentBytes:sent,totalBytes:data.length,frames});
     trace('await_complete',{sentBytes:sent,totalBytes:data.length});
     const result=await awaitLive(()=>complete);assertLive();
     if(result.error)return {phase:'unknown',status:null};

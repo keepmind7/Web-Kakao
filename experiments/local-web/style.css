@@ -31,12 +31,22 @@ h2 {font-size:18px}
 .muted {font-size:12px;color:var(--muted)}
 .secondary {background:var(--subtle);color:var(--text);border:1px solid var(--line)}
 .sr-only {position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
-.app-shell {display:grid;grid-template-columns:340px minmax(0,1fr);height:100dvh;overflow:hidden}
+.app-shell {display:grid;grid-template-columns:340px minmax(0,1fr);height:100vh;height:100dvh;overflow:hidden}
 .sidebar {background:var(--panel);border-right:1px solid var(--line);display:flex;flex-direction:column;min-height:0;min-width:0}
 .sidebar-header {display:flex;align-items:center;gap:12px;padding:18px 16px 14px;min-height:80px}
 .brand-mark {flex:none;background:var(--accent);color:var(--accent-ink);width:46px;height:46px;border-radius:16px;display:grid;place-items:center;font-weight:800;font-size:22px}
 .brand-copy {flex:1;min-width:0}
 .connection-label {font-size:11px;color:var(--muted);margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.status-dot {display:inline-block;width:8px;height:8px;margin-right:6px;border-radius:50%;background:#9aa3ab;vertical-align:1px}
+.status-dot[data-state="connected"] {background:#2fbf71;box-shadow:0 0 0 3px #2fbf7129}
+.status-dot[data-state="connecting"] {background:#e0a800}
+.status-dot[data-state="error"] {background:#d9534f}
+.session-meter {margin:0 16px 10px;font-size:11px;color:var(--muted);line-height:1.5}
+.session-meter-bar {height:4px;border-radius:999px;background:var(--subtle);overflow:hidden;margin-bottom:5px}
+.session-meter-bar span {display:block;height:100%;width:100%;background:#2fbf71;transition:width .9s linear}
+.session-meter[data-level="warn"] .session-meter-bar span {background:#e0a800}
+.session-meter[data-level="danger"] .session-meter-bar span {background:#d9534f}
+.session-meter[data-level="danger"] {color:var(--error)}
 .sidebar-tools {display:flex;gap:2px;flex:none}
 .icon-button {flex:none;width:36px;height:36px;display:inline-grid;place-items:center;background:transparent;color:var(--muted);border-radius:10px;padding:0;font-size:22px;font-weight:400;line-height:1;white-space:nowrap}
 .icon-button:not(:disabled):hover {background:var(--hover);filter:none}
@@ -90,12 +100,15 @@ h2 {font-size:18px}
 .message.mine {align-self:flex-end;margin-left:0;background:var(--mine);color:var(--mine-ink);border-radius:16px 4px 16px 16px}
 .message>.muted {font-size:10px;margin-bottom:4px;color:var(--muted);line-height:1.4}
 .message.mine>.muted {color:#63520f}
-.message p {font-size:14px;line-height:1.55;white-space:pre-wrap}
+.message p {font-size:14px;line-height:1.55;white-space:pre-wrap;overflow:hidden}
+.message>.muted,.message-quote strong,.room-copy strong,.chat-heading h2 {overflow:hidden}
 .message-read {position:absolute;right:calc(100% + 7px);bottom:2px;color:var(--chat-ink);font-size:11px;font-weight:700;white-space:nowrap}
 .message-quote {border:0;border-left:3px solid #81909d66;padding:2px 8px;margin:3px 0 8px;max-width:420px}
 .message-quote strong,.message-quote span {display:block;font-size:12px;white-space:pre-wrap;overflow-wrap:anywhere}
 .message-quote span {color:var(--muted);max-height:64px;overflow:hidden;margin-top:3px}
 .mine .message-quote span {color:#75641b}
+.message-quote.unverified {border-left-style:dashed}
+.message-quote.unverified strong {color:var(--muted);font-weight:500}
 .message mark {background:#f9c940;color:#302800;border-radius:2px}
 .message.search-current {outline:2px solid var(--focus);outline-offset:2px}
 .message-search-bar {display:flex;align-items:center;gap:7px;flex-shrink:0;background:var(--panel);padding:10px 18px;border-bottom:1px solid var(--line)}
@@ -117,6 +130,7 @@ h2 {font-size:18px}
 .composer #send-message:disabled {opacity:1;background:var(--subtle);color:var(--muted)}
 .send-status {font-size:12px;padding:6px 8px 0;line-height:1.6;color:var(--chat-ink);overflow-wrap:anywhere}
 .send-status:empty {display:none}
+.send-status.delivery-warning {margin-top:6px;padding:8px 10px;border:1px solid var(--line);border-radius:10px;background:var(--panel);color:var(--text)}
 #send-reset {font-size:12px;margin-top:6px}
 .reply-preview {display:flex;align-items:center;gap:10px;background:var(--panel);border-radius:14px 14px 0 0;padding:8px 14px;border-bottom:1px solid var(--line)}
 .reply-preview:not([hidden])+.composer {border-radius:0 0 14px 14px}
@@ -139,10 +153,10 @@ dialog p {font-size:12px;line-height:1.8;color:var(--muted);margin-top:12px}
 .image-send-dialog h2 {font-size:18px}
 .photo-dialog {width:auto;max-width:94vw;max-height:94dvh;padding:12px;background:#121417;color:#fff}
 .photo-dialog img {display:block;max-width:88vw;max-height:78dvh;object-fit:contain;margin:10px auto 0}
-.photo-dialog button {display:block;margin-left:auto}
+.photo-actions {display:flex;justify-content:flex-end;gap:8px}
 .photo-dialog p {color:#e8eaed}
 .account-backdrop {position:fixed;inset:0;background:#0006;z-index:10}
-.account-panel {position:fixed;inset:0 auto 0 0;width:min(390px,100%);height:100dvh;overflow-y:auto;padding:22px;background:var(--panel);border-right:1px solid var(--line);box-shadow:var(--shadow);z-index:11}
+.account-panel {position:fixed;inset:0 auto 0 0;width:min(390px,100%);height:100vh;height:100dvh;overflow-y:auto;padding:22px;background:var(--panel);border-right:1px solid var(--line);box-shadow:var(--shadow);z-index:11}
 .account-heading {display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
 .eyebrow {font-size:18px;font-weight:700}
 .badge {font-size:11px;color:var(--muted);margin-bottom:14px}
@@ -170,13 +184,28 @@ summary {cursor:pointer}
   .brand-mark {width:40px;height:40px;border-radius:14px}
   .chat-header {gap:6px;padding-inline:14px}
 }
-@media(max-width:760px) {
+/* 561~760px: 목록과 대화방을 나란히 두고 목록만 좁힌다 */
+@media(max-width:760px) and (min-width:561px) {
+  .app-shell {grid-template-columns:236px minmax(0,1fr)}
+  .sidebar-header {gap:8px;padding:14px 10px 10px;min-height:64px}
+  .brand-mark {display:none}
+  .search-wrap,.room-filters,.session-meter {margin-inline:10px}
+  .room-filters button {padding:5px 9px;font-size:12px}
+  .room-scroll {padding:4px 4px}
+  .room-item {gap:9px;padding:8px;min-height:60px}
+  .room-item .avatar {width:38px;height:38px;border-radius:14px;font-size:15px}
+  .room-copy strong {font-size:14px}
+  .room-preview {font-size:12px}
+}
+@media(max-width:560px) {
   .app-shell {grid-template-columns:minmax(0,1fr)}
   .sidebar {border-right:0}
   .chat-pane {display:none}
   .app-shell.mobile-chat .sidebar {display:none}
   .app-shell.mobile-chat .chat-pane {display:flex}
   .mobile-back {display:inline-grid}
+}
+@media(max-width:760px) {
   .chat-header {gap:5px;padding:10px 12px;min-height:64px}
   .chat-heading h2 {font-size:15px}
   .chat-heading p {font-size:11px}

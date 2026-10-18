@@ -15,8 +15,8 @@ async function browserSession(app,url){
   const {ticket}=await issue.json();assert.match(ticket,/^[a-f0-9]{64}$/);
   const session=await fetch(url+'/api/local/session',{method:'POST',headers:{Origin:url,'Content-Type':'application/json'},body:JSON.stringify({ticket})});
   assert.equal(session.status,200);
-  const cookie=session.headers.get('set-cookie');assert.match(cookie,/HttpOnly; SameSite=Strict/);
-  return {cookie:cookie.split(';')[0],response:session};
+  assert.equal(session.headers.get('set-cookie'),null);const token=(await session.json()).session;assert.match(token,/^[a-f0-9]{64}$/);
+  return {auth:{'x-local-session':token},token,response:session};
 }
 
 const room='r_'+'a'.repeat(24),other='r_'+'b'.repeat(24),msg=n=>'m_'+n.toString(16).padStart(24,'0');
@@ -212,7 +212,7 @@ test('bounded read probe establishes entry once then compares supplemental CHATI
     f.carriage.emit('push',{method:'MSG',status:0,body:{chatId:'9007199254740993',chatLog:{logId:'20',authorId:'111',msg:'Synthetic'}}});
     const message=events.find(e=>e.type==='reader-messages').messages[0];
     await session.action(key,1,'read',{message:message.key});
-    assert.deepEqual(f.calls.map(row=>row.method),['CHATONROOM','CHATINFO','NOTIREAD','CHATINFO']);
+    assert.deepEqual(f.calls.map(row=>row.method).filter(method=>method!=='MEMBER'),['CHATONROOM','CHATINFO','NOTIREAD','CHATINFO'],'read-only MEMBER name lookup is independent of the read sequence');
     assert.deepEqual(observed,[{before:{roomMatched:true,seenAtLeastTarget:false},after:{roomMatched:true,seenAtLeastTarget:true},targetIsOwn:false,requestedIsOwn:false}]);
     await session.action(key,2,'read',{message:message.key});
     assert.equal(f.calls.filter(row=>row.method==='CHATINFO').length,2);
@@ -223,8 +223,8 @@ test('new HTTP actions preserve authentication, origin/CSRF and strict payload v
   let sends=0,renames=0,seen=0;const app=createLocalServer({mode:'live',messaging:true,encode:()=>[[true]],transport:async op=>op==='allowlist'?{httpStatus:200,body:{allowlisted:true}}:op==='generate'?{httpStatus:200,body:{status:0,url:'OFFLINE-NOT-FOR-LOGIN',remainingSeconds:60}}:{httpStatus:200,body:{status:0,user:{userId:'246810'},accessToken:'FAKE_PRIVATE_TOKEN'}},readerFactory:()=>({snapshot:()=>({phase:'connected',canConnect:false}),close(){},sendText(){sends++;return true;},rename(){renames++;return true;},seen(){seen++;return true;}})});
   const url=await app.listen(0);
   try{
-    const {cookie}=await browserSession(app,url);const state=await(await fetch(url+'/api/status',{headers:{cookie}})).json();
-    const post=(path,body,origin=url)=>fetch(url+path,{method:'POST',headers:{cookie,origin,'content-type':'application/json','x-csrf-token':state.csrf},body:JSON.stringify(body)});
+    const {auth}=await browserSession(app,url);const state=await(await fetch(url+'/api/status',{headers:auth})).json();
+    const post=(path,body,origin=url)=>fetch(url+path,{method:'POST',headers:{...auth,origin,'content-type':'application/json','x-csrf-token':state.csrf},body:JSON.stringify(body)});
     const body={room,text:'합성',clientId:'12345678-1234-4123-8123-123456789abc'};
     assert.equal((await post('/api/reader/send',body)).status,409);await app.lab.start();for(let i=0;i<300 && !app.lab.snapshot().credentialInMemory;i++)await new Promise(r=>setTimeout(r,10));
     assert.equal((await post('/api/reader/send',body,'https://other.invalid')).status,403);assert.equal(sends,0);

@@ -4,8 +4,12 @@ import hashlib
 import json
 from pathlib import Path, PurePosixPath
 from urllib.request import Request, urlopen
+try:
+    from tools.cli_support import parse_arguments, run_preparation
+except ModuleNotFoundError:
+    from cli_support import parse_arguments, run_preparation
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).absolute().parent.parent
 CANDIDATES = {
     "modern": ("tyeom/kakao-cli", "8dbbd4f7ed6b42542982252250622fa351af00e9"),
     "legacy": ("storycraft/node-kakao", "8512e4699e2cd4c26516b80d38b57b2f85a6cc8a"),
@@ -23,41 +27,62 @@ def fetch(url):
     return data
 
 
-parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument("candidate", choices=CANDIDATES)
-args = parser.parse_args()
-repo, commit = CANDIDATES[args.candidate]
-tree = json.loads(fetch(f"https://api.github.com/repos/{repo}/git/trees/{commit}?recursive=1"))
-if tree.get("truncated"):
-    raise SystemExit("파일 목록이 잘려 조사 완료로 처리할 수 없습니다.")
-paths = [entry["path"] for entry in tree["tree"] if entry["type"] == "blob"]
-if args.candidate == "superpowers":
-    selected = ["LICENSE", "skills/brainstorming/SKILL.md", "skills/brainstorming/builder-check-prompt.md",
-                "skills/using-superpowers/SKILL.md", "skills/using-superpowers/references/codex-tools.md"]
-else:
-    selected = [p for p in paths if p.lower().endswith((".ts", ".tsx", ".py", ".json", ".yaml", ".md"))
-                or PurePosixPath(p).name.upper().startswith("LICENSE")]
-directory = ROOT / "local-only/sources" / args.candidate / commit
-directory.mkdir(parents=True, exist_ok=True)
-rows = []
-for relative in selected:
-    parts = PurePosixPath(relative)
-    if parts.is_absolute() or ".." in parts.parts:
-        raise ValueError("잘못된 원본 경로")
-    target = (directory / relative).resolve()
-    if not target.is_relative_to(directory.resolve()):
-        raise ValueError("원본 저장 경로가 작업 경계를 벗어남")
-    url = f"https://raw.githubusercontent.com/{repo}/{commit}/{relative}"
-    data = target.read_bytes() if target.exists() else fetch(url)
-    if not target.exists():
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(data)
-    rows.append({"path": relative, "sha256": hashlib.sha256(data).hexdigest()})
-manifest = {"candidate": args.candidate, "repository": f"https://github.com/{repo}", "commit": commit,
-            "directory": directory.relative_to(ROOT).as_posix(), "files": rows,
-            "public_tree_paths": paths, "code_executed": False, "account_used": False}
-output = ROOT / "evidence/alternatives" / f"{args.candidate}-source.json"
-output.parent.mkdir(parents=True, exist_ok=True)
-output.write_text(json.dumps(manifest, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
-print(json.dumps({"candidate": args.candidate, "commit": commit, "files": len(rows),
-                  "manifest": output.relative_to(ROOT).as_posix()}))
+def prepare(candidate):
+    repo, commit = CANDIDATES[candidate]
+    tree = json.loads(fetch(f"https://api.github.com/repos/{repo}/git/trees/{commit}?recursive=1"))
+    if tree.get("truncated"):
+        raise SystemExit("파일 목록이 잘려 조사 완료로 처리할 수 없습니다.")
+    paths = [entry["path"] for entry in tree["tree"] if entry["type"] == "blob"]
+    if candidate == "superpowers":
+        selected = ["LICENSE", "skills/brainstorming/SKILL.md", "skills/brainstorming/builder-check-prompt.md",
+                    "skills/using-superpowers/SKILL.md", "skills/using-superpowers/references/codex-tools.md"]
+    else:
+        selected = [p for p in paths if p.lower().endswith((".ts", ".tsx", ".py", ".json", ".yaml", ".md"))
+                    or PurePosixPath(p).name.upper().startswith("LICENSE")]
+    directory = ROOT / "local-only/sources" / candidate / commit
+    directory.mkdir(parents=True, exist_ok=True)
+    output = ROOT / "evidence/alternatives" / f"{candidate}-source.json"
+    previous = {}
+    if output.exists():
+        recorded = json.loads(output.read_text(encoding="utf-8"))
+        if recorded.get("commit") == commit:
+            previous = {row["path"]: row["sha256"] for row in recorded["files"]}
+    rows = []
+    for relative in selected:
+        parts = PurePosixPath(relative)
+        if parts.is_absolute() or ".." in parts.parts:
+            raise ValueError("잘못된 원본 경로")
+        target = (directory / relative).resolve()
+        if not target.is_relative_to(directory.resolve()):
+            raise ValueError("원본 저장 경로가 작업 경계를 벗어남")
+        url = f"https://raw.githubusercontent.com/{repo}/{commit}/{relative}"
+        if target.exists():
+            # Re-hash before reuse; without a record, compare with the pinned commit's public bytes.
+            data = target.read_bytes()
+            expected = previous.get(relative) or hashlib.sha256(fetch(url)).hexdigest()
+            if hashlib.sha256(data).hexdigest() != expected:
+                raise SystemExit("보관된 원본이 기록된 SHA-256과 달라 재사용하지 않습니다: " + relative)
+        else:
+            data = fetch(url)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+        rows.append({"path": relative, "sha256": hashlib.sha256(data).hexdigest()})
+    manifest = {"candidate": candidate, "repository": f"https://github.com/{repo}", "commit": commit,
+                "directory": directory.relative_to(ROOT).as_posix(), "files": rows,
+                "public_tree_paths": paths, "code_executed": False, "account_used": False}
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(manifest, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps({"candidate": candidate, "commit": commit, "files": len(rows),
+                      "manifest": output.relative_to(ROOT).as_posix()}))
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('candidate', choices=CANDIDATES)
+    args = parse_arguments(parser, argv)
+    run_preparation(parser, lambda: prepare(args.candidate))
+    return 0
+
+
+if __name__ == '__main__':
+    main()

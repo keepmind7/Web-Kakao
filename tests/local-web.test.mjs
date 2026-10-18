@@ -12,9 +12,9 @@ async function browserSession(app,url){
   assert.equal(issue.status,200);assert.equal(issue.headers.get('set-cookie'),null);
   const {ticket}=await issue.json();assert.match(ticket,/^[a-f0-9]{64}$/);
   const session=await fetch(url+'/api/local/session',{method:'POST',headers:{Origin:url,'Content-Type':'application/json'},body:JSON.stringify({ticket})});
-  assert.equal(session.status,200);
-  const cookie=session.headers.get('set-cookie');assert.match(cookie,/HttpOnly; SameSite=Strict/);
-  return {cookie:cookie.split(';')[0],response:session};
+  assert.equal(session.status,200);assert.equal(session.headers.get('set-cookie'),null,'cookies are not port-scoped');
+  const token=(await session.json()).session;assert.match(token,/^[a-f0-9]{64}$/);
+  return {auth:{'x-local-session':token},token,response:session};
 }
 
 const ok = body => ({ httpStatus: 200, body });
@@ -149,7 +149,7 @@ test('cancelled or expired QR can be manually renewed, but denial stays locked',
   const f = fixture([ok({allowlisted:true}),qr(),ok({allowlisted:true}),qr(),ok({allowlisted:true}),qr()]);
   await f.lab.start(); assert.equal(f.lab.snapshot().canStart,false); f.lab.cancel(); assert.equal(f.lab.snapshot().canStart,true);
   await f.lab.start(); f.advance(181000); await f.tick(); assert.equal(f.lab.snapshot().canStart,true);
-  await f.lab.start(); f.lab.cancel(); assert.equal(f.lab.snapshot().canStart,false); assert.equal(f.lab.snapshot().attempts,3);
+  await f.lab.start(); f.lab.cancel(); assert.equal(f.lab.snapshot().canStart,true); assert.equal(f.lab.snapshot().attempts,3);
   const denied = fixture([ok({allowlisted:false})]); await denied.lab.start(); denied.lab.cancel(); assert.equal(denied.lab.snapshot().canStart,false); assert.equal(await denied.lab.start(),false);
 });
 test('expiry stops polling; malformed or oversized QR content never reaches display', async () => {
@@ -222,22 +222,23 @@ test('HTTPS transport pins origin, path, TLS and bounded parsing; unknown operat
   assert.equal(captured[0].headers['Content-Type'],'application/x-www-form-urlencoded');
   await assert.rejects(transport('send',{},new AbortController().signal)); assert.equal(captured.length,1);
 });
-test('local web enforces cookie, Origin, CSRF, Host and has no chat endpoints', async () => {
+test('local web enforces session header, Origin, CSRF, Host and has no chat endpoints', async () => {
   let calls = 0;
   const app = createLocalServer({ transport:async () => { calls++; return ok({allowlisted:false}); }, encode:() => [[true]] });
   const url = await app.listen(0);
   try {
     assert.equal((await fetch(url+'/api/status')).status,403);
     const page = await fetch(url); assert.equal(page.headers.get('set-cookie'),null);
-    const {cookie,response:session}=await browserSession(app,url);
-    assert.match(session.headers.get('set-cookie'),/HttpOnly; SameSite=Strict/); assert.equal(page.headers.get('cache-control'),'no-store, max-age=0');
+    const {auth,token}=await browserSession(app,url);
+    assert.equal((await fetch(url+'/api/status',{headers:{cookie:'local_auth='+token}})).status,403,'a cookie never authenticates');
+    assert.equal((await fetch(url+'/api/status',{headers:{'x-local-session':'0'.repeat(64)}})).status,403); assert.equal(page.headers.get('cache-control'),'no-store, max-age=0');
     assert.equal(page.headers.get('access-control-allow-origin'),null);
-    const state = await (await fetch(url+'/api/status',{headers:{cookie}})).json();
-    const headers = {cookie,origin:url,'content-type':'application/json','x-csrf-token':state.csrf};
+    const state = await (await fetch(url+'/api/status',{headers:auth})).json();
+    const headers = {...auth,origin:url,'content-type':'application/json','x-csrf-token':state.csrf};
     assert.equal((await fetch(url+'/api/start',{method:'POST',headers:{...headers,origin:'https://evil.example'},body:'{}'})).status,403);
     assert.equal((await fetch(url+'/api/start',{method:'POST',headers:{...headers,'x-csrf-token':'wrong'},body:'{}'})).status,403);
     assert.equal(await rawStatus(url+'/api/start',{method:'POST',headers:{...headers,host:'evil.example'},body:'{}'}),403);
-    assert.equal(await rawStatus(url+'/api/status',{headers:{cookie,'sec-fetch-site':'cross-site'}}),403);
+    assert.equal(await rawStatus(url+'/api/status',{headers:{...auth,'sec-fetch-site':'cross-site'}}),403);
     assert.equal((await fetch(url+'/api/start',{method:'POST',headers,body:'{"token":"never accepted"}'})).status,400);
     assert.equal(calls,0);
     assert.equal((await fetch(url+'/api/start',{method:'POST',headers,body:'{}'})).status,202);
@@ -262,9 +263,9 @@ test('authenticated web can run one protected read-only probe without exposing a
   }});
   const url=await app.listen(0);
   try {
-    const {cookie}=await browserSession(app,url);
-    const state=await (await fetch(url+'/api/status',{headers:{cookie}})).json();
-    const headers={cookie,origin:url,'content-type':'application/json','x-csrf-token':state.csrf};
+    const {auth}=await browserSession(app,url);
+    const state=await (await fetch(url+'/api/status',{headers:auth})).json();
+    const headers={...auth,origin:url,'content-type':'application/json','x-csrf-token':state.csrf};
     const post=(path,extra={})=>fetch(url+path,{method:'POST',headers:{...headers,...extra},body:'{}'});
     assert.equal((await post('/api/room-probe')).status,409);
     await app.lab.start();await ready;await new Promise(setImmediate);
@@ -272,8 +273,27 @@ test('authenticated web can run one protected read-only probe without exposing a
     assert.equal((await post('/api/room-probe',{origin:'https://evil.example'})).status,403);assert.equal(probeCalls,0);
     assert.equal((await post('/api/room-probe')).status,202);assert.equal(probeCalls,1);
     assert.equal((await post('/api/room-probe')).status,409);
-    const output=await (await fetch(url+'/api/status',{headers:{cookie}})).text();
+    const output=await (await fetch(url+'/api/status',{headers:auth})).text();
     assert.equal(output.includes('FAKE_PRIVATE_ACCESS'),false);assert.equal(output.includes('246810'),false);
     const completed=JSON.parse(output);assert.equal(completed.actualChatConnected,true);assert.equal(completed.actualMessageSent,false);assert.equal(completed.roomProbe.roomCount,3);
   } finally {app.lab.cancel();app.server.close();app.server.closeAllConnections();}
+});
+
+test('launcher challenge proves the control token without receiving it and photos need a session-bound capability',async()=>{
+  const {createHmac}=await import('node:crypto');
+  const app=createLocalServer({encode:()=>[[true]]});const url=await app.listen(0);
+  try{
+    const nonce='ab'.repeat(32),challenge=await fetch(url+'/api/local/challenge?nonce='+nonce);assert.equal(challenge.status,200);
+    const body=await challenge.json();assert.equal(body.app,'web-kakao-auth-lab-v1');assert.equal(Object.keys(body).sort().join(','),'app,proof');
+    assert.equal(body.proof,createHmac('sha256',app.controlToken).update('web-kakao-launcher-challenge\0'+nonce).digest('hex'));
+    assert.equal((await fetch(url+'/api/local/challenge?nonce=short')).status,403);
+    const {auth,token}=await browserSession(app,url),room='r_'+'a'.repeat(24),message='m_'+'b'.repeat(24),path=`/api/photo?room=${room}&message=${message}&index=0`;
+    const cap=createHmac('sha256',token).update(`web-kakao-photo\0${room}:${message}:0`).digest('hex');
+    assert.equal((await fetch(url+path)).status,403);
+    assert.equal((await fetch(url+path+'&cap='+'0'.repeat(64))).status,403);
+    assert.equal((await fetch(url+path.replace('index=0','index=1')+'&cap='+cap)).status,403,'capability is bound to one photo');
+    assert.equal((await fetch(url+path+'&cap='+cap)).status,409,'valid capability passes authentication (no credential in fixture)');
+    assert.equal((await fetch(url+path,{headers:auth})).status,409,'header session also authorizes photo fetch');
+    assert.equal((await fetch(url+'/api/status?cap='+cap)).status,403,'photo capability never authorizes other routes');
+  }finally{app.server.close();app.server.closeAllConnections();}
 });

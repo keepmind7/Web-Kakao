@@ -17,8 +17,8 @@ async function browserSession(app,url){
   const {ticket}=await issue.json();assert.match(ticket,/^[a-f0-9]{64}$/);
   const session=await fetch(url+'/api/local/session',{method:'POST',headers:{Origin:url,'Content-Type':'application/json'},body:JSON.stringify({ticket})});
   assert.equal(session.status,200);
-  const cookie=session.headers.get('set-cookie');assert.match(cookie,/HttpOnly; SameSite=Strict/);
-  return {cookie:cookie.split(';')[0],response:session};
+  assert.equal(session.headers.get('set-cookie'),null);const token=(await session.json()).session;assert.match(token,/^[a-f0-9]{64}$/);
+  return {auth:{'x-local-session':token},token,response:session};
 }
 
 const png=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=','base64');
@@ -144,7 +144,7 @@ test('session constructs type26 from a real cached target and photo COMPLETE wit
     const target=events.find(e=>e.type==='reader-messages').messages[0].key;
     assert.equal(await session.action(key,1,'send',{text:'답장',replyTo:target}),true);const write=f.calls.find(c=>c.method==='WRITE');assert.equal(write.body.type,26);assert.equal(JSON.parse(write.body.extra).src_message,'합성 원문');
     assert.equal(await session.action(key,2,'photo',{image:png.toString('base64')}),true);assert.equal(f.calls.filter(c=>c.method==='WRITE').length,1);
-    assert.equal(f.calls.find(c=>c.method==='POST').body.mid,String(write.body.msgId+1));
+    assert.equal(f.calls.find(c=>c.method==='POST').body.mid,String(BigInt(String(write.body.msgId))+1n));
     assert.equal(events.filter(e=>e.type==='reader-action').at(-1).phase,'accepted');
   }finally{session.close();}
 });
@@ -224,8 +224,8 @@ test('image and reply HTTP routes require auth/CSRF, exact fields and valid actu
   let sent=0,quoted;
   const app=createLocalServer({mode:'live',messaging:true,encode:()=>[[true]],transport:async op=>op==='allowlist'?{httpStatus:200,body:{allowlisted:true}}:op==='generate'?{httpStatus:200,body:{status:0,url:'OFFLINE',remainingSeconds:60}}:{httpStatus:200,body:{status:0,user:{userId:'999'},accessToken:'FAKE'}},readerFactory:()=>({snapshot:()=>({phase:'connected'}),close(){},sendPhoto(){sent++;return true;},sendText(_room,_text,_uuid,replyTo){quoted=replyTo;return true;}})});
   const url=await app.listen(0);try{
-    const {cookie}=await browserSession(app,url),status=await(await fetch(url+'/api/status',{headers:{cookie}})).json();
-    const post=(path,body,origin=url)=>fetch(url+path,{method:'POST',headers:{cookie,origin,'Content-Type':'application/json','X-CSRF-Token':status.csrf},body:JSON.stringify(body)}),image={room,clientId:uuid,image:png.toString('base64')};
+    const {auth}=await browserSession(app,url),status=await(await fetch(url+'/api/status',{headers:auth})).json();
+    const post=(path,body,origin=url)=>fetch(url+path,{method:'POST',headers:{...auth,origin,'Content-Type':'application/json','X-CSRF-Token':status.csrf},body:JSON.stringify(body)}),image={room,clientId:uuid,image:png.toString('base64')};
     assert.equal((await post('/api/reader/photo',image)).status,409);await app.lab.start();for(let i=0;i<300 && !app.lab.snapshot().credentialInMemory;i++)await new Promise(r=>setTimeout(r,10));
     assert.equal((await post('/api/reader/photo',image,'https://evil.test')).status,403);
     for(const body of [{...image,url:'https://evil.test'}, {...image,image:'PHN2Zz4='},{...image,replyTo:message}])assert.equal((await post('/api/reader/photo',body)).status,400);

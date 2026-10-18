@@ -70,9 +70,10 @@ export function createTransport() {
 
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const seconds = value => Number.isFinite(value) && value > 0 && value <= 300;
-const positiveId = value => (typeof value === 'string' && /^[1-9]\d{0,30}$/.test(value)) || (Number.isSafeInteger(value) && value > 0);
+// Same positive signed int64 bound as reader-data serverId (SDK toLong wraps beyond it).
+const positiveId = value => (typeof value === 'string' && /^[1-9]\d{0,18}$/.test(value) && BigInt(value) <= 9223372036854775807n) || (Number.isSafeInteger(value) && value > 0);
 export function createAuthLab({ transport, encodeQr, mode = 'live', now = Date.now, later = setTimeout, clear = clearTimeout, credentialRetentionMs = 15*60*1000 }) {
-  if (!Number.isInteger(credentialRetentionMs) || credentialRetentionMs<1000 || credentialRetentionMs>60*60*1000) throw new Error('invalid_retention');
+  if (credentialRetentionMs!==null && (!Number.isInteger(credentialRetentionMs) || credentialRetentionMs<1000 || credentialRetentionMs>60*60*1000)) throw new Error('invalid_retention');
   let view = { phase: 'idle', message: 'QR 로그인 시작을 누르면 서버 허용 여부부터 확인합니다.', stage: null };
   let credentials = null, deviceUUID = null, qrId = null, timer = null, deadlineTimer = null, epoch = 0, attempts = 0, locked = false;
   let credentialDeadline = null, credentialObservedAt = null;
@@ -92,10 +93,10 @@ export function createAuthLab({ transport, encodeQr, mode = 'live', now = Date.n
     // state and remove credentials before allowing that reentrant observation.
     abort.abort();
   };
-  const canStart = () => !locked && attempts < 3 && ['idle','expired','cancelled','error'].includes(view.phase);
+  const canStart = () => !locked && ['idle','expired','cancelled','error'].includes(view.phase);
   const schedule = (callback, ms) => { timer = later(callback, ms); timer?.unref?.(); };
   function expireCredential(run=epoch) {
-    if(run!==epoch || !credentials)return false;
+    if(run!==epoch || !credentials || credentialRetentionMs===null)return false;
     const observed=now();
     if(!Number.isFinite(observed) || observed<credentialObservedAt || observed>=credentialDeadline){
       terminal('expired','실험용 인증 메모리를 지웠습니다. 다시 연결하려면 QR 인증이 필요합니다.');return true;
@@ -142,12 +143,12 @@ export function createAuthLab({ transport, encodeQr, mode = 'live', now = Date.n
         stopTimer();
         // Already queued QR callbacks must not expire or poll this new state.
         const authenticatedRun=++epoch;
-        credentials = { userId: String(body.user.userId), deviceUUID, accessToken: body.accessToken,
-          refreshToken: typeof body.refreshToken === 'string' ? body.refreshToken : '' };
-        credentialObservedAt=now();credentialDeadline=credentialObservedAt+credentialRetentionMs;
+        // refreshToken is never used, so it is not retained in memory either.
+        credentials = { userId: String(body.user.userId), deviceUUID, accessToken: body.accessToken };
+        credentialObservedAt=now();credentialDeadline=credentialRetentionMs===null?null:credentialObservedAt+credentialRetentionMs;
         qrId = null; delete view.grid; delete view.passcode; delete view.expiresAt;
         view = { ...view, phase: 'authenticated', message: 'QR 인증 응답과 토큰을 받았습니다. 대화 서버 연결은 아직 검증하지 않았습니다.' };
-        if(!expireCredential(authenticatedRun))scheduleCredentialExpiry(authenticatedRun);
+        if(credentialRetentionMs!==null && !expireCredential(authenticatedRun))scheduleCredentialExpiry(authenticatedRun);
         return;
       }
       if(body.status===0){terminal('error','인증 응답의 필수 항목을 확인할 수 없어 중단했습니다.');return;}
@@ -181,8 +182,9 @@ export function createAuthLab({ transport, encodeQr, mode = 'live', now = Date.n
     snapshot() {
       expireCredential();
       return { ...view, mode, profile: PROFILE, credentialInMemory: credentials !== null,
-        canStart: canStart(), sessionBlocked:locked, canProbe: !locked && view.phase === 'authenticated' && credentials !== null && !probeAttempted,
-        attempts, actualChatConnected: view.roomProbe?.connectionVerified === true, actualMessageSent: false, requests: { ...counts },authEvents:authEvents.map(event=>({...event})) };
+        credentialDeadline: credentials !== null ? credentialDeadline : null, serverNow: now(),
+        canStart: canStart(), sessionBlocked:locked, startBlockedReason:locked?'server_denied':null, canProbe: !locked && view.phase === 'authenticated' && credentials !== null && !probeAttempted,
+        attempts,attemptLimit:null, actualChatConnected: view.roomProbe?.connectionVerified === true, actualMessageSent: false, requests: { ...counts },authEvents:authEvents.map(event=>({...event})) };
     },
     async start() {
       expireCredential();

@@ -13,8 +13,8 @@ async function browserSession(app,url){
   const {ticket}=await issue.json();assert.match(ticket,/^[a-f0-9]{64}$/);
   const session=await fetch(url+'/api/local/session',{method:'POST',headers:{Origin:url,'Content-Type':'application/json'},body:JSON.stringify({ticket})});
   assert.equal(session.status,200);
-  const cookie=session.headers.get('set-cookie');assert.match(cookie,/HttpOnly; SameSite=Strict/);
-  return {cookie:cookie.split(';')[0],response:session};
+  assert.equal(session.headers.get('set-cookie'),null);const token=(await session.json()).session;assert.match(token,/^[a-f0-9]{64}$/);
+  return {auth:{'x-local-session':token},token,response:session};
 }
 import { createAuthLab } from '../experiments/local-web/kakao-auth.mjs';
 import { fork } from 'node:child_process';
@@ -239,20 +239,20 @@ test('server denies reader requests before authentication and protects history a
   const url=await app.listen(0);
   try{
     assert.equal((await fetch(url+'/api/reader/rooms')).status,403);
-    const {cookie}=await browserSession(app,url);
-    let state=await(await fetch(url+'/api/status',{headers:{cookie}})).json();
-    const headers={cookie,origin:url,'content-type':'application/json','x-csrf-token':state.csrf};
+    const {auth}=await browserSession(app,url);
+    let state=await(await fetch(url+'/api/status',{headers:auth})).json();
+    const headers={...auth,origin:url,'content-type':'application/json','x-csrf-token':state.csrf};
     const post=(path,body={},extra={})=>fetch(url+path,{method:'POST',headers:{...headers,...extra},body:JSON.stringify(body)});
-    assert.equal((await fetch(url+'/api/reader/rooms',{headers:{cookie}})).status,409);
+    assert.equal((await fetch(url+'/api/reader/rooms',{headers:auth})).status,409);
     await app.lab.start();await readyPoll;await tick();
     assert.equal((await post('/api/shutdown')).status,409);
     assert.equal((await post('/api/reader/connect')).status,202);
     assert.equal((await post('/api/reader/history',{room:key},{origin:'https://evil.example'})).status,403);assert.equal(historyCalls,0);
     assert.equal((await post('/api/reader/history',{room:credential.userId})).status,400);
     assert.equal((await post('/api/reader/history',{room:key})).status,202);
-    const status=await(await fetch(url+'/api/status',{headers:{cookie}})).text();assert.equal(status.includes('예시 방'),false);assert.equal(status.includes(credential.accessToken),false);
+    const status=await(await fetch(url+'/api/status',{headers:auth})).text();assert.equal(status.includes('예시 방'),false);assert.equal(status.includes(credential.accessToken),false);
     blockSession();
     assert.equal((await post('/api/reader/connect')).status,409);assert.equal((await post('/api/room-probe')).status,409);
-    await post('/api/cancel');assert.equal((await post('/api/start')).status,409);assert.equal((await fetch(url+'/api/reader/rooms',{headers:{cookie}})).status,409);
+    await post('/api/cancel');assert.equal((await post('/api/start')).status,409);assert.equal((await fetch(url+'/api/reader/rooms',{headers:auth})).status,409);
   }finally{app.lab.cancel();app.server.close();app.server.closeAllConnections();}
 });

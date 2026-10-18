@@ -73,14 +73,12 @@ try{
   };
   const until=async expression=>{const until=Date.now()+10000;while(!await evaluate(expression)){if(Date.now()>until){console.log(JSON.stringify({syntheticBrowserTimeout:await evaluate("({selectedRoom,pendingSelection,busy,refreshing,ackInFlight,pageKey:currentPage?.key,history:currentPage?.history,readSync:currentPage?.readSync,reader:lastState?.reader,freshness,connectDisabled:el('reader-connect').disabled,messageCount:document.querySelectorAll('#message-list article').length,historyButtonDisabled:el('history-load').disabled})"),historyRooms,statusRequests}));throw new Error('browser assertion timeout: '+expression);}await sleep(100);}};
   const refreshUi=()=>evaluate("(async()=>{while(refreshing || busy)await new Promise(resolve=>setTimeout(resolve,10));await refresh();})()");
-  // Compatibility only for this UI fixture's pre-security baseline. Security
-  // contract tests independently require the new control/ticket bootstrap.
-  const launcher=await fetch(url+'/api/local/launch',{method:'POST',headers:{'Content-Type':'application/json','Origin':url,'X-Local-Control':controlToken},body:'{}'});
-  let sessionCookie,bootstrap;
-  if(launcher.ok){const issued=await launcher.json();const exchange=await fetch(url+'/api/local/session',{method:'POST',headers:{'Content-Type':'application/json','Origin':url},body:JSON.stringify({ticket:issued.ticket})});assert.equal(exchange.status,200,'synthetic ticket exchange must succeed');sessionCookie=exchange.headers.get('set-cookie');bootstrap='control-ticket';}
-  else{assert.equal(launcher.status,403,'only the explicitly known pre-security fixture may use root cookie bootstrap');const root=await fetch(url+'/');sessionCookie=root.headers.get('set-cookie');bootstrap='legacy-root-baseline-only';}
-  assert.ok(sessionCookie?.startsWith('local_auth='),'fixture session cookie unavailable');
-  await call('Network.setCookie',{name:'local_auth',value:sessionCookie.split(';')[0].slice('local_auth='.length),url:url+'/',httpOnly:true,sameSite:'Strict'});await call('Page.reload');
+  // Bootstrap through the real launcher flow: control-issued ticket, fragment handoff, header session.
+  const launchUrl=async()=>{const launcher=await fetch(url+'/api/local/launch',{method:'POST',headers:{'Content-Type':'application/json','Origin':url,'X-Local-Control':controlToken},body:'{}'});assert.equal(launcher.status,200,'synthetic launch ticket must be issued');return url+'/launch#launch='+(await launcher.json()).ticket;};
+  const bootstrap='control-ticket-header-session';
+  await call('Page.navigate',{url:await launchUrl()});
+  {const end=Date.now()+10000;while(!await evaluate("location.pathname==='/' && document.readyState==='complete' && /^[a-f0-9]{64}$/.test(sessionStorage.getItem('webKakaoLocalSession') ?? '')").catch(()=>false)){if(Date.now()>end)throw new Error('launch bootstrap timeout');await sleep(100);}}
+  assert.equal(await evaluate("document.cookie"),'','header session must not use cookies');
   writeFileSync(resolve(folder,'synthetic-bootstrap.json'),JSON.stringify({actualAccountUsed:false,mode:bootstrap,secretsRecorded:false},null,2));
   async function checkAdversarialBrowser(){
     const results=[],extraSockets=[];let target;
@@ -91,7 +89,7 @@ try{
     const ready="typeof lastState!=='undefined' && lastState?.reader?.phase==='connected' && !busy && !refreshing && !ackInFlight && !pendingSelection";
     const stopPolling="clearTimeout(pollTimer);pollTimer=null;clearTimeout(queuedRefreshTimer);queuedRefreshTimer=null;refreshPending=false;showAccount(false);Object.defineProperty(document,'hidden',{configurable:true,get:()=>globalThis.testHidden===true});Object.defineProperty(document,'visibilityState',{configurable:true,get:()=>globalThis.testHidden?'hidden':'visible'});globalThis.testHidden=false;globalThis.testFocus=true;document.hasFocus=()=>globalThis.testFocus;el('read-sync').checked=false;";
     async function secondTab(){
-      target=await call('Target.createTarget',{url:url+'/'});
+      target=await call('Target.createTarget',{url:await launchUrl()});
       const targets=await(await fetch(`http://127.0.0.1:${port}/json/list`)).json();const remote=targets.find(row=>row.id===target.targetId);assert.ok(remote,'test-owned second target must exist');
       const socket=new WebSocket(remote.webSocketDebuggerUrl);extraSockets.push(socket);await new Promise((resolve,reject)=>{socket.addEventListener('open',resolve,{once:true});socket.addEventListener('error',reject,{once:true});});
       let sequence=0;const pending=new Map();socket.addEventListener('message',event=>{const message=JSON.parse(event.data),entry=pending.get(message.id);if(!entry)return;pending.delete(message.id);clearTimeout(entry.timer);message.error?entry.reject(new Error('second target CDP error')):entry.resolve(message.result);});
@@ -139,6 +137,12 @@ try{
       await check('new text retains existing photo img identity with zero extra photo GET',async()=>{assert.equal(await evaluate("document.querySelector('.photo-open img')===globalThis.retainedPhoto"),true);assert.equal(photoRequests-beforePhotos,0);return {additionalPhotoGets:photoRequests-beforePhotos};});
       const beforeReceiptPhotos=photoRequests;messageRows[1].unreadCount=1;touch(key);await refreshUi();await sleep(150);
       await check('receipt change retains existing photo img identity with zero extra photo GET',async()=>{assert.equal(await evaluate("document.querySelector('.photo-open img')===globalThis.retainedPhoto"),true);assert.equal(photoRequests-beforeReceiptPhotos,0);return {additionalPhotoGets:photoRequests-beforeReceiptPhotos};});
+await evaluate("globalThis.downloads=[];globalThis.originalAnchorClick=HTMLAnchorElement.prototype.click;HTMLAnchorElement.prototype.click=function(){globalThis.downloads.push(this.download);};document.querySelector('.photo-open').click()");
+await until("document.getElementById('photo-dialog').open && document.getElementById('photo-full').naturalWidth===1 && !document.getElementById('photo-download').disabled");
+const beforeDownload=photoRequests;await evaluate("document.getElementById('photo-download').click()");await until("globalThis.downloads.length===1 && document.getElementById('photo-download').textContent==='다운로드'");
+await check('explicit photo download fetches once and saves an image file',async()=>{const name=await evaluate("globalThis.downloads[0]");assert.match(name,/^kakao-photo-\d{8}-\d{6}\.(?:png|jpg|webp|gif)$/);assert.equal(photoRequests-beforeDownload,1);return {name,photoGets:photoRequests-beforeDownload};});
+await evaluate("HTMLAnchorElement.prototype.click=globalThis.originalAnchorClick;document.getElementById('photo-dialog').close()");
+await check('closing the photo dialog disables download',async()=>{assert.equal(await evaluate("document.getElementById('photo-download').disabled"),true);return {disabled:true};});
       // Real rendered CSS, composited through ancestors. Small text is held to
       // 4.5 even if bold; transparent badges/quotes use their actual backdrops.
       await evaluate('globalThis.testFocus=false');unread.set(key,3);roomsVersion++;roomCapabilities.set(key,{...roomCapabilities.get(key),kind:'OpenMultiChat'});touch(key);await refreshUi();

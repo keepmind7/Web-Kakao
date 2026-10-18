@@ -10,8 +10,12 @@ import stat
 from urllib.request import Request, urlopen
 import uuid
 from zipfile import ZipFile
+try:
+    from tools.cli_support import parse_arguments, run_preparation
+except ModuleNotFoundError:
+    from cli_support import parse_arguments, run_preparation
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).absolute().parent.parent
 VERSIONS = {'rea': '6.5.0', 'ghidra': '12.1.4', 'jdk': '21.0.12.1+1'}
 ASSETS = [
     {'name': 'ghidra.zip',
@@ -166,7 +170,7 @@ def install_archive(path, destination, required):
                     raise ValueError('existing_install_has_extra_files')
             return home
         destination.mkdir(parents=True, exist_ok=True)
-        with publication_stage(destination, 'rea-install-') as stage:
+        with publication_stage(destination, 'ri-') as stage:
             # No writes occurred until every member and required file was checked.
             archive.extractall(stage)
             staged_home = stage / top
@@ -188,7 +192,7 @@ def ensure_archive(destination, asset, offline=False):
     if offline:
         raise FileNotFoundError('offline_asset_missing')
     destination.mkdir(parents=True, exist_ok=True)
-    with publication_stage(destination, 'rea-download-') as stage:
+    with publication_stage(destination, 'rd-') as stage:
         partial = stage / 'asset.partial'
         request = Request(asset['url'], headers={'User-Agent': 'Web-Kakao-REA-setup'})
         with urlopen(request, timeout=60) as response, partial.open('xb') as output:
@@ -242,12 +246,10 @@ def prepare(root=ROOT, offline=False):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--offline', action='store_true')
-    args = parser.parse_args(argv)
-    try:
-        prepare(offline=args.offline)
-    except (OSError, ValueError, KeyError) as error:
-        # Do not echo URLs, local environment or arbitrary exception text.
-        parser.error(type(error).__name__ + ': preparation failed; existing state preserved')
+    args = parse_arguments(parser, argv)
+    run_preparation(parser, lambda: prepare(offline=args.offline),
+                    missing='REA 설치 파일 또는 오프라인 자산이 없습니다. README의 REA 준비 절차를 먼저 실행하세요.',
+                    invalid_errors=(KeyError,))
     print(json.dumps({'prepared': True, 'global_settings_changed': False}))
     return 0
 

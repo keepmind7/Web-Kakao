@@ -71,3 +71,60 @@ evidence/
 
 # 실험 중 임시 응답 파일 (서버 응답 원문 유출 방지)
 *.tmp
+
+# 로컬 실행 상태·진단 (저장소 안에 생겨도 커밋 금지)
+runtime.json
+reader-diagnostic*.json
+identity.key
+preferences/
+web-auth/
+
+# 추출한 앱 패키지와 추출 키트 결과물 (카카오톡 APK 포함 가능)
+*.apks
+*.apkm
+*.aab
+*.jks
+*.keystore
+tools/apk_export/output/
+tools/apk_export/platform-tools/
+apk-manifest.json
+
+# 압축 파일 (추출 결과·다운로드 원본)
+*.zip
+*.7z
+*.rar
+*.tar
+*.tar.gz
+*.tgz
+
+# 대화 데이터베이스·백업
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.sqlite-*
+*.realm
+*.bak
+
+# 대화 사진·화면 캡처 (실제 대화나 얼굴이 담길 수 있음)
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.heic
+*.bmp
+*.mp4
+*.mov
+
+# 브라우저 테스트 프로필과 다운로드 중 파일
+chrome-profile*/
+*.crdownload
+*.partial
+
+# Claude Code 개인 설정
+.claude/settings.local.json
+
+# 테스트 캐시
+.pytest_cache/
+coverage/

@@ -6,7 +6,7 @@ import { uploadPhoto } from './media-upload.mjs';
 import { PROFILE } from './kakao-auth.mjs';
 
 export const allowedReaderMethod = (method,{messaging=false}={}) => ['GETCONF','CHECKIN','LOGINLIST','SYNCMSG','MCHATLOGS','PING','CHATINFO'].includes(method)
-  || messaging===true && ['WRITE','CHATONROOM','NOTIREAD','SHIP','SYNCLINK','INFOLINK'].includes(method);
+  || messaging===true && ['WRITE','CHATONROOM','NOTIREAD','SHIP','SYNCLINK','INFOLINK','MEMBER'].includes(method);
 
 export function createReaderSession(credential,factory,emit) {
   let carriage,store,closed=false,busy=false,resolveStop,pingTimer=null,pingPending=false,pingMisses=0;
@@ -14,10 +14,17 @@ export function createReaderSession(credential,factory,emit) {
   const gapProbes=new Map();
   const readProbed=new Set();
   const entries=new Map();let activeRoom=null,selectionVersion=0;
-  const discoveryQueue=new Map(),discoveryAttempted=new Set();let discoveryPromise=null,discoveryInFlight=null,discoverTimer=null;
+  const discoveryQueue=new Map(),discoveryAttempts=new Map();let discoveryPromise=null,discoveryInFlight=null,discoverTimer=null;
   const now=factory.now ?? (()=>performance.now());
-  let titleQueue=[],titlePromise=null;
+  let titleQueue=[],titlePromise=null,titleChanged=false,aliveAt=-Infinity;
+  const memberLookups=new Set();
+  // Discovery replays are bounded in bytes, not only packet counts.
+  const DISCOVERY_BYTES=2*1024*1024,ATTACHMENT_BYTES=8192;
+  const queuedBytes=()=>[...discoveryQueue.values(),...(discoveryInFlight?[discoveryInFlight.packets]:[])].reduce((n,packets)=>n+(packets.bytes ?? 0),0);
+  const eligibleDiscovery=()=>[...discoveryQueue].find(([,packets])=>packets.ready!==false);
+  const alive=()=>{const at=Date.now();if(at-aliveAt<30000)return;aliveAt=at;emit({type:'reader-alive',at});};
   let nextMessageId=Date.now()%0x3fffffff;
+  const observeSend=details=>{try{factory.observeSend?.(details);}catch{/* Diagnostics cannot change a send outcome. */}};
   const uploadAbort=new AbortController();
   let activePhoto=null;
   const invalidatePhoto=key=>{if(activePhoto?.key===key)activePhoto.controller.abort();};
@@ -28,60 +35,99 @@ export function createReaderSession(credential,factory,emit) {
   const stopped=new Promise(resolve=>{resolveStop=resolve;});
   const close=()=>{
     if(closed)return;closed=true;uploadAbort.abort();
-    clearInterval(pingTimer);clearTimeout(discoverTimer);carriage?.stopPing();carriage?.disconnect();store?.clear();cursors.clear();gapProbes.clear();readProbed.clear();entries.clear();activeRoom=null;discoveryQueue.clear();discoveryAttempted.clear();titleQueue=[];resolveStop();
+    clearInterval(pingTimer);clearTimeout(discoverTimer);carriage?.stopPing();carriage?.disconnect();store?.clear();cursors.clear();memberLookups.clear();gapProbes.clear();readProbed.clear();entries.clear();activeRoom=null;discoveryQueue.clear();discoveryAttempts.clear();titleQueue=[];resolveStop();
   };
   function activate(key){
     if(activeRoom===key)return;
-    const previous=activeRoom;activeRoom=key;selectionVersion++;entries.clear();
+    const previous=activeRoom;activeRoom=key;selectionVersion++;entries.clear();store?.pin(key); // The active room is never display-LRU evicted.
     if(previous)invalidatePhoto(previous);
     if(previous && store?.has(previous))publish({...store.current(previous),entryInvalidated:true},'receipt');
   }
   function entryReady(key){return activeRoom===key && entries.get(key)?.version===store.receiptVersion(key) && entries.get(key)?.selection===selectionVersion;}
-  async function ensureEntry(key,bound){
+  async function ensureEntry(key,bound,trace=()=>{}){
     if(entryReady(key))return {ready:true,receiptReady:entries.get(key).receiptReady};
     if(!store.canAction(key,'context'))return {ready:false};
     const version=store.receiptVersion(key),selection=selectionVersion;
     store.recent(key);
     const response=await carriage.request('CHATONROOM',{chatId:factory.toLong(store.serverRoomId(key)),token:factory.toLong(store.entryToken(key)),opt:store.entryOption(key)},bound(5500),{recoverable:true});
-    if(closed || responseStatus(response)!==0 || activeRoom!==key || selectionVersion!==selection || version!==store.receiptVersion(key))return {ready:false,status:responseStatus(response)};
+    trace('entry',{status:responseStatus(response)});
+    if(closed || responseStatus(response)!==0 || response.method!==undefined && response.method!=='CHATONROOM' || activeRoom!==key || selectionVersion!==selection || version!==store.receiptVersion(key))return {ready:false,status:responseStatus(response)};
     if(!store.entrySnapshot(key,response.body,version))return {ready:false,status:0};
+    if(store.takeOwnMemberLookup(key,version)){
+      trace('member_lookup');
+      try{
+        const member=await carriage.request('MEMBER',{chatId:factory.toLong(store.serverRoomId(key)),memberIds:[factory.toLong(credential.userId)]},bound(2500),{optional:true});
+        if(closed || activeRoom!==key || selectionVersion!==selection || version!==store.receiptVersion(key))return {ready:false,status:0};
+        const status=responseStatus(member);
+        if(status===0 && (member.method===undefined || member.method==='MEMBER') && store.ownMemberSnapshot(key,member.body,version))trace('member_verified',{status:0});
+        else trace('member_lookup',{status,reason:status!==0?'member_rejected':Array.isArray(member.body?.members) && member.body.members.length===0?'member_missing':'member_invalid'});
+      }catch(error){trace('member_lookup',{reason:error?.code==='READER_REQUEST_TIMEOUT'?'member_timeout':'member_invalid'});}
+      if(closed || activeRoom!==key || selectionVersion!==selection || version!==store.receiptVersion(key))return {ready:false,status:0};
+    }
     const receiptReady=store.receiptSnapshot(key,response.body,version);
     entries.set(key,{version,selection,receiptReady});
-    store.recent(key);publish(store.current(key),'receipt');
+    store.recent(key);publish(store.current(key),'receipt');void lookupMembers(key);
     return {ready:true,receiptReady};
+  }
+  // Read-only MEMBER name lookup: once per opened room and connection, at most
+  // five exact-correlated optional requests of 100 IDs. Failure keeps aliases.
+  async function lookupMembers(key){
+    if(factory.messaging!==true || closed || memberLookups.has(key) || !store.has(key))return;memberLookups.add(key);
+    const ids=store.unnamedMembers(key);
+    for(let n=0;n<ids.length && n<500 && !closed && store.has(key);n+=100){
+      const batch=ids.slice(n,n+100);
+      try{
+        const response=await carriage.request('MEMBER',{chatId:factory.toLong(store.serverRoomId(key)),memberIds:batch.map(id=>factory.toLong(id))},2500,{optional:true});
+        if(!closed && responseStatus(response)===0 && (response.method===undefined || response.method==='MEMBER') && store.applyMembers(key,response.body,batch))emit({type:'reader-messages',...store.current(key),source:'receipt'});
+      }catch{/* Optional lookup expiry/refusal leaves the current labels. */}
+    }
   }
   function scheduleDiscovery(){
     clearTimeout(discoverTimer);
-    if(closed || busy || discoveryPromise || titlePromise || !discoveryQueue.size && !titleQueue.length)return;
+    if(closed || busy || discoveryPromise || titlePromise || !eligibleDiscovery() && !titleQueue.length)return;
     discoverTimer=setTimeout(()=>{
       if(closed || busy || discoveryPromise || titlePromise)return;
-      if(!discoveryQueue.size){
+      const next=eligibleDiscovery();
+      if(!next){
         const key=titleQueue.shift();if(!key)return;
         titlePromise=Promise.resolve().then(async()=>{
           if(closed)return;
           try{
             const response=await carriage.request('CHATINFO',{chatId:factory.toLong(store.serverRoomId(key))},3000,{optional:true});
             if(closed || responseStatus(response)!==0 || response?.method!==undefined && response.method!=='CHATINFO')return;
-            if(store.recoverTitle(key,response.body))emit({type:'reader-rooms',rooms:store.rooms(),stats:store.stats(),source:'push'});
+            if(store.recoverTitle(key,response.body))titleChanged=true;
           }catch{
             // Optional metadata rejection/decoding is nonfatal. A real socket
             // error/close still reaches the existing transport listeners.
           }
-        }).finally(()=>{titlePromise=null;scheduleDiscovery();});
+        }).finally(()=>{
+          titlePromise=null;
+          // One room list after the repair batch rather than one per recovered title.
+          if(!closed && titleChanged && !titleQueue.length){titleChanged=false;emit({type:'reader-rooms',rooms:store.rooms(),stats:store.stats(),source:'push'});}
+          scheduleDiscovery();
+        });
         return;
       }
-      const [id,packets]=discoveryQueue.entries().next().value;discoveryQueue.delete(id);discoveryAttempted.add(id);
+      const [id,packets]=next;discoveryQueue.delete(id);
+      const attempt=discoveryAttempts.get(id);attempt.count++;attempt.terminal=true;
       discoveryInFlight={id,packets};
       discoveryPromise=(async()=>{
         try{
           const response=await carriage.request('CHATINFO',{chatId:factory.toLong(id)},5000,{optional:true});
           if(closed)return;
-          if(responseStatus(response)!==0)return;
+          if(responseStatus(response)!==0 || response?.method!==undefined && response.method!=='CHATINFO')return;
           const key=store.discover(id,response.body);if(!key)return;
           // Publish the vetted room before any messages referencing its handle.
           publish(null,'push');
-          for(const packet of packets)for(const update of store.push(packet))publish(update,'push');
-        }catch{/* Optional discovery refusal/expiry does not end a healthy reader. */}
+          for(const packet of packets)for(const update of store.push(packet))publish(packets.partial?{...update,partial:true}:update,'push');
+          if(packets.partial && !packets.length)publish({...store.current(key),partial:true},'push');
+        }catch(error){
+          if(!closed && error?.code==='READER_REQUEST_TIMEOUT' && attempt.count<3){
+            // Retain bounded replay data, but only a later push can re-enable it.
+            attempt.terminal=false;attempt.retryAt=now()+3000;packets.ready=false;discoveryQueue.set(id,packets);
+          }
+          // All other optional failures/refusals stay terminal and nonfatal.
+        }
         finally{discoveryPromise=null;discoveryInFlight=null;scheduleDiscovery();}
       })();
     },100);discoverTimer.unref?.();
@@ -100,6 +146,7 @@ export function createReaderSession(credential,factory,emit) {
           const onPush=packet=>{
             if(closed)return;
             if(responseStatus(packet)!==0){fail('push',responseStatus(packet));return;}
+            alive();
             try {
               if(factory.messaging===true && packet?.method==='DECUNREAD'){
                 const update=store.readUpdate(packet.body);if(update)publish(update,'receipt');return;
@@ -112,18 +159,31 @@ export function createReaderSession(credential,factory,emit) {
               }
               if(!['MSG','SYNCJOIN'].includes(packet?.method))return;
               for(const id of store.unknownRooms(packet.body)){
-                if(discoveryInFlight?.id!==id && (discoveryAttempted.has(id) || discoveryAttempted.size>=500))continue;
-                if(discoveryInFlight?.id!==id && !discoveryQueue.has(id) && discoveryQueue.size<20)discoveryQueue.set(id,[]);
+                let attempt=discoveryAttempts.get(id);
+                if(!attempt){if(discoveryAttempts.size>=500)continue;attempt={count:0,retryAt:0,terminal:false,partial:false};discoveryAttempts.set(id,attempt);}
+                if(discoveryInFlight?.id!==id && attempt.terminal)continue;
+                if(discoveryInFlight?.id!==id && !discoveryQueue.has(id)){
+                  if(discoveryQueue.size+(discoveryInFlight?1:0)>=20){attempt.partial=true;continue;}
+                  discoveryQueue.set(id,[]);
+                }
                 const packets=discoveryInFlight?.id===id?discoveryInFlight.packets:discoveryQueue.get(id);
                 if(!packets)continue;
+                if(discoveryInFlight?.id!==id)packets.ready=attempt.count===0 || now()>=attempt.retryAt;
+                if(attempt.partial)packets.partial=true;
                 const remaining=50-packets.reduce((n,p)=>n+p.chatLogs.length,0);
-                const logs=(logArray(packet.body) ?? []).filter(log=>{
+                const sourceLogs=logArray(packet.body) ?? [];
+                const validLogs=sourceLogs.slice(0,200).filter(log=>{
                   const attached=serverId(log?.chatId ?? log?.roomId ?? log?.c);
                   return log && serverId(log.logId ?? log.msgId ?? log.id) && (!attached || attached===id);
-                }).slice(0,remaining).map(log=>({logId:serverId(log.logId ?? log.msgId ?? log.id),authorId:serverId(log.authorId ?? log.senderId ?? log.userId ?? log.writerId ?? log.sender?.userId),
+                });
+                if(sourceLogs.length>200 || validLogs.length>remaining)packets.partial=true;
+                const logs=validLogs.slice(0,remaining).map(log=>({logId:serverId(log.logId ?? log.msgId ?? log.id),authorId:serverId(log.authorId ?? log.senderId ?? log.userId ?? log.writerId ?? log.sender?.userId),
                   msg:[...(typeof (log.message ?? log.msg ?? log.text ?? log.content)==='string'?(log.message ?? log.msg ?? log.text ?? log.content):'')].slice(0,4000).join(''),
-                  type:Number(log.type ?? log.msgType ?? log.t ?? 1),attachment:typeof log.attachment==='string'?log.attachment.slice(0,65536):undefined,sendAt:Number(log.sendAt ?? log.createdAt),senderName:typeof (log.senderName ?? log.authorName)==='string'?(log.senderName ?? log.authorName).slice(0,80):''}));
-                if(logs.length)packets.push({chatId:id,chatLogs:logs});
+                  type:Number(log.type ?? log.msgType ?? log.t ?? 1),attachment:[2,26,27].includes(Number(log.type ?? log.msgType ?? log.t ?? 1)) && typeof log.attachment==='string' && log.attachment.length<=ATTACHMENT_BYTES?log.attachment:undefined,sendAt:Number(log.sendAt ?? log.createdAt),senderName:typeof (log.senderName ?? log.authorName)==='string'?(log.senderName ?? log.authorName).slice(0,80):''}));
+                const bytes=logs.reduce((n,log)=>n+256+2*(log.msg.length+(log.attachment?.length ?? 0)+log.senderName.length),0);
+                // Over budget: drop this room's further replays and mark it partial.
+                if(logs.length && queuedBytes()+bytes>DISCOVERY_BYTES)packets.partial=true;
+                else if(logs.length){packets.push({chatId:id,chatLogs:logs});packets.bytes=(packets.bytes ?? 0)+bytes;}
               }
               scheduleDiscovery();
               const updates=store.push(packet.body);
@@ -140,7 +200,7 @@ export function createReaderSession(credential,factory,emit) {
           if(closed)return;
           const heartbeat=async()=>{
             if(closed || pingPending)return;pingPending=true;
-            try{const response=await carriage.request('PING',{},10000,{recoverable:true});if(!closed && responseStatus(response)!==0)fail('ping',responseStatus(response));else pingMisses=0;}
+            try{const response=await carriage.request('PING',{},10000,{recoverable:true});if(!closed && responseStatus(response)!==0)fail('ping',responseStatus(response));else{pingMisses=0;if(!closed)alive();}}
             catch(error){if(!closed && (error?.code!=='READER_REQUEST_TIMEOUT' || ++pingMisses>=3))fail('ping');}finally{pingPending=false;}
           };
           pingTimer=(factory.every ?? setInterval)(heartbeat,30000);pingTimer?.unref?.();
@@ -168,7 +228,7 @@ export function createReaderSession(credential,factory,emit) {
         }).catch(()=>{if(!closed)fail('worker');resolve({ok:false});});
       });
     },
-    view(key){return !closed && Boolean(store?.pin(key));},
+    view(key){if(closed || !store?.has(key))return false;activate(key);return true;},
     async history(key,requestId) {
       const started=now(),remaining=()=>18000-(now()-started);
       if(titlePromise)await titlePromise;
@@ -259,13 +319,21 @@ export function createReaderSession(credential,factory,emit) {
       if(action==='read' && !watermark)return false;
       busy=true;
       activate(key);
-      const result=(phase,status=null,messageKey)=>emit({type:'reader-action',key,requestId,action,phase,status,entryPhase:entryReady(key)?'acknowledged':'failed',...(action==='context'?{receiptPhase:entryReady(key)?entries.get(key).receiptReady?'ready':'unavailable':'idle'}:{}),...(messageKey?{messageKey}:{})});
+      let writeAttempted=false;
+      const trace=(stage,details={})=>{if(action==='send')observeSend({stage,...(stage==='start'?{kind:payload.replyTo===undefined?'text':'reply'}:{}),writeAttempted,...details});};
+      const blockedReason=()=>['send','photo'].includes(action) && store.isOpen(key) && !store.canAction(key,'read')?'open_member_unverified':undefined;
+      const result=(phase,status=null,messageKey,reason,diagnosticReason)=>{
+        if(phase==='failed' && !writeAttempted)trace('blocked',{phase,status,reason:reason ?? diagnosticReason ?? 'permission_changed'});
+        trace('result',{phase,status,...(reason || diagnosticReason?{reason:reason ?? diagnosticReason}:{})});
+        emit({type:'reader-action',key,requestId,action,phase,status,entryPhase:entryReady(key)?'acknowledged':'failed',...(action==='context'?{receiptPhase:entryReady(key)?entries.get(key).receiptReady?'ready':'unavailable':'idle'}:{}),...(messageKey?{messageKey}:{}),...(reason==='open_member_unverified'?{reason}:{})});
+      };
+      trace('start');
       try{
         const chatId=factory.toLong(store.serverRoomId(key));
         if(action==='context' || action==='read' || store.isOpen(key)){
-          const entry=await ensureEntry(key,bound);if(closed)return false;
-          if(!entry.ready){result('failed',entry.status ?? null);return true;}
-          if(!store.canAction(key,capability)){result('unavailable',0);return true;}
+          const entry=await ensureEntry(key,bound,trace);if(closed)return false;
+          if(!entry.ready){result('failed',entry.status ?? null,undefined,blockedReason(),'entry_unavailable');return true;}
+          if(!store.canAction(key,capability)){result(['send','photo'].includes(action)?'failed':'unavailable',0,undefined,blockedReason());return true;}
           if(action==='context'){result(entry.receiptReady?'accepted':'unavailable',0);return true;}
         }
         let beforeRead=null;
@@ -278,7 +346,7 @@ export function createReaderSession(credential,factory,emit) {
           }catch{return {roomMatched:false,seenAtLeastTarget:null};}
         };
         if(probeRead){readProbed.add(key);beforeRead=await inspectRead();if(closed)return false;}
-        if((action==='read' || store.isOpen(key)) && (!entryReady(key) || !store.canAction(key,capability))){result('failed');return true;}
+        if((action==='read' || store.isOpen(key)) && (!entryReady(key) || !store.canAction(key,capability))){result('failed',['send','photo'].includes(action)?0:null,undefined,blockedReason());return true;}
         if(action==='photo'){
           const version=store.receiptVersion(key),selection=selectionVersion,requiresEntry=store.isOpen(key),readOnSend=store.canAction(key,'read'),controller=new AbortController();
           activePhoto={key,controller};
@@ -293,17 +361,22 @@ export function createReaderSession(credential,factory,emit) {
           return true;
         }
         const expectedMessageId=action==='send'?++nextMessageId:null;
-        const response=action==='send'
-          ?await carriage.request('WRITE',{chatId,msgId:expectedMessageId,type:extra?26:1,noSeen:!store.canAction(key,'read'),msg:payload.text,...(extra?{extra}:{})},bound(20000))
-          :await carriage.request('NOTIREAD',{chatId,watermark:factory.toLong(watermark),...(store.isOpen(key)?{li:factory.toLong(store.linkId(key))}:{})},bound(9000),{recoverable:true});
+        let response;
+        if(action==='send'){
+          const body={chatId,msgId:factory.toLong(String(expectedMessageId)),type:extra?26:1,noSeen:!store.canAction(key,'read'),msg:payload.text,scope:1,silence:false,...(extra?{extra}:{})},timeout=bound(20000);
+          writeAttempted=true;
+          trace('write_attempt');
+          response=await carriage.request('WRITE',body,timeout);
+        }else response=await carriage.request('NOTIREAD',{chatId,watermark:factory.toLong(watermark),...(store.isOpen(key)?{li:factory.toLong(store.linkId(key))}:{})},bound(9000),{recoverable:true});
         if(closed)return false;
         const status=responseStatus(response);
-        if(status!==0){result(action==='send' && status===null?'unknown':'failed',status);if(!Number.isInteger(status)){emit({type:'reader-failed',stage:action,status});close();}return true;}
+        trace('response',{status});
+        if(status!==0){result(action==='send' && status===null?'unknown':'failed',status,undefined,undefined,Number.isInteger(status)?'write_rejected':'transport');if(!Number.isInteger(status)){emit({type:'reader-failed',stage:action,status});close();}return true;}
         if(action==='send'){
           if(response.body?.msgId!==undefined && String(response.body.msgId)!==String(expectedMessageId))throw new Error('write_correlation');
           const update=store.writeAccepted(key,response.body,payload.text,{type:extra?26:1,attachment:extra});
           if(update)publish(update,'sent');
-          result(update?'accepted':'unknown',0,update?.messageKey);
+          result(update?'accepted':'unknown',0,update?.messageKey,undefined,update?undefined:'write_ack_unrecognized');
         }else{
           // status0 acknowledges the request, not the peer's displayed unread count.
           if(probeRead){
@@ -314,7 +387,7 @@ export function createReaderSession(credential,factory,emit) {
         }
         return true;
       }catch(error){
-        if(!closed){const recoverable=error?.code==='READER_REQUEST_TIMEOUT' && action!=='send';result(action==='read' || action==='send' || action==='photo' && !recoverable?'unknown':'failed');if(!recoverable){emit({type:'reader-failed',stage:action,status:null});close();}}
+        if(!closed){const beforeWrite=action==='send' && !writeAttempted,recoverable=error?.code==='READER_REQUEST_TIMEOUT' && (action!=='send' || beforeWrite);result(beforeWrite?'failed':action==='read' || action==='send' || action==='photo' && !recoverable?'unknown':'failed',null,undefined,undefined,error?.message==='write_correlation'?'write_correlation':error?.code==='READER_REQUEST_TIMEOUT'?'write_timeout':'transport');if(!recoverable){emit({type:'reader-failed',stage:action,status:null});close();}}
         return true;
       }finally{busy=false;scheduleDiscovery();}
     },

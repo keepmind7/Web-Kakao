@@ -127,6 +127,27 @@ class ApkExportTests(unittest.TestCase):
                 self.assertEqual(len(self.calls()), 3)
                 self.assertFalse((self.root / 'output').exists())
 
+    def test_bundled_tools_are_fully_verified_and_reextracted_when_modified(self):
+        archive = ROOT / 'local-only/android-tools/platform-tools-37.0.1-windows.zip'
+        if not archive.is_file():
+            if os.environ.get('WEB_KAKAO_STRICT') == '1':
+                self.fail('WEB_KAKAO_STRICT=1: platform-tools ZIP missing')
+            self.skipTest('platform-tools ZIP not prepared')
+        shutil.copyfile(archive, self.root / archive.name)
+        run = lambda: subprocess.run(['powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', str(self.root / 'Export-KakaoApk.ps1'), '-PrepareOnly'],
+                                     capture_output=True, timeout=120, creationflags=subprocess.CREATE_NO_WINDOW)
+        result = run()  # `adb version` only; no server, device or network.
+        self.assertEqual(result.returncode, 0, result.stderr.decode(errors='replace'))
+        tools = self.root / 'platform-tools'
+        notice = (tools / 'NOTICE.txt').read_bytes()
+        (tools / 'NOTICE.txt').write_bytes(b'tampered')
+        (tools / 'version.dll').write_bytes(b'planted next to adb.exe')
+        result = run()
+        self.assertEqual(result.returncode, 0, result.stderr.decode(errors='replace'))
+        self.assertFalse((tools / 'version.dll').exists())
+        self.assertEqual((tools / 'NOTICE.txt').read_bytes(), notice)
+        self.assertEqual([p.name for p in self.root.iterdir() if p.name.startswith('.platform-tools-')], [])
+
     def test_nonlocal_endpoint_is_rejected_before_any_adb(self):
         result = self.run_export('ready', '-AdbEndpoint', '192.0.2.1:5555')
         self.assertNotEqual(result.returncode, 0)

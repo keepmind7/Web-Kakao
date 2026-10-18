@@ -48,7 +48,7 @@ test('direct read establishes matching entry before NOTIREAD despite an incomple
   try{
     const {key,message}=await f.ready();
     assert.equal(await f.session.action(key,1,'read',{message}),true);
-    assert.deepEqual(f.calls.map(call=>call.method),['CHATONROOM','NOTIREAD']);
+    assert.deepEqual(f.calls.map(call=>call.method).filter(method=>method!=='MEMBER'),['CHATONROOM','NOTIREAD']);
     const entry=f.calls[0].body;
     assert.equal(String(entry.chatId),'123');assert.equal(String(entry.token),'0');
     assert.ok(entry.opt===undefined || Number.isInteger(entry.opt),'optional opt must be absent or an Integer');

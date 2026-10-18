@@ -1,11 +1,19 @@
 """프로젝트 내부에 고정 JDK와 REA용 JADX 엔진을 준비한다. APK·계정은 사용하지 않는다."""
+import argparse
 import hashlib
 import json
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from urllib.request import Request, urlopen
-from zipfile import ZipFile
+try:
+    from tools.cli_support import parse_arguments, run_preparation
+    from tools.prepare_rea_windows import install_archive
+    from tools.safe_download import checked_path, ensure_download
+except ModuleNotFoundError:
+    from cli_support import parse_arguments, run_preparation
+    from prepare_rea_windows import install_archive
+    from safe_download import checked_path, ensure_download
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).absolute().parent.parent
 DEST = ROOT / 'local-only/rea-android'
 ASSETS = [
     ('jdk.zip', 'https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.12.1%2B1/OpenJDK21U-jdk_x64_windows_hotspot_21.0.12.1_1.zip',
@@ -21,40 +29,36 @@ def digest(path):
 
 
 def main():
-    DEST.mkdir(parents=True, exist_ok=True)
+    destination = checked_path(DEST)
+    runtime = checked_path(destination / 'runtime.json')
+    # Validate all asset paths before starting the first network operation.
+    for name, _, _ in ASSETS:
+        checked_path(destination / name)
     records = []
     for name, url, expected in ASSETS:
-        target = DEST / name
-        if not target.exists():
-            temporary = target.with_suffix(target.suffix + '.partial')
-            with urlopen(Request(url, headers={'User-Agent': 'Web-Kakao-REA-setup'}), timeout=60) as response, temporary.open('wb') as output:
-                while chunk := response.read(1024 * 1024):
-                    output.write(chunk)
-            if digest(temporary) != expected:
-                raise ValueError('asset_sha256_mismatch')
-            temporary.replace(target)
-        if digest(target) != expected:
-            raise ValueError('existing_asset_sha256_mismatch')
+        target = ensure_download(destination / name, Request(url, headers={'User-Agent': 'Web-Kakao-REA-setup'}),
+                                 expected, opener=urlopen)
         records.append({'name': name, 'url': url, 'sha256': expected, 'bytes': target.stat().st_size})
         print(json.dumps({'verified': name, 'bytes': target.stat().st_size}), flush=True)
-    with ZipFile(DEST / 'jdk.zip') as archive:
-        members = archive.infolist()
-        for member in members:
-            relative = PurePosixPath(member.filename)
-            target = (DEST / member.filename).resolve()
-            if relative.is_absolute() or '..' in relative.parts or '\\' in member.filename or not target.is_relative_to(DEST.resolve()):
-                raise ValueError('unsafe_archive_path')
-            if (member.external_attr >> 16) & 0o170000 == 0o120000:
-                raise ValueError('archive_symlink_not_allowed')
-        # All resolved destinations have been checked before extraction.
-        archive.extractall(DEST)
-    homes = [p for p in DEST.iterdir() if p.is_dir() and (p / 'bin/java.exe').is_file() and (p / 'bin/javac.exe').is_file()]
-    if len(homes) != 1:
+    home = install_archive(destination / 'jdk.zip', destination, ['bin/java.exe', 'bin/javac.exe'])
+    homes = []
+    for candidate in destination.iterdir():
+        checked_path(candidate)
+        if candidate.is_dir() and checked_path(candidate / 'bin/java.exe').is_file() and checked_path(candidate / 'bin/javac.exe').is_file():
+            homes.append(candidate)
+    if homes != [home]:
         raise ValueError('full_jdk_not_unique')
-    result = {'assets': records, 'java_home': str(homes[0]), 'jadx_jar': str(DEST / ASSETS[1][0]), 'global_settings_changed': False}
-    (DEST / 'runtime.json').write_text(json.dumps(result, indent=2) + '\n', encoding='utf-8')
+    result = {'assets': records, 'java_home': str(home), 'jadx_jar': str(destination / ASSETS[1][0]), 'global_settings_changed': False}
+    checked_path(runtime).write_text(json.dumps(result, indent=2) + '\n', encoding='utf-8')
     print(json.dumps({'prepared': True, 'global_settings_changed': False}), flush=True)
 
 
+def cli(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parse_arguments(parser, argv)
+    run_preparation(parser, main)
+    return 0
+
+
 if __name__ == '__main__':
-    main()
+    cli()

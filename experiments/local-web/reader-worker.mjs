@@ -6,7 +6,6 @@ import { guardReaderClient } from './reader-protocol.mjs';
 
 process.env.KAKAO_DEBUG_LOCO='0';
 let session=null,started=false,operationTimer=null,operationBusy=false,diagnostic=null,ending=false;
-const lifetime=setTimeout(()=>{diagnostic?.end('lifetime');process.exit(2);},60*60*1000);lifetime.unref();
 const stop=(reason='closed')=>{diagnostic?.end(reason);session?.close();process.exit(0);};
 process.once('disconnect',()=>stop('parent-disconnected'));
 process.once('uncaughtException',error=>{diagnostic?.end('fatal',error);process.exit(4);});
@@ -36,7 +35,7 @@ process.on('message',async message=>{
       const Media=guardReaderClient(sdk.CarriageClient,diagnostic,{messaging,media:true});
       const sessionSalt=typeof message.sessionSalt==='string' && /^[a-f0-9]{64}$/.test(message.sessionSalt)?Buffer.from(message.sessionSalt,'hex'):undefined;
       const settingsSecret=typeof message.settingsSecret==='string' && /^[a-f0-9]{64}$/.test(message.settingsSecret)?Buffer.from(message.settingsSecret,'hex'):null;
-      session=createReaderSession(credential,{booking:()=>new Booking(),ticket:()=>new Ticket(),carriage:()=>new Carriage(),media:()=>new Media(),toLong:sdk.toLong,messaging,sessionSalt,settingsSecret,gapProbe:message.gapProbe===true,readProbe:true,observeRead:details=>diagnostic.note('read-verification',details),observeHistory:details=>diagnostic.note('history-page',details),observeUpload:details=>diagnostic.note('photo-upload',details)},event=>{
+      session=createReaderSession(credential,{booking:()=>new Booking(),ticket:()=>new Ticket(),carriage:()=>new Carriage(),media:()=>new Media(),toLong:sdk.toLong,messaging,sessionSalt,settingsSecret,gapProbe:message.gapProbe===true,readProbe:true,observeRead:details=>diagnostic.note('read-verification',details),observeHistory:details=>diagnostic.note('history-page',details),observeUpload:details=>diagnostic.note('photo-upload',details),observeSend:details=>diagnostic.note('send-stage',details)},event=>{
         send(event);
       });
       await session.start();clearTimeout(operationTimer);operationBusy=false;

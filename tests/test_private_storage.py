@@ -1,6 +1,7 @@
 """Synthetic storage/launcher contracts; never apply ACLs or read user data."""
 import contextlib
 import hashlib
+import hmac
 import importlib.util
 import io
 import json
@@ -18,6 +19,8 @@ ROOT = Path(__file__).resolve().parents[1]
 PRIVATE = ROOT / "tools/private_storage.py"
 NODE_PRIVATE = ROOT / "experiments/local-web/private-storage.mjs"
 NODE = ROOT / "local-only/runtime/node-v24.21.0-win-x64/node.exe"
+# WEB_KAKAO_STRICT=1 turns a missing prerequisite into a failure instead of a silent skip.
+STRICT = os.environ.get("WEB_KAKAO_STRICT") == "1"
 
 
 def load_private():
@@ -47,15 +50,19 @@ class LauncherSecurityRegressionTests(unittest.TestCase):
         def opened(req, *args, **kwargs):
             address = req.full_url if hasattr(req, "full_url") else str(req)
             calls.append(address)
+            if "/api/local/challenge?nonce=" in address:
+                nonce = address.rsplit("=", 1)[1].encode()
+                return io.BytesIO(json.dumps({"app": local_web.APP, "proof": hmac.new(b"7" * 64, b"web-kakao-launcher-challenge\0" + nonce, hashlib.sha256).hexdigest()}).encode())
             return io.BytesIO(json.dumps(state).encode())
         opener = Mock()
         opener.open.side_effect = opened
         with patch.object(Path, "read_text", return_value=json.dumps(saved)), \
              patch.object(local_web.request, "build_opener", return_value=opener), \
              patch.object(local_web.request, "urlopen", side_effect=opened), \
-             patch("socket.socket", side_effect=AssertionError("real network forbidden")):
+             patch.object(local_web, "listener_matches"),              patch("socket.socket", side_effect=AssertionError("real network forbidden")):
             local_web.connect()
-        self.assertEqual(calls, ["http://127.0.0.1:1/api/local/status"],
+        self.assertTrue(calls[0].startswith("http://127.0.0.1:1/api/local/challenge?nonce="))
+        self.assertEqual(calls[1:], ["http://127.0.0.1:1/api/local/status"],
                          "launcher status must not obtain a browser cookie or CSRF")
 
     def test_runtime_permission_corruption_and_other_instance_errors_never_spawn(self):
@@ -97,8 +104,11 @@ class LauncherSecurityRegressionTests(unittest.TestCase):
             self.assertNotIn(key, result)
 
 
-@unittest.skipUnless(PRIVATE.is_file(), "private_storage module not yet implemented; not a RED import failure")
+@unittest.skipUnless(PRIVATE.is_file() or STRICT, "private_storage module not yet implemented; not a RED import failure")
 class PrivateStorageContracts(unittest.TestCase):
+    def setUp(self):
+        self.assertTrue(PRIVATE.is_file(), "WEB_KAKAO_STRICT=1: private_storage module missing")
+
     def test_import_and_data_root_calculation_have_no_io_side_effects(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
@@ -117,8 +127,9 @@ class PrivateStorageContracts(unittest.TestCase):
             expected = hashlib.sha256(str(project.resolve()).replace("\\", "/").lower().encode()).hexdigest()[:16]
             self.assertEqual(module.data_root(project, appdata), appdata / "WebKakao" / expected)
 
-    @unittest.skipUnless(NODE_PRIVATE.is_file() and NODE.is_file(), "Node private-storage calculation not implemented")
+    @unittest.skipUnless(NODE_PRIVATE.is_file() and NODE.is_file() or STRICT, "Node private-storage calculation not implemented")
     def test_python_and_node_install_roots_agree_without_creating_a_directory(self):
+        self.assertTrue(NODE_PRIVATE.is_file() and NODE.is_file(), "WEB_KAKAO_STRICT=1: project Node runtime missing")
         module = load_private()
         with tempfile.TemporaryDirectory() as tmp:
             project, appdata = Path(tmp) / "한글 설치", Path(tmp) / "AppData"
@@ -132,10 +143,7 @@ class PrivateStorageContracts(unittest.TestCase):
     def test_private_acl_command_failure_is_fail_closed(self):
         module = load_private()
         with tempfile.TemporaryDirectory() as tmp, \
-             patch("subprocess.run", side_effect=subprocess.CalledProcessError(1, "synthetic ACL denied")), \
-             patch("subprocess.check_output", side_effect=subprocess.CalledProcessError(1, "synthetic ACL denied")), \
-             patch("subprocess.check_call", side_effect=subprocess.CalledProcessError(1, "synthetic ACL denied")), \
-             patch("subprocess.Popen", side_effect=OSError("synthetic process denied")):
+             patch.object(module, "secure_directory", side_effect=OSError("synthetic ACL denied")):
             target = Path(tmp) / "private"
             with self.assertRaises((OSError, RuntimeError, ValueError, subprocess.SubprocessError)):
                 module.ensure_private_directory(target)
@@ -219,6 +227,19 @@ class PrivateStorageContracts(unittest.TestCase):
                 except (OSError, RuntimeError, ValueError):
                     pass
             self.assertFalse(destination.exists())
+
+
+@unittest.skipUnless(os.name == "nt", "Windows ACL")
+class PrivateDirectoryReapplyTests(unittest.TestCase):
+    # Applies the owner-only ACL only to a fresh directory under the system temp folder.
+    def test_owner_only_acl_can_be_applied_twice(self):
+        private = load_private()
+        with tempfile.TemporaryDirectory(prefix="webkakao-acl-") as temporary:
+            target = Path(temporary) / "private"
+            private.ensure_private_directory(target)
+            private.ensure_private_directory(target)  # Set-Acl failed here with SeSecurityPrivilege.
+            (target / "probe.json").write_text("{}", encoding="utf-8")
+            self.assertTrue(private.verify_private_file(target / "probe.json"))
 
 
 if __name__ == "__main__":

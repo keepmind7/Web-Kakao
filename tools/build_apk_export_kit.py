@@ -1,7 +1,10 @@
 """다른 Windows PC용 APK 추출 키트를 만든다. 사용자 데이터·APK는 포함하지 않는다."""
 import hashlib
 from pathlib import Path
+import sys
 from zipfile import ZipFile, ZIP_DEFLATED
+if sys.version_info < (3, 11):
+    raise SystemExit("Python 3.11 이상이 필요합니다 (hashlib.file_digest). py -3.11 로 실행하세요.")
 
 ROOT = Path(__file__).resolve().parent.parent
 SOURCE = ROOT / 'tools/apk_export'

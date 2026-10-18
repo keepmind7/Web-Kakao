@@ -1,11 +1,15 @@
 """실제 네트워크/계정 없이 인증 전제의 오류·거부 처리를 확인한다."""
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from experiments.auth_preflight import SOURCE, allowlist_accepted, inspect_source
+
+# WEB_KAKAO_STRICT=1 turns a missing prerequisite into a failure instead of a silent skip.
+STRICT = os.environ.get("WEB_KAKAO_STRICT") == "1"
 
 
 class AuthPreflightTests(unittest.TestCase):
@@ -36,8 +40,9 @@ class AuthPreflightTests(unittest.TestCase):
             path.write_text("changed", encoding="utf-8")
             self.assertEqual(inspect_source(root)["outcome"], "source_changed")
 
-    @unittest.skipUnless(SOURCE.exists(), "고정 공개 소스 미다운로드")
+    @unittest.skipUnless(SOURCE.exists() or STRICT, "고정 공개 소스 미다운로드")
     def test_current_windows_candidate_stops_before_auth_or_secret_read(self):
+        self.assertTrue(SOURCE.exists(), "WEB_KAKAO_STRICT=1: 고정 공개 소스 미다운로드")
         # 네트워크 호출이나 외부 프로그램 실행이 추가되면 회귀를 검출한다.
         with patch("socket.socket", side_effect=AssertionError("network forbidden")), \
              patch("subprocess.Popen", side_effect=AssertionError("process forbidden")):

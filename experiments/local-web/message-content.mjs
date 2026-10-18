@@ -1,4 +1,4 @@
-import { imageType } from './photos.mjs';
+import { imageType,imageDimensions } from './photos.mjs';
 
 export const IMAGE_LIMIT=10*1024*1024;
 export const messageKeyValid=value=>typeof value==='string' && /^m_[a-f0-9]{24}$/.test(value);
@@ -15,21 +15,7 @@ export function replyExtra(target){
 }
 export function inspectImage(data){
   if(!Buffer.isBuffer(data) || data.length>IMAGE_LIMIT || data.length<24)return null;
-  const mime=imageType(data);let width=0,height=0;
-  if(mime==='image/png' && data.toString('ascii',12,16)==='IHDR'){width=data.readUInt32BE(16);height=data.readUInt32BE(20);}
-  else if(mime==='image/jpeg'){
-    let offset=2;
-    while(offset+4<=data.length){
-      if(data[offset++]!==255)return null;
-      while(data[offset]===255)offset++;
-      const marker=data[offset++];if(marker===217 || marker===218)break;
-      if(marker===1 || marker>=208 && marker<=215)continue;
-      if(offset+2>data.length)break;const size=data.readUInt16BE(offset);
-      if(size<2 || offset+size>data.length)break;
-      if([192,193,194,195,197,198,199,201,202,203,205,206,207].includes(marker) && size>=8){height=data.readUInt16BE(offset+3);width=data.readUInt16BE(offset+5);break;}
-      offset+=size;
-    }
-  }
+  const mime=imageType(data),{width=0,height=0}=['image/png','image/jpeg'].includes(mime)?imageDimensions(data) ?? {}:{};
   if(!width || !height || width>4096 || height>4096 || width*height>16777216)return null;
   return {mime,width,height,ext:mime==='image/png'?'png':'jpg'};
 }

@@ -61,13 +61,13 @@ test('valid control status is allowlisted and never grants a cookie or browser C
   assert.equal(response.status,200);assert.equal(response.headers.get('set-cookie'),null);const body=await response.json();assert.equal(body.app,'web-kakao-auth-lab-v1');
   for(const name of ['csrf','cookie','controlToken','grid','passcode','accessToken','refreshToken','userId','rooms','messages'])assert.equal(Object.hasOwn(body,name),false,name+' must not be disclosed to launcher status');assert.equal(f.actions.length,0);
 });
-test('a ticket exchanges exactly once and preserves previously authorized browser cookies',async t=>{
+test('a ticket exchanges exactly once and preserves previously authorized browser sessions',async t=>{
   const f=await serverFixture(t),first=await issue(f.url);
-  const response=await post(f.url,'/api/local/session',{ticket:first});assert.equal(response.status,200);const header=response.headers.get('set-cookie');assert.match(header,/HttpOnly/);assert.match(header,/SameSite=Strict/);const cookie=header.split(';')[0];
-  assert.equal((await fetch(f.url+'/api/status',{headers:{cookie}})).status,200);
+  const response=await post(f.url,'/api/local/session',{ticket:first});assert.equal(response.status,200);assert.equal(response.headers.get('set-cookie'),null,'cookies are not port-scoped');const auth={'X-Local-Session':(await response.json()).session};
+  assert.equal((await fetch(f.url+'/api/status',{headers:auth})).status,200);
   assert.equal((await post(f.url,'/api/local/session',{ticket:first})).status,403);
   const second=await issue(f.url);assert.equal((await post(f.url,'/api/local/session',{ticket:second})).status,200);
-  assert.equal((await fetch(f.url+'/api/status',{headers:{cookie}})).status,200,'opening another authorized tab must not revoke the first cookie');assert.equal(f.actions.length,0);
+  assert.equal((await fetch(f.url+'/api/status',{headers:auth})).status,200,'opening another authorized tab must not revoke the first session');assert.equal(f.actions.length,0);
 });
 test('missing forged and expired tickets never grant cookies',async t=>{
   // Install the clock before server construction, including implementations
@@ -80,7 +80,8 @@ test('missing forged and expired tickets never grant cookies',async t=>{
 test('simultaneous ticket reuse grants one cookie and only one success',async t=>{
   const f=await serverFixture(t),ticket=await issue(f.url);
   const responses=await Promise.all([post(f.url,'/api/local/session',{ticket}),post(f.url,'/api/local/session',{ticket})]);
-  assert.deepEqual(responses.map(r=>r.status).sort(),[200,403]);assert.equal(responses.filter(r=>r.headers.has('set-cookie')).length,1);
+  assert.deepEqual(responses.map(r=>r.status).sort(),[200,403]);assert.equal(responses.filter(r=>r.headers.has('set-cookie')).length,0);
+  assert.equal((await Promise.all(responses.map(r=>r.json()))).filter(body=>typeof body.session==='string').length,1);
 });
 test('outstanding launch tickets stay bounded to at most eight usable capabilities',async t=>{
   const f=await serverFixture(t),tickets=[];
@@ -106,11 +107,11 @@ test('public launcher document and script grant no cookie and use fragment-only 
 });
 
 const transientCases=[['network',()=>{throw new Error('SYNTHETIC TRANSPORT');}],['HTTP5xx',{httpStatus:503,body:{status:0}}],['malformed JSON',ok(null)],['invalid status type',ok({status:'0'})],['incomplete success',ok({status:0,accessToken:'SYNTHETIC'})]];
-for(const [name,failure] of transientCases)test('QR poll '+name+' permits only manual retries up to the total three-attempt limit',async()=>{
-  const replies=Array.from({length:3},()=>[ok({allowlisted:true}),qr(),failure]).flat(),f=authFixture(replies);
-  try{for(let n=0;n<3;n++){
-    assert.equal(await f.lab.start(),true);await f.tick();const state=f.lab.snapshot();assert.equal(state.phase,'error');assert.equal(state.sessionBlocked,false,'transient failure is not an explicit server denial');assert.equal(state.canStart,n<2);assert.equal(state.credentialInMemory,false);assert.equal(f.timers.length,0);assert.equal(f.calls.filter(op=>op==='poll').length,n+1);
-  }assert.equal(await f.lab.start(),false);assert.equal(f.lab.snapshot().attempts,3);}finally{f.lab.cancel();}
+for(const [name,failure] of transientCases)test('QR poll '+name+' permits further manual retries without automatic retry or a local total limit',async()=>{
+  const replies=Array.from({length:5},()=>[ok({allowlisted:true}),qr(),failure]).flat(),f=authFixture(replies);
+  try{for(let n=0;n<5;n++){
+    assert.equal(await f.lab.start(),true);await f.tick();const state=f.lab.snapshot();assert.equal(state.phase,'error');assert.equal(state.sessionBlocked,false,'transient failure is not an explicit server denial');assert.equal(state.canStart,true);assert.equal(state.credentialInMemory,false);assert.equal(f.timers.length,0);assert.equal(f.calls.filter(op=>op==='poll').length,n+1);
+  }assert.equal(f.lab.snapshot().canStart,true);assert.equal(f.lab.snapshot().attempts,5);}finally{f.lab.cancel();}
 });
 for(const failure of [ok({allowlisted:false}),{httpStatus:403,body:{}},ok({allowlisted:true,status:-997})])test('explicit authentication refusal remains locked even after local cancel',async()=>{
   const f=authFixture([failure]);try{await f.lab.start();assert.equal(f.lab.snapshot().phase,'blocked');f.lab.cancel();assert.equal(await f.lab.start(),false);assert.equal(f.lab.snapshot().sessionBlocked,true);assert.deepEqual(f.calls,['allowlist']);}finally{f.lab.cancel();}

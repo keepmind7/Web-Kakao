@@ -1,11 +1,11 @@
 import { randomBytes,createHash } from 'node:crypto';
-import { roomKeyValid,ROOM_LIMIT } from './reader-data.mjs';
+import { roomKeyValid,ROOM_LIMIT,initialUnreadState } from './reader-data.mjs';
 
 const messageKey=value=>typeof value==='string' && /^m_[a-f0-9]{24}$/.test(value);
 export function cleanRoomTitle(value){
   if(typeof value!=='string')return null;
   const title=value.trim();
-  return title && [...title].length<=120 && !/[\u0000-\u001f\u007f]/u.test(title)?title:null;
+  return title && [...title].length<=120 && !/[\u0000-\u001f\u007f-\u009f\u200e\u200f\u202a-\u202e\u2066-\u2069\u2028\u2029]/u.test(title)?title:null;
 }
 
 // Account-session memory only. It is independent of the 20-room display LRU.
@@ -21,7 +21,7 @@ export function createRoomState({perRoomLimit=2000,totalLimit=20000,bloomBytes=2
   const get=key=>{
     if(!rooms.has(key)){
       if(rooms.size>=ROOM_LIMIT)return null;
-      rooms.set(key,{title:null,pinOrder:null,muted:false,events:new Map(),exact:new Map(),sequence:0,seen:0,partial:false});
+      rooms.set(key,{title:null,pinOrder:null,muted:false,events:new Map(),exact:new Map(),sequence:0,seen:0,partial:false,seeded:false,initialUnreadCount:0});
     }
     return rooms.get(key);
   };
@@ -44,10 +44,15 @@ export function createRoomState({perRoomLimit=2000,totalLimit=20000,bloomBytes=2
       for(const row of rows){
         if(!roomKeyValid(row?.key))continue;
         const existing=rooms.has(row.key),state=get(row.key);
+        if(state && !state.seeded){
+          const initial=initialUnreadState(row);state.seeded=true;state.initialUnreadCount=initial.initialUnreadCount;
+          if(initial.initialUnreadCoverage==='partial')state.partial=true;
+        }
         if(state && existing && reconnect)state.partial=true;
       }
-      tokens.clear();
+      if(reconnect)tokens.clear();
     },
+    markPartial(key){const state=rooms.get(key);if(state)state.partial=true;},
     receive(key,arrivals){
       if(!roomKeyValid(key))return;
       const state=get(key);if(!state)return;
@@ -69,7 +74,7 @@ export function createRoomState({perRoomLimit=2000,totalLimit=20000,bloomBytes=2
     decorate(row){
       const state=get(row.key);
       if(!state)return {...row,unreadLocalCount:0,unreadCoverage:'partial'};
-      const count=state.events.size;
+      const count=state.initialUnreadCount+state.events.size;
       return {...row,baseTitle:row.title,localTitle:state.title,title:state.title || row.title,
         pinOrder:state.pinOrder,muted:state.muted,unreadLocalCount:count,unreadCoverage:state.partial || globalPartial?'partial':'observed'};
     },
@@ -94,7 +99,7 @@ export function createRoomState({perRoomLimit=2000,totalLimit=20000,bloomBytes=2
       const issued=tokens.get(token);
       if(!issued || issued.key!==key || !rooms.has(key))return null;
       tokens.delete(token);
-      const state=get(key);state.seen=Math.max(state.seen,issued.sequence);
+      const state=get(key);state.initialUnreadCount=0;state.seen=Math.max(state.seen,issued.sequence);
       for(const [message,sequence] of state.events)if(sequence<=state.seen){state.events.delete(message);entries--;}
       if(!state.events.size)notices.delete(key);
       return {message:issued.message};
