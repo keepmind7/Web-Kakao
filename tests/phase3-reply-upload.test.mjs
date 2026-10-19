@@ -55,6 +55,15 @@ function uploadFixture({offset=0,denial=null,disconnect=false,routeError=false,c
     createClient(){media=Object.assign(new EventEmitter(),{async connect(host,port){calls.push({method:'connect',host,port});},async request(method,body){calls.push({method,body});expected=body.s-offset;if(disconnect)throw new Error('PRIVATE');if(expected===0)queueMicrotask(()=>media.emit('push',{method:'COMPLETE',status:0,body:completeBody ?? {status:0,chatLog:{logId:'20',chatId:'123'}}}));return {status:denial==='post'?-203:0,body:{o:offset}};},async writeEncrypted(data){bytes.push(Buffer.from(data));if(bytes.reduce((sum,b)=>sum+b.length,0)===expected)media.emit('push',{method:'COMPLETE',status:0,body:completeBody ?? {status:0,chatLog:{logId:'20',chatId:'123'}}});},disconnect(){}});return media;},
     toLong:String,chatId:'123',userId:'999',messageId:'345',data:png,profile:{os:'android',appVersion:'26.1.2'},resolve:async(host,port)=>{if(routeError)throw new Error('private route');return '1.2.3.4';}}};
 }
+function syntheticPngWithSize(size){
+  // Add a valid private ancillary chunk before IEND. Exact boundary lengths
+  // do not depend on compression, production MAX or any user's photo bytes.
+  const payload=Buffer.alloc(size-png.length-12),type=Buffer.from('raNd'),length=Buffer.alloc(4),crc=Buffer.alloc(4);
+  length.writeUInt32BE(payload.length);let value=0xffffffff;
+  for(const byte of Buffer.concat([type,payload])){value^=byte;for(let n=0;n<8;n++)value=(value>>>1)^((value&1)?0xedb88320:0);}
+  crc.writeUInt32BE((value^0xffffffff)>>>0);
+  return Buffer.concat([png.subarray(0,-12),length,type,payload,crc,png.subarray(-12)]);
+}
 test('photo uses SHIP and dedicated POST/COMPLETE once, streams remaining bytes and never WRITE',async()=>{
   const f=uploadFixture({offset:10}),outcome=await uploadPhoto(f.options);
   assert.equal(outcome.phase,'accepted');assert.equal(outcome.chatLog.logId,'20');assert.deepEqual(Buffer.concat(f.bytes),png.subarray(10));
@@ -91,9 +100,22 @@ test('the remaining large payload uses bounded encrypted frames and an uppercase
   const outcome=await uploadPhoto({...f.options,data,observe:e=>steps.push(e)});
   assert.equal(outcome.phase,'accepted');assert.equal(f.bytes.length,Math.ceil((data.length-17)/MAX_UPLOAD_CHUNK_BYTES));assert.deepEqual(Buffer.concat(f.bytes),data.subarray(17));
   assert.ok(f.bytes.every(b=>b.length+12+16<=131068));
+  assert.ok(f.bytes.every(b=>b.length<=65536),'reference outbound 64KiB policy is independent of the receive-frame cap');
   assert.equal(f.calls[0].body.cs,createHash('sha1').update(data).digest('hex').toUpperCase());
   assert.equal(steps.find(e=>e.stage==='await_complete').sentBytes,data.length);
   assert.equal(steps.find(e=>e.stage==='received_complete').status,0);
+});
+for(const size of [65535,65536,65537,131072,131073,629748])test('reference outbound 64KiB literal boundary preserves a '+size+' byte synthetic PNG',async()=>{
+  const data=syntheticPngWithSize(size),f=uploadFixture();
+  assert.equal(data.length,size);assert.ok(inspectImage(data));
+  const result=await uploadPhoto({...f.options,data});
+  assert.equal(result.phase,'accepted');assert.deepEqual(Buffer.concat(f.bytes),data);
+  assert.deepEqual(f.calls.map(call=>call.method),['SHIP','connect','POST']);
+  // Fixed reference: modern media-upload.ts at 8dbbd4f7 streamEncryptedFile
+  // uses highWaterMark 64*1024. This asserts source compatibility, not a live
+  // service limit; no test peer is made to reject otherwise valid frames.
+  assert.ok(f.bytes.every(chunk=>chunk.length<=65536));
+  assert.equal(f.bytes.length,Math.ceil(size/65536));
 });
 test('upload diagnostics isolate numeric offset and transfer stages without recording the token or image',async()=>{
   const f=uploadFixture({offset:-1}),steps=[];

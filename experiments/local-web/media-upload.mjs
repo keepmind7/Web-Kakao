@@ -4,10 +4,26 @@ import { responseStatus } from './reader-response.mjs';
 import { inspectImage } from './message-content.mjs';
 import { serverId } from './reader-data.mjs';
 
-// Match the pinned transport's 131,068-byte encrypted block body limit:
-// 12-byte nonce + plaintext + 16-byte GCM tag. This is a conservative framing
-// bound, not evidence of the live upload server's own negotiated limit.
-export const MAX_UPLOAD_CHUNK_BYTES=131068-12-16;
+// Match modern 8dbbd4f7ed6b42542982252250622fa351af00e9's
+// src/kakao/media-upload.ts streamEncryptedFile highWaterMark: 64 * 1024.
+// This is the reference's outbound policy, not a confirmed live-server limit.
+export const MAX_UPLOAD_CHUNK_BYTES=64*1024;
+
+const metadataValue=(value,key)=>{try{return value?.[key];}catch{return undefined;}};
+const duration=started=>Math.max(0,Math.min(2147483647,Date.now()-started));
+const counter=value=>Number.isSafeInteger(value) && value>=0?value:null;
+function socketSnapshot(client,baseline){
+  const socket=metadataValue(client,'socket');
+  if(!socket || typeof socket!=='object')return {available:false};
+  const snapshot={available:true};
+  for(const key of ['destroyed','writable','writableEnded','writableNeedDrain']){const value=metadataValue(socket,key);if(typeof value==='boolean')snapshot[key]=value;}
+  for(const key of ['writableLength','writableHighWaterMark']){const value=counter(metadataValue(socket,key));if(value!==null && value<=2147483647)snapshot[key]=value;}
+  for(const [key,name] of [['bytesWritten','writtenBytesDelta'],['bytesRead','readBytesDelta']]){
+    const value=counter(metadataValue(socket,key)),start=baseline[key];
+    if(value!==null && start!==null && value>=start && value-start<=2147483647)snapshot[name]=value-start;
+  }
+  return snapshot;
+}
 
 function uploadFault(error){
   const category=['TypeError','RangeError','Error'].includes(error?.name)?error.name:'other';
@@ -35,7 +51,7 @@ function completeMatches(body,{chatId,userId,messageId,requireLog}){
 // the photo itself. Never follow this path with WRITE, nor automatically retry.
 export async function uploadPhoto(options){
   let posting=false,stage='ship';
-  const trace=(next,details={})=>{stage=next;options.observe?.({stage,...details});};
+  const trace=(next,details={})=>{stage=next;try{options.observe?.({stage,...details});}catch{/* Observation cannot change an upload outcome. */}};
   try{return await performUpload({...options,trace,onPosting:()=>{posting=true;}});}catch(error){trace(stage,{failure:'exception',...uploadFault(error)});return {phase:posting?'unknown':'failed',status:null};}
 }
 async function performUpload({carriage,createClient,toLong,chatId,userId,messageId,data,signal,isCurrent=()=>true,readOnSend=false,resolve=resolvePublicDestination,profile,timeout=20000,onPosting,trace}){
@@ -44,18 +60,18 @@ async function performUpload({carriage,createClient,toLong,chatId,userId,message
   if(typeof messageId!=='string' || !/^[1-9]\d{0,18}$/.test(messageId) || BigInt(messageId)>9223372036854775807n)throw new Error('invalid_message_id');
   chatId=signedId(chatId);userId=signedId(userId);
   if(!chatId || !userId)throw new Error('invalid_upload_identity');
-  const assertLive=()=>{if(signal?.aborted || isCurrent()!==true)throw new Error('upload_cancelled');};
-  // The predicate protects every async boundary; the signal also releases a
-  // stalled SHIP/DNS/connect/POST wait when its owning room is invalidated.
+  const lifetime=new AbortController(),uploadSignal=signal?AbortSignal.any([signal,lifetime.signal]):lifetime.signal;
+  const assertLive=()=>{if(uploadSignal.aborted || isCurrent()!==true)throw new Error('upload_cancelled');};
+  // Every wait, including raw writes, shares cancellation independently of
+  // whether the transport settles its own promises after disconnect.
   const awaitLive=async operation=>{
     assertLive();
-    if(!signal){const result=await operation();assertLive();return result;}
     return await new Promise((resolve,reject)=>{
       let settled=false;
-      const finish=(callback,value)=>{if(settled)return;settled=true;signal.removeEventListener('abort',onAbort);callback(value);};
+      const finish=(callback,value)=>{if(settled)return;settled=true;uploadSignal.removeEventListener('abort',onAbort);callback(value);};
       const onAbort=()=>finish(reject,new Error('upload_cancelled'));
-      signal.addEventListener('abort',onAbort,{once:true});
-      if(signal.aborted){onAbort();return;}
+      uploadSignal.addEventListener('abort',onAbort,{once:true});
+      if(uploadSignal.aborted){onAbort();return;}
       try{
         Promise.resolve(operation()).then(value=>{try{assertLive();finish(resolve,value);}catch(error){finish(reject,error);}},error=>finish(reject,error));
       }catch(error){finish(reject,error);}
@@ -69,14 +85,38 @@ async function performUpload({carriage,createClient,toLong,chatId,userId,message
   const token=ship.body?.k,host=ship.body?.vh,port=Number(ship.body?.p);
   if(typeof token!=='string' || !token.length || token.length>4096)throw new Error('invalid_upload_route');
   trace('route');const address=await awaitLive(()=>resolve(host,port));assertLive();
-  const client=createClient();let settle,settled=false,posting=false;
+  const client=createClient();let settle,settled=false,posting=false,finalized=false,disconnected=false,sent=null,frames=0,streamRecorded=false,completeObserved=false;
+  let write=null,writeStarted=0,writeFrozen=false,baseline=null;
+  const captureTerminal=()=>{if(write && !writeFrozen){writeFrozen=true;write.elapsedMs=duration(writeStarted);write.terminal=socketSnapshot(client,baseline);}};
+  const writeDetails=()=>write?{write}:{};
+  const writeChunk=async chunk=>{
+    if(!baseline){const socket=metadataValue(client,'socket');baseline={bytesWritten:counter(metadataValue(socket,'bytesWritten')),bytesRead:counter(metadataValue(socket,'bytesRead'))};}
+    writeStarted=Date.now();writeFrozen=false;
+    const current=write={index:frames+1,inputBytes:chunk.length,phase:'calling',elapsedMs:0,before:socketSnapshot(client,baseline)};
+    try{
+      await awaitLive(()=>{
+        const called=Date.now();let waiting;
+        try{waiting=client.writeEncrypted(chunk);}catch(error){if(!writeFrozen){current.phase='threw';current.callMs=duration(called);captureTerminal();}throw error;}
+        if(!writeFrozen){current.phase='waiting';current.callMs=duration(called);current.returned=socketSnapshot(client,baseline);}
+        return waiting;
+      });
+      if(!writeFrozen){current.phase='fulfilled';current.elapsedMs=duration(writeStarted);}
+    }catch(error){if(!writeFrozen){current.phase='rejected';captureTerminal();}throw error;}
+  };
+  const disconnect=()=>{if(disconnected)return;disconnected=true;try{client.disconnect();}catch{/* Cancellation already releases our waits. */}};
+  const recordStream=()=>{if(sent!==null && !streamRecorded){streamRecorded=true;captureTerminal();trace('stream',{sentBytes:sent,totalBytes:data.length,frames,...writeDetails()});}};
   const complete=new Promise(resolve=>{settle=resolve;});
   const finish=value=>{if(!settled){settled=true;settle(value);}};
-  const onPush=packet=>{if(posting && packet?.method==='COMPLETE')finish({packet});};
-  const onError=error=>{trace('transport',{failure:'closed_or_error',...uploadFault(error)});finish({error:true});};
-  const onAbort=()=>{finish({error:true});client.disconnect();};
-  client.on('push',onPush);client.on('error',onError);client.on('disconnected',onError);signal?.addEventListener('abort',onAbort,{once:true});
-  const timer=setTimeout(()=>{trace('deadline',{failure:'timeout'});finish({error:true});client.disconnect();},timeout+10000);timer.unref?.();
+  const onPush=packet=>{
+    if(!finalized && !uploadSignal.aborted && posting && packet?.method==='COMPLETE'){
+      if(!completeObserved){completeObserved=true;let status=null;try{const value=responseStatus(packet);if(Number.isInteger(value) && value>=-2147483648 && value<=2147483647)status=value;}catch{/* Missing observation status is not an outcome. */}trace('complete_observed',{status,beforeStreamEnd:sent===null || sent<data.length});}
+      finish({packet});
+    }
+  };
+  const onError=error=>{if(finalized || uploadSignal.aborted)return;captureTerminal();trace('transport',{failure:'closed_or_error',...uploadFault(error),...writeDetails()});lifetime.abort();};
+  const onAbort=()=>{captureTerminal();finish({error:true});disconnect();};
+  client.on('push',onPush);client.on('error',onError);client.on('disconnected',onError);uploadSignal.addEventListener('abort',onAbort,{once:true});
+  const timer=setTimeout(()=>{if(finalized || uploadSignal.aborted)return;captureTerminal();trace('deadline',{failure:'timeout',...writeDetails()});lifetime.abort();},timeout+10000);timer.unref?.();
   try{
     trace('connect');
     await awaitLive(()=>client.connect(address,port,timeout));assertLive();
@@ -94,13 +134,13 @@ async function performUpload({carriage,createClient,toLong,chatId,userId,message
     const offset=Number(post.body?.o);
     trace('offset',{offset:Number.isSafeInteger(offset)?offset:null,totalBytes:data.length});
     if(!Number.isSafeInteger(offset) || offset<0 || offset>data.length){trace('offset',{failure:'invalid_offset'});return {phase:'unknown',status:null};}
-    let sent=offset,frames=0;
+    sent=offset;
     trace('stream');
     // Each writeEncrypted call makes a complete GCM frame. Preserve the file
     // byte sequence while bounding each frame, including nonce and tag.
     // One collapsed stream event keeps earlier stage timings in the rolling log.
-    while(sent<data.length){assertLive();const end=Math.min(sent+MAX_UPLOAD_CHUNK_BYTES,data.length);await awaitLive(()=>client.writeEncrypted(data.subarray(sent,end)));sent=end;frames++;}
-    if(frames)trace('stream',{sentBytes:sent,totalBytes:data.length,frames});
+    while(sent<data.length){assertLive();const end=Math.min(sent+MAX_UPLOAD_CHUNK_BYTES,data.length);await writeChunk(data.subarray(sent,end));sent=end;frames++;}
+    recordStream();
     trace('await_complete',{sentBytes:sent,totalBytes:data.length});
     const result=await awaitLive(()=>complete);assertLive();
     if(result.error)return {phase:'unknown',status:null};
@@ -109,6 +149,6 @@ async function performUpload({carriage,createClient,toLong,chatId,userId,message
     if(!completeMatches(result.packet.body,{chatId,userId,messageId,requireLog:status===0}))return {phase:'unknown',status:null};
     // Preserve verified outer identity as evidence for the session/store boundary.
     return {phase:status===0?'accepted':status===null?'unknown':'failed',status,chatLog:status===0?result.packet.body?.chatLog:null,...(status===0?{completeBody:result.packet.body}:{})};
-  }catch(error){trace('exception',uploadFault(error));return {phase:posting?'unknown':'failed',status:null};}
-  finally{clearTimeout(timer);signal?.removeEventListener('abort',onAbort);client.off('push',onPush);client.off('disconnected',onError);client.disconnect();/* Keep the harmless error listener for late socket errors. */}
+  }catch(error){captureTerminal();trace('exception',{...uploadFault(error),...writeDetails()});return {phase:posting?'unknown':'failed',status:null};}
+  finally{captureTerminal();finalized=true;clearTimeout(timer);uploadSignal.removeEventListener('abort',onAbort);client.off('push',onPush);client.off('disconnected',onError);lifetime.abort();recordStream();disconnect();/* Keep the inert error listener for late socket errors. */}
 }

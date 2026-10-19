@@ -35,13 +35,26 @@ function encrypt(key,plain){
 function decrypt(key,frame){
   const cipher=createDecipheriv('aes-128-gcm',key,frame.subarray(0,12));cipher.setAuthTag(frame.subarray(-16));return Buffer.concat([cipher.update(frame.subarray(12,-16)),cipher.final()]);
 }
-async function exercise(data,{offset=0,frameLimit=MAX_FRAME_BODY,abort=false,readOnSend}={}){
+async function exercise(data,{offset=0,frameLimit=MAX_FRAME_BODY,abort=false,readOnSend,cork=false,thirdWriteAbort=false}={}){
   const Media=guardReaderClient(CarriageClient,null,{messaging:true,media:true}),client=new Media();
   // The sole key inspected belongs to this new synthetic client. It is shared
   // with this test peer only in memory; neither key nor wire bytes are logged.
   const key=client.crypto.aesKey,observed={handshakes:0,posts:0,frames:[],received:[],oversized:false,errors:[]};
   const sockets=new Set(),controller=new AbortController(),steps=[];
-  let peerDone;
+  let peerDone,uncork=null,abortThird=null;
+  const originalWriteEncrypted=client.writeEncrypted;
+  if(thirdWriteAbort)client.writeEncrypted=function(chunk){
+    observed.sdkWriteCalls=(observed.sdkWriteCalls??0)+1;
+    const third=observed.sdkWriteCalls===3;
+    if(third){client.socket.cork();observed.resolvedBeforeThird=observed.sdkResolvedWrites;}
+    // Preserve the original pinned SDK encryption, socket.write and callback.
+    const pending=originalWriteEncrypted.call(this,chunk);
+    if(third)abortThird=setImmediate(()=>{
+      observed.thirdCorkDepth=client.socket.writableCorked;observed.thirdQueuedBytes=client.socket.writableLength;
+      controller.abort();abortThird=null;
+    });
+    return pending.then(value=>{observed.sdkResolvedWrites=(observed.sdkResolvedWrites??0)+1;return value;});
+  };
   const disconnected=new Promise(resolve=>{peerDone=resolve;});
   const server=net.createServer(socket=>{
     sockets.add(socket);socket.on('close',()=>{sockets.delete(socket);peerDone();});socket.on('error',()=>{});
@@ -81,13 +94,27 @@ async function exercise(data,{offset=0,frameLimit=MAX_FRAME_BODY,abort=false,rea
     });
   });
   server.listen(0,'127.0.0.1');await once(server,'listening');
+  assert.notEqual(server.address().port,8787);
   try{
     const result=await uploadPhoto({carriage:{async request(method,body){assert.equal(method,'SHIP');observed.shipSizeIsLong=Long.isLong(body.s);return {status:0,body:{k:'SYNTHETIC',vh:'unused.invalid',p:server.address().port}};}},
       createClient:()=>client,toLong,chatId:'123',userId:'999',messageId:'345',data,signal:controller.signal,...(readOnSend===undefined?{}:{readOnSend}),
-      resolve:async()=> '127.0.0.1',profile:{os:'android',appVersion:'26.1.2',subDeviceMode:true},timeout:1000,observe:e=>steps.push(e)});
+      resolve:async()=> '127.0.0.1',profile:{os:'android',appVersion:'26.1.2',subDeviceMode:true},timeout:1000,observe:e=>{
+        steps.push(e);
+        if(cork && e.stage==='stream' && !observed.corked){
+          // This socket belongs solely to this new synthetic SDK client.
+          // Preserve the actual writeEncrypted implementation and callback:
+          // real corking defers its first encrypted write until uncork.
+          const socket=client.socket;socket.cork();observed.corked=true;
+          uncork=setImmediate(()=>{
+            observed.corkDepth=socket.writableCorked;observed.queuedBytes=socket.writableLength;
+            observed.peerFramesBeforeUncork=observed.frames.length;
+            socket.uncork();uncork=null;
+          });
+        }
+      }});
     await disconnected;assert.deepEqual(observed.errors,[]);
     return {result,observed,steps};
-  }finally{client.disconnect();for(const socket of sockets)socket.destroy();await new Promise(resolve=>server.close(resolve));console.log(JSON.stringify({syntheticMediaPeerCleanup:{serverListening:server.listening,remainingSockets:sockets.size,pending:client.pending?.size??0,handshakes:observed.handshakes,posts:observed.posts}}));}
+  }finally{if(uncork)clearImmediate(uncork);if(abortThird)clearImmediate(abortThird);client.writeEncrypted=originalWriteEncrypted;client.disconnect();for(const socket of sockets)socket.destroy();await new Promise(resolve=>server.close(resolve));console.log(JSON.stringify({syntheticMediaPeerCleanup:{serverListening:server.listening,remainingSockets:sockets.size,pending:client.pending?.size??0,handshakes:observed.handshakes,posts:observed.posts}}));}
 }
 
 test('real media transport preserves a small PNG and reassembles fragmented COMPLETE',async()=>{
@@ -99,10 +126,12 @@ test('a large PNG fits bounded GCM frames and preserves every file byte',async()
   const data=png(512,512),{result,observed}=await exercise(data);
   assert.equal(observed.oversized,false);assert.equal(result.phase,'accepted');assert.ok(observed.frames.length>1);
   assert.ok(observed.frames.every(size=>size<=MAX_FRAME_BODY));assert.deepEqual(Buffer.concat(observed.received),data);
+  assert.ok(observed.received.every(chunk=>chunk.length<=65536),'outbound reference policy checks decrypted plaintext separately from peer receive cap');
 });
 test('resumed media starts at a non-frame-aligned offset without gaps or duplicates',async()=>{
   const data=png(512,512),offset=65539,{result,observed}=await exercise(data,{offset});
   assert.equal(result.phase,'accepted');assert.deepEqual(Buffer.concat(observed.received),data.subarray(offset));
+  assert.ok(observed.received.every(chunk=>chunk.length<=65536));
 });
 test('transport cancellation after POST ends without a second connection or request',async()=>{
   const {result,observed}=await exercise(png(1,1),{abort:true});
@@ -113,4 +142,40 @@ test('real encrypted media POST serializes ns false only for explicit readOnSend
   const data=png(1,1),{result,observed}=await exercise(data,{readOnSend:true});
   assert.equal(result.phase,'accepted');assert.equal(observed.handshakes,1);assert.equal(observed.posts,1);assert.deepEqual(Buffer.concat(observed.received),data);
   assert.equal(observed.noSeen,false,'actual pinned SDK BSON POST must carry ns:false for the explicit send policy');
+});
+
+for(const offset of [0,65539])test('real SDK corked write callback resumes without byte loss or duplication at offset '+offset,async()=>{
+  const data=png(512,512),{result,observed,steps}=await exercise(data,{offset,cork:true});
+  assert.equal(result.phase,'accepted');assert.equal(observed.corked,true);assert.ok(observed.corkDepth>0);
+  assert.ok(observed.queuedBytes>0,'actual net.Socket write stays buffered while corked');
+  assert.equal(observed.peerFramesBeforeUncork,0);
+  assert.equal(observed.handshakes,1);assert.equal(observed.posts,1);assert.equal(observed.oversized,false);
+  assert.deepEqual(Buffer.concat(observed.received),data.subarray(offset));
+  assert.ok(observed.frames.length>1);assert.ok(observed.frames.every(size=>size<=MAX_FRAME_BODY));
+  assert.equal(steps.filter(row=>row.stage==='stream').length,2);
+  assert.ok(observed.received.every(chunk=>chunk.length<=65536));
+});
+
+for(const remaining of [1,0])test('real SDK resume with '+remaining+' file bytes remaining preserves exact suffix and fragmented COMPLETE',async()=>{
+  const data=png(512,512),offset=data.length-remaining,{result,observed,steps}=await exercise(data,{offset});
+  assert.equal(result.phase,'accepted');assert.equal(observed.handshakes,1);assert.equal(observed.posts,1);
+  assert.deepEqual(Buffer.concat(observed.received),data.subarray(offset));
+  assert.equal(observed.received.length,remaining);assert.equal(observed.frames.length,remaining);
+  assert.ok(observed.received.every(chunk=>chunk.length<=65536));
+  assert.equal(steps.at(-1).stage,'received_complete');
+});
+
+test('real SDK third write stays corked after two callbacks and explicit abort starts no fourth write',async()=>{
+  const data=png(512,512),{result,observed,steps}=await exercise(data,{thirdWriteAbort:true});
+  assert.equal(result.phase,'unknown');assert.equal(observed.sdkWriteCalls,3);assert.equal(observed.resolvedBeforeThird,2);
+  assert.ok(observed.thirdCorkDepth>0);assert.ok(observed.thirdQueuedBytes>0);assert.equal(observed.sdkResolvedWrites,2);
+  assert.equal(observed.handshakes,1);assert.equal(observed.posts,1);assert.equal(observed.oversized,false);
+  const received=Buffer.concat(observed.received);assert.ok(received.length<=131072);assert.deepEqual(received,data.subarray(0,received.length));
+  const stream=steps.filter(row=>row.stage==='stream');assert.equal(stream.length,2);assert.equal(stream[1].sentBytes,131072);assert.equal(stream[1].frames,2);
+  assert.equal(steps.some(row=>row.stage==='await_complete'),false);
+  const write=stream[1].write;assert.ok(write,'actual SDK terminal aggregate must expose bounded write metadata');
+  assert.equal(write.index,3);assert.equal(write.inputBytes,65536);assert.equal(write.phase,'waiting');
+  assert.equal(write.returned.available,true);assert.ok(write.returned.writableLength>0);
+  assert.equal(write.terminal.available,true);assert.equal(write.terminal.destroyed,false,'terminal snapshot precedes our explicit abort cleanup');
+  for(const snapshot of [write.returned,write.terminal])for(const field of ['writableLength','writableHighWaterMark','writtenBytesDelta','readBytesDelta'])assert.ok(Number.isInteger(snapshot[field]) && snapshot[field]>=0 && snapshot[field]<=2147483647);
 });
