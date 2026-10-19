@@ -7,6 +7,7 @@ import { createRoomState } from './reader-room-state.mjs';
 import { createPreferenceStore,validSettings,validRoomSettings } from './preferences.mjs';
 import { photoUrl } from './photos.mjs';
 import { messageKeyValid,clientIdValid,decodeImage } from './message-content.mjs';
+import { DEFAULT_PHOTO_TRANSPORT,normalizePhotoTransport } from './photo-transport.mjs';
 
 const integer=value=>Number.isSafeInteger(value) && value>=0 ? value : 0;
 const text=(value,max)=>typeof value==='string'?(value.length<=max?value:[...value].slice(0,max).join('')):'';
@@ -27,8 +28,8 @@ export function safeMessages(rows){
   for(const row of rows.slice(-MESSAGE_LIMIT))if(messageKeyValid(row?.key))unique.set(row.key,{key:row.key,text:text(row.text,4000),sender:text(row.sender,80),mine:row.mine===true,canReply:row.canReply===true,reply:row.reply && typeof row.reply.text==='string'?{text:text(row.reply.text,4000),sender:text(row.reply.sender,80),verified:row.reply.verified===true}:null,at:at(row.at),photos:(Array.isArray(row.photos)?row.photos:[]).slice(0,30).map(photo=>({url:photoUrl(photo?.url),width:Number.isInteger(photo?.width)&&photo.width>0&&photo.width<=20000?photo.width:null,height:Number.isInteger(photo?.height)&&photo.height>0&&photo.height<=20000?photo.height:null})).filter(photo=>photo.url),unreadCount:row.mine===true && Number.isSafeInteger(row.unreadCount) && row.unreadCount>=0 && row.unreadCount<=100?row.unreadCount:null});
   return [...unique.values()];
 }
-export function createReadOnlyReader({spawn=fork,now=Date.now,onBlocked=()=>{},gapProbe=false,messaging=false,photoTransport='loco',preferenceStore=createPreferenceStore()}={}){
-  if(!['loco','https-experimental'].includes(photoTransport))throw new Error('invalid_photo_transport');
+export function createReadOnlyReader({spawn=fork,now=Date.now,onBlocked=()=>{},gapProbe=false,messaging=false,photoTransport=DEFAULT_PHOTO_TRANSPORT,preferenceStore=createPreferenceStore()}={}){
+  photoTransport=normalizePhotoTransport(photoTransport);
   const instanceId=randomBytes(12).toString('hex');
   let child=null,signal=null,abortHandler=null,deadline=null,phase='idle',stage=null,status=null,attempts=0,consecutiveFailures=0,rooms=[],pages=new Map(),request=0,pending=null,revision=0,connectedAt=null;
   let historyRequests=0,historySuccesses=0,pushBatches=0,duplicates=0,sourceRoomCount=0,truncated=false;

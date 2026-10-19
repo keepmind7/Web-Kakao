@@ -23,7 +23,7 @@ function fixture({kind='OM',entry={},answer=valid(),active=true,messaging=true,w
   return {status:0,body:{}};
  }});
  const bootstrap=()=>Object.assign(new EventEmitter(),{async connect(){},disconnect(){},async request(){return {status:0,body:{ticket:{lsl:['synthetic.kakao.com']},wifi:{ports:[443]}}};},async checkin(){return {status:0,host:'synthetic.kakao.com',port:443};}});
- const session=createReaderSession(credential,{messaging,booking:bootstrap,ticket:bootstrap,carriage:()=>carriage,toLong:value=>Long.fromString(String(value)),resolve:async host=>host,every:()=>0,observeSend:row=>trace.push(row),media:()=>{assert.fail('pre-WRITE blocked photo must never open upload');}},row=>{events.push(row);onEvent(row);});
+ const session=createReaderSession(credential,{messaging,photoTransport:'loco',booking:bootstrap,ticket:bootstrap,carriage:()=>carriage,toLong:value=>Long.fromString(String(value)),resolve:async host=>host,every:()=>0,observeSend:row=>trace.push(row),media:()=>{assert.fail('pre-WRITE blocked photo must never open upload');}},row=>{events.push(row);onEvent(row);});
  return {session,carriage,calls,events,trace,disconnected:()=>disconnected,count:method=>calls.filter(c=>c.method===method).length,async start(){assert.equal((await session.start()).ok,true);return events.find(e=>e.type==='reader-rooms'&&e.source==='loginlist').rooms.find(r=>r.kind!=='DirectChat'||kind==='DirectChat').key;}};
 }
 const outcome=f=>f.events.findLast(e=>e.type==='reader-action');

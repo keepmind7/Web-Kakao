@@ -1,5 +1,5 @@
-// Deliberate legacy-derived experiment. Current endpoint/PHOTO compatibility is
-// unverified. An uploaded asset or WRITE ACK is not recipient delivery.
+// Default HTTPS photo upload, with JPEG/converted PNG delivery verified for
+// reported samples. An uploaded asset or WRITE ACK is not recipient delivery.
 import https from 'node:https';
 import {lookup} from 'node:dns/promises';
 import {isIP} from 'node:net';

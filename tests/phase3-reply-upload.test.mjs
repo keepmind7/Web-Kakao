@@ -10,6 +10,7 @@ import { guardReaderClient } from '../experiments/local-web/reader-protocol.mjs'
 import { uploadPhoto,MAX_UPLOAD_CHUNK_BYTES } from '../experiments/local-web/media-upload.mjs';
 import { createLocalServer } from '../experiments/local-web/server.mjs';
 import { makeSyntheticImage } from '../experiments/photo-method-simulation/model.mjs';
+import { DEFAULT_PHOTO_TRANSPORT,normalizePhotoTransport,photoTransportFromArgs } from '../experiments/local-web/photo-transport.mjs';
 
 // Browser control is granted only by the local launcher capability exchange.
 async function browserSession(app,url){
@@ -25,6 +26,29 @@ async function browserSession(app,url){
 const png=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=','base64');
 const room='r_'+'a'.repeat(24),message='m_'+'b'.repeat(24),uuid='12345678-1234-4123-8123-123456789abc';
 const credential={userId:'999',deviceUUID:'SYNTHETIC',accessToken:'FAKE_TOKEN'};
+test('photo transport defaults to canonical HTTPS and only explicit legacy mode selects LOCO',()=>{
+  assert.equal(DEFAULT_PHOTO_TRANSPORT,'https');
+  assert.equal(normalizePhotoTransport('https'),'https');assert.equal(normalizePhotoTransport('https-experimental'),'https');assert.equal(normalizePhotoTransport('loco'),'loco');
+  for(const value of [undefined,null,'','http','untrusted'])assert.throws(()=>normalizePhotoTransport(value),/invalid_photo_transport/);
+});
+test('direct Node photo CLI accepts space and equals forms and rejects missing or invalid values',()=>{
+  assert.equal(photoTransportFromArgs([]),'https');
+  for(const mode of ['https','https-experimental','loco'])for(const args of [['--photo-transport',mode],['--photo-transport='+mode]])assert.equal(photoTransportFromArgs(args),mode==='loco'?'loco':'https');
+  for(const args of [['--photo-transport'],['--photo-transport','--port','1234'],['--photo-transport='],['--photo-transport=untrusted'],['--photo-transport','untrusted']])assert.throws(()=>photoTransportFromArgs(args),/invalid_photo_transport/);
+});
+for(const mode of [undefined,'https','https-experimental','loco'])test('server mode '+String(mode)+' is normalized and preserved when the local account is cleared',async()=>{
+  const factories=[],app=createLocalServer({mode:'mock',encode:()=>[[true]],...(mode===undefined?{}:{photoTransport:mode}),readerFactory:options=>{factories.push(options.photoTransport);return {snapshot:()=>({phase:'idle'}),close(){}};}});
+  const url=await app.listen(0),expected=mode==='loco'?'loco':'https';
+  try{const {auth}=await browserSession(app,url);let status=await(await fetch(url+'/api/status',{headers:auth})).json();assert.equal(status.photoTransport,expected);
+    const response=await fetch(url+'/api/cancel',{method:'POST',headers:{...auth,Origin:url,'Content-Type':'application/json','X-CSRF-Token':status.csrf},body:'{}'});assert.equal(response.status,200);
+    status=await(await fetch(url+'/api/status',{headers:auth})).json();assert.equal(status.photoTransport,expected);assert.equal(status.credentialInMemory,false);
+    const start=await fetch(url+'/api/start',{method:'POST',headers:{...auth,Origin:url,'Content-Type':'application/json','X-CSRF-Token':status.csrf},body:'{}'});assert.equal(start.status,202);assert.ok(factories.length>=2);assert.ok(factories.every(value=>value===expected));
+  }finally{app.lab.cancel();app.server.closeAllConnections();await new Promise(resolve=>app.server.close(resolve));}
+});
+test('manager omitted photo option forwards canonical HTTPS to its synthetic child',()=>{
+  const child=childFixture(),reader=createReadOnlyReader({messaging:true,spawn:()=>child});
+  try{assert.equal(reader.connect(credential),true);ready(child);assert.equal(child.sent[0].photoTransport,'https');}finally{reader.close();}
+});
 test('reply JSON retains 64-bit numeric identifiers and rejects unsupported targets',()=>{
   const extra=replyExtra({id:'9007199254740993',authorId:'9007199254740995',type:1,text:'<img>한글😀'});
   assert.ok(extra.includes('"src_logId":9007199254740993'));assert.ok(extra.includes('"src_userId":9007199254740995'));
@@ -157,7 +181,7 @@ function sessionFixture(uploadOptions){
   const f=uploadFixture(uploadOptions),events=[];
   const carriage=Object.assign(new EventEmitter(),{connect:async()=>{},stopPing(){},disconnect(){},loginList:async()=>({status:0,body:{chatDatas:[{c:'123',t:'DirectChat',ll:'10'}]}}),request:async(method,body)=>{if(method==='SHIP')return f.options.carriage.request(method,body);f.calls.push({method,body});return {status:0,body:{logId:'20',msgId:body.msgId}};}});
   const client=()=>Object.assign(new EventEmitter(),{connect:async()=>{},disconnect(){},request:async()=>({status:0,body:{ticket:{lsl:['ticket.kakao.com']},wifi:{ports:[443]}}}),checkin:async()=>({status:0,host:'carriage.kakao.com',port:443})});
-  const factory={messaging:true,booking:client,ticket:client,carriage:()=>carriage,media:f.options.createClient,resolveUpload:f.options.resolve,toLong:String,resolve:async h=>h,every:()=>0};
+  const factory={messaging:true,photoTransport:'loco',booking:client,ticket:client,carriage:()=>carriage,media:f.options.createClient,resolveUpload:f.options.resolve,toLong:String,resolve:async h=>h,every:()=>0};
   return {f,events,carriage,session:createReaderSession(credential,factory,e=>events.push(e))};
 }
 test('session constructs type26 from a real cached target and photo COMPLETE without a second WRITE',async()=>{
@@ -222,7 +246,7 @@ for(const stage of ['ship','route','connect','post'])for(const method of ['SYNCL
     throw new Error('unexpected synthetic request');
   }});
   const bootstrap=()=>Object.assign(new EventEmitter(),{async connect(){},disconnect(){},async request(){return {status:0,body:{ticket:{lsl:['ticket.kakao.com']},wifi:{ports:[443]}}};},async checkin(){return {status:0,host:'carriage.kakao.com',port:443};}});
-  const session=createReaderSession(credential,{messaging:true,booking:bootstrap,ticket:bootstrap,carriage:()=>carriage,media:f.options.createClient,resolveUpload:f.options.resolve,toLong:String,resolve:async h=>h,every:()=>0},event=>events.push(event));
+  const session=createReaderSession(credential,{messaging:true,photoTransport:'loco',booking:bootstrap,ticket:bootstrap,carriage:()=>carriage,media:f.options.createClient,resolveUpload:f.options.resolve,toLong:String,resolve:async h=>h,every:()=>0},event=>events.push(event));
   try{
     await session.start();const key=events.find(event=>event.source==='loginlist').rooms[0].key;
     await session.action(key,1,'context');const pending=session.action(key,2,'photo',{image:png.toString('base64')});await f.begun.promise;
@@ -260,7 +284,7 @@ test('image and reply HTTP routes require auth/CSRF, exact fields and valid actu
 
 // Isolated HTTPS mode integration: native image is synthetic; HTTP and account
 // transports below are injected and never contact any production destination.
-function httpsSessionFixture({hangUpload=false,writeGate,photoTransport='https-experimental'}={}){
+function httpsSessionFixture({hangUpload=false,writeGate,photoTransport}={}){
   const events=[],calls=[],begun=deferredUpload(),release=deferredUpload();let requestCount=0,mediaCount=0;
   const carriage=Object.assign(new EventEmitter(),{async connect(){},stopPing(){},disconnect(){},async loginList(){return {status:0,body:{chatDatas:[{c:'123',t:'DirectChat',ll:'10'},{c:'124',t:'DirectChat',ll:'10'}]}};},async request(method,body){
     calls.push({method,body});if(method==='WRITE'){begun.resolve();if(writeGate)await writeGate.promise;return {status:0,body:{chatId:String(body.chatId),msgId:body.msgId,chatLog:{logId:String(42+calls.length),chatId:String(body.chatId),authorId:'999',type:body.type,msgId:body.msgId}}};}return {status:0,body:{}};
@@ -290,7 +314,7 @@ test('HTTPS session selection after WRITE makes late ACK unknown and never inser
 });
 test('HTTPS manager forwards startup mode and preserves duplicate/unknown reconnect protection',()=>{
   const children=[],spawns=[],reader=createReadOnlyReader({messaging:true,photoTransport:'https-experimental',spawn:(_path,_args,options)=>{const child=childFixture();children.push(child);spawns.push(options);return child;}}),encoded=makeSyntheticImage().bytes.toString('base64');
-  try{assert.equal(reader.connect(credential),true);ready(children[0]);assert.equal(children[0].sent[0].photoTransport,'https-experimental');assert.equal(reader.sendPhoto(room,encoded,uuid),true);assert.equal(reader.sendPhoto(room,encoded,uuid),true);assert.equal(children[0].sent.filter(m=>m.action==='photo').length,1);reader.disconnect();assert.equal(reader.messages(room).outbox.at(-1).phase,'unknown');assert.equal(reader.connect(credential),true);ready(children[1]);assert.equal(reader.sendPhoto(room,encoded,uuid),true);assert.equal(children[1].sent.filter(m=>m.action==='photo').length,0);assert.equal(spawns.every(s=>!Object.hasOwn(s.env,'KAKAO_PHOTO_TRANSPORT')),true);}finally{reader.close();}
+  try{assert.equal(reader.connect(credential),true);ready(children[0]);assert.equal(children[0].sent[0].photoTransport,'https');assert.equal(reader.sendPhoto(room,encoded,uuid),true);assert.equal(reader.sendPhoto(room,encoded,uuid),true);assert.equal(children[0].sent.filter(m=>m.action==='photo').length,1);reader.disconnect();assert.equal(reader.messages(room).outbox.at(-1).phase,'unknown');assert.equal(reader.connect(credential),true);ready(children[1]);assert.equal(reader.sendPhoto(room,encoded,uuid),true);assert.equal(children[1].sent.filter(m=>m.action==='photo').length,0);assert.equal(spawns.every(s=>!Object.hasOwn(s.env,'KAKAO_PHOTO_TRANSPORT')),true);}finally{reader.close();}
 });
 test('photo mode invalid values are refused by server, manager and session constructors',()=>{
   assert.throws(()=>createLocalServer({photoTransport:'untrusted'}),/invalid_photo_transport/);assert.throws(()=>createReadOnlyReader({photoTransport:'untrusted'}),/invalid_photo_transport/);assert.throws(()=>createReaderSession(credential,{photoTransport:'untrusted'},()=>{}),/invalid_photo_transport/);
@@ -298,16 +322,16 @@ test('photo mode invalid values are refused by server, manager and session const
 test('HTTPS server exposes fixed startup mode through safe status and rejects browser mode override',async()=>{
   let options;
   const app=createLocalServer({mode:'live',messaging:true,photoTransport:'https-experimental',encode:()=>[[true]],transport:async op=>op==='allowlist'?{httpStatus:200,body:{allowlisted:true}}:op==='generate'?{httpStatus:200,body:{status:0,url:'OFFLINE',remainingSeconds:60}}:{httpStatus:200,body:{status:0,user:{userId:'999'},accessToken:'FAKE'}},readerFactory:opts=>{options=opts;return {snapshot:()=>({phase:'connected'}),close(){},sendPhoto(){return true;}};}});
-  const url=await app.listen(0);try{const {auth}=await browserSession(app,url);await app.lab.start();for(let i=0;i<300&&!app.lab.snapshot().credentialInMemory;i++)await new Promise(r=>setTimeout(r,5));const status=await(await fetch(url+'/api/status',{headers:auth})).json();assert.equal(status.photoTransport,'https-experimental');assert.equal(options.photoTransport,'https-experimental');const response=await fetch(url+'/api/reader/photo',{method:'POST',headers:{...auth,Origin:url,'Content-Type':'application/json','X-CSRF-Token':status.csrf},body:JSON.stringify({room,clientId:uuid,image:makeSyntheticImage().bytes.toString('base64'),photoTransport:'loco'})});assert.equal(response.status,400);assert.equal((await(await fetch(url+'/api/status',{headers:auth})).json()).photoTransport,'https-experimental');}finally{app.lab.cancel();app.server.closeAllConnections();await new Promise(resolve=>app.server.close(resolve));}
+  const url=await app.listen(0);try{const {auth}=await browserSession(app,url);await app.lab.start();for(let i=0;i<1000&&!app.lab.snapshot().credentialInMemory;i++)await new Promise(r=>setTimeout(r,5));const status=await(await fetch(url+'/api/status',{headers:auth})).json();assert.equal(status.photoTransport,'https');assert.equal(options.photoTransport,'https');const response=await fetch(url+'/api/reader/photo',{method:'POST',headers:{...auth,Origin:url,'Content-Type':'application/json','X-CSRF-Token':status.csrf},body:JSON.stringify({room,clientId:uuid,image:makeSyntheticImage().bytes.toString('base64'),photoTransport:'loco'})});assert.equal(response.status,400);assert.equal((await(await fetch(url+'/api/status',{headers:auth})).json()).photoTransport,'https');}finally{app.lab.cancel();app.server.closeAllConnections();await new Promise(resolve=>app.server.close(resolve));}
 });
 test('worker entry forwards the fixed startup mode to session without SDK network execution',async()=>{
   const {readFileSync}=await import('node:fs'),{runInNewContext}=await import('node:vm');
   const original=readFileSync(new URL('../experiments/local-web/reader-worker.mjs',import.meta.url),'utf8');
-  for(const mode of ['loco','https-experimental']){
+  for(const mode of [undefined,'https','loco','https-experimental']){
     let source=original.replace(/^import .*;\r?\n/gm,'');const dynamic=/const sdk=await import\('[^']+forge-protocol\.ts'\);/;assert.match(source,dynamic);source=source.replace(dynamic,'const sdk=__sdk;');
     const process=new EventEmitter();process.env={};process.connected=true;process.send=(_m,callback)=>callback?.();process.exit=()=>{throw new Error('unexpected synthetic worker exit');};let factory;
     const Client=class{};
-    runInNewContext(source,{process,__sdk:{BookingClient:Client,TicketClient:Client,CarriageClient:Client,toLong:String},checkPinnedSource:()=>{},roomKeyValid:()=>true,guardReaderClient:Base=>Base,createReaderDiagnostic:()=>({note(){},end(){}}),createReaderSession:(_credential,options)=>{factory=options;return {start:async()=>({ok:true}),close(){}};},setTimeout:()=>({unref(){}}),clearTimeout:()=>{}},{filename:'synthetic-worker-entry.mjs'});
-    await process.listeners('message')[0]({type:'reader-start',messaging:true,photoTransport:mode,credential});assert.equal(factory.photoTransport,mode);
+    runInNewContext(source,{process,DEFAULT_PHOTO_TRANSPORT,normalizePhotoTransport,__sdk:{BookingClient:Client,TicketClient:Client,CarriageClient:Client,toLong:String},checkPinnedSource:()=>{},roomKeyValid:()=>true,guardReaderClient:Base=>Base,createReaderDiagnostic:()=>({note(){},end(){}}),createReaderSession:(_credential,options)=>{factory=options;return {start:async()=>({ok:true}),close(){}};},setTimeout:()=>({unref(){}}),clearTimeout:()=>{}},{filename:'synthetic-worker-entry.mjs'});
+    await process.listeners('message')[0]({type:'reader-start',messaging:true,photoTransport:mode,credential});assert.equal(factory.photoTransport,normalizePhotoTransport(mode ?? DEFAULT_PHOTO_TRANSPORT));
   }
 });

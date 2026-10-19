@@ -21,7 +21,7 @@ class ExistingServerModeTests(unittest.TestCase):
         self.addCleanup(isolation.stop)
 
     def invoke(self, existing_gap, requested_gap):
-        state = {"app": local_web.APP, "build": 8, "mode": "live", "gapProbe": existing_gap,
+        state = {"app": local_web.APP, "build": 8, "mode": "live", "photoTransport": "https", "gapProbe": existing_gap,
                  "phase": "authenticated", "credentialInMemory": True}
         args = ["local_web.py", "start"] + (["--gap-probe"] if requested_gap else [])
         with patch.object(sys, "argv", args), patch.object(local_web, "connect",
@@ -112,11 +112,11 @@ class PhotoTransportLauncherTests(unittest.TestCase):
                 self.assertEqual(state["phase"], "authenticated")
 
     def test_same_photo_mode_and_legacy_default_reuse_without_starting(self):
-        for mode in [None, "loco", "https-experimental"]:
+        for mode, requested in [(None, "loco"), ("loco", "loco"), ("https", None), ("https-experimental", None), ("https", "https-experimental"), ("https-experimental", "https")]:
             state = {"build": 8, "mode": "live", "phase": "authenticated"}
             if mode is not None:
                 state["photoTransport"] = mode
-            args = ["local_web.py", "start"] + (["--photo-transport", mode] if mode else [])
+            args = ["local_web.py", "start"] + (["--photo-transport", requested] if requested else [])
             with self.subTest(mode=mode), patch.object(local_web, "connect", return_value=("http://127.0.0.1:1", Mock(), state)), \
                  patch.object(sys, "argv", args), patch.object(local_web.subprocess, "Popen") as spawn, contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(local_web.main(), 0)
@@ -125,8 +125,9 @@ class PhotoTransportLauncherTests(unittest.TestCase):
     def test_start_forwards_explicit_photo_mode_and_does_not_inherit_unsafe_environment(self):
         runtime = local_web.FOLDER / "synthetic-node.exe"
         runtime.write_bytes(b"synthetic-not-executable")
-        for mode in ["loco", "https-experimental"]:
-            state = {"build": 8, "mode": "live", "photoTransport": mode}
+        for mode in [None, "https", "loco", "https-experimental"]:
+            expected = "https" if mode in (None, "https-experimental") else mode
+            state = {"build": 8, "mode": "live", "photoTransport": expected}
             process = Mock(pid=12345)
             process.poll.return_value = None
             with self.subTest(mode=mode), patch.object(local_web, "RUNTIME", runtime), \
@@ -135,10 +136,10 @@ class PhotoTransportLauncherTests(unittest.TestCase):
                  patch.object(local_web, "verify_private_file"), patch.object(local_web, "broad_write_warnings", return_value=[]), \
                  patch.object(local_web.subprocess, "Popen", return_value=process) as spawn, \
                  patch.dict(local_web.os.environ, {"KAKAO_PHOTO_TRANSPORT": "untrusted", "NODE_OPTIONS": "untrusted", "HTTPS_PROXY": "untrusted"}), \
-                 patch.object(sys, "argv", ["local_web.py", "start", "--photo-transport", mode]), contextlib.redirect_stdout(io.StringIO()):
+                 patch.object(sys, "argv", ["local_web.py", "start"] + (["--photo-transport", mode] if mode else [])), contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(local_web.main(), 0)
                 command = spawn.call_args.args[0]
-                self.assertEqual(command[command.index("--photo-transport") + 1], mode)
+                self.assertEqual(command[command.index("--photo-transport") + 1], expected)
                 environment = spawn.call_args.kwargs["env"]
                 for key in ["KAKAO_PHOTO_TRANSPORT", "NODE_OPTIONS", "HTTPS_PROXY"]:
                     self.assertNotIn(key, environment)
@@ -162,6 +163,26 @@ class PhotoTransportLauncherTests(unittest.TestCase):
             self.assertEqual(error.exception.code, 2)
             connect.assert_not_called()
             spawn.assert_not_called()
+
+    def test_default_start_preserves_an_existing_legacy_or_unknown_mode_server(self):
+        for mode in [None, "loco", "unknown"]:
+            state = {"build": 8, "mode": "live", "phase": "authenticated", "credentialInMemory": True}
+            if mode is not None:
+                state["photoTransport"] = mode
+            with self.subTest(mode=mode), patch.object(sys, "argv", ["local_web.py", "start"]), \
+                 patch.object(local_web, "connect", return_value=("http://127.0.0.1:1", Mock(), state)), \
+                 patch.object(local_web.subprocess, "Popen") as spawn, contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(local_web.main(), 2)
+                spawn.assert_not_called()
+                self.assertTrue(state["credentialInMemory"])
+
+    def test_photo_mode_missing_value_is_rejected_before_accessing_server(self):
+        with patch.object(sys, "argv", ["local_web.py", "start", "--photo-transport"]), \
+             patch.object(local_web, "connect") as connect, contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as error:
+                local_web.main()
+            self.assertEqual(error.exception.code, 2)
+            connect.assert_not_called()
 
 
 if __name__ == "__main__":

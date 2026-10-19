@@ -3,6 +3,7 @@ import { createReaderSession } from './reader-session.mjs';
 import { roomKeyValid } from './reader-data.mjs';
 import { createReaderDiagnostic } from './reader-diagnostics.mjs';
 import { guardReaderClient } from './reader-protocol.mjs';
+import { DEFAULT_PHOTO_TRANSPORT,normalizePhotoTransport } from './photo-transport.mjs';
 
 process.env.KAKAO_DEBUG_LOCO='0';
 let session=null,started=false,operationTimer=null,operationBusy=false,diagnostic=null,ending=false;
@@ -30,8 +31,7 @@ process.on('message',async message=>{
       checkPinnedSource({workingCopy:true});
       const sdk=await import('../../local-only/spikes/modern/src/kakao/forge-protocol.ts');
       const messaging=message.messaging===true;
-      const photoTransport=message.photoTransport ?? 'loco';
-      if(!['loco','https-experimental'].includes(photoTransport))throw new Error('invalid_photo_transport');
+      const photoTransport=normalizePhotoTransport(message.photoTransport ?? DEFAULT_PHOTO_TRANSPORT);
       const guard=Client=>guardReaderClient(Client,diagnostic,{messaging});
       const Booking=guard(sdk.BookingClient),Ticket=guard(sdk.TicketClient),Carriage=guard(sdk.CarriageClient);
       const Media=guardReaderClient(sdk.CarriageClient,diagnostic,{messaging,media:true});

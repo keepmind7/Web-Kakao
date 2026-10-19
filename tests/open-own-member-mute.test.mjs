@@ -19,7 +19,7 @@ function fixture(entry,kind='OM'){
   return {status:0,body:{}};
  }});
  const bootstrap=()=>Object.assign(new EventEmitter(),{async connect(){},disconnect(){},async request(){return {status:0,body:{ticket:{lsl:['synthetic.kakao.com']},wifi:{ports:[443]}}};},async checkin(){return {status:0,host:'synthetic.kakao.com',port:443};}});
- const session=createReaderSession({userId:own,deviceUUID:'SYNTHETIC',accessToken:'SYNTHETIC_NO_ACCOUNT'},{messaging:true,booking:bootstrap,ticket:bootstrap,carriage:()=>carriage,toLong:value=>Long.fromString(String(value)),resolve:async host=>host,every:()=>0,media:()=>{assert.fail('synthetic fixture never uploads bytes');}},e=>events.push(e));
+ const session=createReaderSession({userId:own,deviceUUID:'SYNTHETIC',accessToken:'SYNTHETIC_NO_ACCOUNT'},{messaging:true,photoTransport:'loco',booking:bootstrap,ticket:bootstrap,carriage:()=>carriage,toLong:value=>Long.fromString(String(value)),resolve:async host=>host,every:()=>0,media:()=>{assert.fail('synthetic fixture never uploads bytes');}},e=>events.push(e));
  return {session,events,calls,count:method=>calls.filter(c=>c.method===method).length,healthy(){assert.equal(disconnected,0);assert.equal(events.some(e=>e.type==='reader-failed'),false);},async start(){assert.equal((await session.start()).ok,true);return events.find(e=>e.type==='reader-rooms').rooms[0].key;},row:key=>events.findLast(e=>e.type==='reader-rooms').rooms.find(r=>r.key===key)};
 }
 const noEffects=f=>{for(const method of ['WRITE','SHIP','POST','NOTIREAD','JOINLINK'])assert.equal(f.count(method),0,method);f.healthy();};

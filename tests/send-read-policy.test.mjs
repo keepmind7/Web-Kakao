@@ -31,7 +31,7 @@ function sessionFixture({kind='DirectChat',writeMode,upload={}}={}){
     throw new Error('unexpected synthetic method '+method);
   }});
   const bootstrap=()=>Object.assign(new EventEmitter(),{async connect(){},disconnect(){},async request(){return {status:0,body:{ticket:{lsl:['ticket.kakao.com']},wifi:{ports:[443]}}};},async checkin(){return {status:0,host:'carriage.kakao.com',port:443};}});
-  const session=createReaderSession(credential,{messaging:true,booking:bootstrap,ticket:bootstrap,carriage:()=>carriage,media:f.options.createClient,resolveUpload:f.options.resolve,toLong:String,resolve:async host=>host,every:()=>0},event=>events.push(event));
+  const session=createReaderSession(credential,{messaging:true,photoTransport:'loco',booking:bootstrap,ticket:bootstrap,carriage:()=>carriage,media:f.options.createClient,resolveUpload:f.options.resolve,toLong:String,resolve:async host=>host,every:()=>0},event=>events.push(event));
   return {...f,session,carriage,events,key:()=>events.find(event=>event.source==='loginlist').rooms.find(room=>room.title==='Synthetic first').key,other:()=>events.find(event=>event.source==='loginlist').rooms.find(room=>room.title==='Synthetic other').key,
     quote(){carriage.emit('push',{method:'MSG',status:0,body:{chatId:'123',chatLog:{chatId:'123',logId:'10',authorId:'111',msg:'Synthetic quoted message',type:1}}});return events.findLast(event=>event.type==='reader-messages').messages[0].key;}};
 }

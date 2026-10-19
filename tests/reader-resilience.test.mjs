@@ -92,7 +92,7 @@ function sessionFixture({source=[{c:'123',t:'DirectChat',title:'Synthetic',ll:'1
       return {status:0,body:{}};
     }});
   const bootstrap=()=>Object.assign(new EventEmitter(),{async connect(){},disconnect(){},async request(){return {status:0,body:{ticket:{lsl:['synthetic.kakao.com']},wifi:{ports:[443]}}};},async checkin(){return {status:0,host:'synthetic.kakao.com',port:443};}});
-  const session=createReaderSession(credential,{messaging:true,gapProbe,readProbe,booking:bootstrap,ticket:bootstrap,carriage:()=>carriage,toLong,resolve:async host=>host,every:()=>0,delay:async()=>{},now:()=>clock.value,media:()=>{throw new Error('unexpected media client');}},event=>events.push(event));
+  const session=createReaderSession(credential,{messaging:true,photoTransport:'loco',gapProbe,readProbe,booking:bootstrap,ticket:bootstrap,carriage:()=>carriage,toLong,resolve:async host=>host,every:()=>0,delay:async()=>{},now:()=>clock.value,media:()=>{throw new Error('unexpected media client');}},event=>events.push(event));
   return Object.assign(f,{session,calls,events,carriage,clock,async start(){assert.equal((await session.start()).ok,true);return events.findLast(event=>event.type==='reader-rooms').rooms[0].key;}});
 }
 

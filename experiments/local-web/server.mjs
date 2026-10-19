@@ -14,6 +14,7 @@ import { IMAGE_LIMIT,messageKeyValid,clientIdValid,decodeImage } from './message
 import { privateDataRoot,ensurePrivateDirectoryAsync,verifyPrivateFile,verifyPrivateFileAsync } from './private-storage.mjs';
 import { createLocalAccess,localControlStatus } from './local-access.mjs';
 import { createTabPresence } from './tab-presence.mjs';
+import { DEFAULT_PHOTO_TRANSPORT,normalizePhotoTransport,photoTransportFromArgs } from './photo-transport.mjs';
 
 const APP = 'web-kakao-auth-lab-v1';
 export function encodeQr(text) {
@@ -30,8 +31,8 @@ const assets = new Map([
   ['/style.css', ['style.css', 'text/css; charset=utf-8']],
   ['/local-launch.js', ['local-launch.js', 'text/javascript; charset=utf-8']],
 ]);
-export function createLocalServer({ transport, mode = 'mock', encode = encodeQr, probe = runRoomProbe, readerFactory = createReadOnlyReader, gapProbe=false,messaging=false,photoTransport='loco',preferenceStore=createPreferenceStore(),photoFetcher,controlToken,presenceOptions={} } = {}) {
-  if(!['loco','https-experimental'].includes(photoTransport))throw new Error('invalid_photo_transport');
+export function createLocalServer({ transport, mode = 'mock', encode = encodeQr, probe = runRoomProbe, readerFactory = createReadOnlyReader, gapProbe=false,messaging=false,photoTransport=DEFAULT_PHOTO_TRANSPORT,preferenceStore=createPreferenceStore(),photoFetcher,controlToken,presenceOptions={} } = {}) {
+  photoTransport=normalizePhotoTransport(photoTransport);
   const access=createLocalAccess({controlToken});
   const lab = createAuthLab({ transport: transport ?? (mode === 'live' ? createTransport() : mockTransport()), encodeQr: encode, mode, credentialRetentionMs:null });
   const photos=createPhotoCache({fetcher:photoFetcher});
@@ -248,9 +249,7 @@ export function createLocalServer({ transport, mode = 'mock', encode = encodeQr,
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const mode = process.argv.includes('--live') ? 'live' : 'mock';
-  const photoIndex=process.argv.indexOf('--photo-transport');
-  const photoTransport=photoIndex<0?'loco':process.argv[photoIndex+1];
-  if(!['loco','https-experimental'].includes(photoTransport))throw new Error('invalid_photo_transport');
+  const photoTransport=photoTransportFromArgs(process.argv.slice(2));
   const index = process.argv.indexOf('--port');
   const port = index < 0 ? 8787 : Number(process.argv[index + 1]);
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error('invalid_port');

@@ -4,14 +4,14 @@ import { responseStatus } from './reader-response.mjs';
 import { decodeImage,messageKeyValid } from './message-content.mjs';
 import { uploadPhoto } from './media-upload.mjs';
 import { uploadPhotoHttps } from './media-upload-https.mjs';
+import { DEFAULT_PHOTO_TRANSPORT,normalizePhotoTransport } from './photo-transport.mjs';
 import { PROFILE } from './kakao-auth.mjs';
 
 export const allowedReaderMethod = (method,{messaging=false}={}) => ['GETCONF','CHECKIN','LOGINLIST','SYNCMSG','MCHATLOGS','PING','CHATINFO'].includes(method)
   || messaging===true && ['WRITE','CHATONROOM','NOTIREAD','SHIP','SYNCLINK','INFOLINK','MEMBER'].includes(method);
 
 export function createReaderSession(credential,factory,emit) {
-  const photoTransport=factory.photoTransport ?? 'loco';
-  if(!['loco','https-experimental'].includes(photoTransport))throw new Error('invalid_photo_transport');
+  const photoTransport=normalizePhotoTransport(factory.photoTransport ?? DEFAULT_PHOTO_TRANSPORT);
   let carriage,store,closed=false,busy=false,resolveStop,pingTimer=null,pingPending=false,pingMisses=0;
   const cursors=new Map();
   const gapProbes=new Map();
@@ -357,7 +357,7 @@ export function createReaderSession(credential,factory,emit) {
           let outcome;
           try{
             const options={carriage,toLong:factory.toLong,chatId:store.serverRoomId(key),userId:credential.userId,messageId:String(++nextMessageId),data:image.data,signal:AbortSignal.any([uploadAbort.signal,controller.signal]),isCurrent,readOnSend,observe:factory.observeUpload};
-            outcome=photoTransport==='https-experimental'
+            outcome=photoTransport==='https'
               ?await uploadPhotoHttps({...options,timeout:bound(20000),resolve:factory.resolveHttpsUpload,request:factory.requestHttpsUpload})
               :await uploadPhoto({...options,createClient:factory.media,resolve:factory.resolveUpload,profile:PROFILE});
           }

@@ -79,7 +79,7 @@ function sessionFixture({source=rows(1),reply,earlyPush=false}={}){
     if(method==='WRITE')return {status:0,body:{chatId:String(body.chatId),msgId:body.msgId,chatLog:{...log(String(body.chatId),102),authorId:'999',msg:body.msg}}};
     return {status:0,body:{}};}});
   const bootstrap=()=>Object.assign(new EventEmitter(),{async connect(){},disconnect(){},async request(){return {status:0,body:{ticket:{lsl:['synthetic.kakao.com']},wifi:{ports:[443]}}};},async checkin(){return {status:0,host:'synthetic.kakao.com',port:443};}});
-  f.session=createReaderSession(credential,{messaging:true,booking:bootstrap,ticket:bootstrap,carriage:()=>f.carriage,media:()=>{throw new Error('no media expected');},toLong,resolve:async host=>host,every:callback=>{f.heartbeat=callback;return 0;},delay:async()=>{}},event=>f.events.push(event));
+  f.session=createReaderSession(credential,{messaging:true,photoTransport:'loco',booking:bootstrap,ticket:bootstrap,carriage:()=>f.carriage,media:()=>{throw new Error('no media expected');},toLong,resolve:async host=>host,every:callback=>{f.heartbeat=callback;return 0;},delay:async()=>{}},event=>f.events.push(event));
   f.start=async()=>{assert.equal((await f.session.start()).ok,true);return f.events.find(event=>event.type==='reader-rooms'&&event.source==='loginlist').rooms.map(row=>row.key);};return f;
 }
 for(const [action,method] of [['context','CHATONROOM'],['read','NOTIREAD'],['photo','SHIP']])test('session '+method+' single recoverable expiry leaves subsequent explicit action usable',async()=>{

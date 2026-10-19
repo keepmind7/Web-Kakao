@@ -1,5 +1,6 @@
 'use strict';
 const el = id => document.getElementById(id);
+const isHttpsPhotoTransport=value=>value==='https' || value==='https-experimental';
 let csrf = null, busy = false, expiresAt = null;
 let refreshing=false,hasAccount=false,readerGeneration=0,readerRevision=-1,selectedRoom=null,roomsCache=[],lastState=null,actionEpoch=0,readerAttempt=null;
 let pendingSelection=null,reconnectRoom=null,readerInstance=null;
@@ -454,7 +455,7 @@ function render(state) {
       el('message').textContent='이전 인증 요청을 서버가 거절해 추가 시도를 중단했습니다. 로컬 세션을 지워도 이 차단은 해제되지 않습니다. 표시된 오류와 휴대폰의 연결 기기를 확인해 주세요.';
     }
   }
-  el('mode').textContent = (state.mode === 'live' ? '실제 서버 인증 실험 · 이 노트북에서만 접근' : '모의 화면 · 실제 카카오톡 로그인 아님')+(state.photoTransport==='https-experimental'?' · HTTPS 사진 전송 · JPEG로 변환':'');
+  el('mode').textContent = (state.mode === 'live' ? '실제 서버 인증 실험 · 이 노트북에서만 접근' : '모의 화면 · 실제 카카오톡 로그인 아님')+(isHttpsPhotoTransport(state.photoTransport)?' · HTTPS 사진 전송 · JPEG로 변환':'');
   el('start').disabled = busy || !state.canStart || !csrf;
   el('start').textContent = state.phase === 'idle' ? 'QR 로그인 시작' : '새 QR 발급';
   el('cancel').disabled = busy || ['idle','cancelled'].includes(state.phase) || !csrf;
@@ -948,7 +949,7 @@ async function decodeSelectedImage(file){
 }
 async function prepareImage(file){
   if(!file || imagePreparing || pendingSend || uncertainPhoto || !imageContextReady())return;
-  clearImageDraft();const epoch=imageEpoch,key=selectedRoom,generation=readerGeneration,jpegTransport=lastState?.photoTransport==='https-experimental';imagePreparing=true;renderComposer();let bitmap,step='input-size';
+  clearImageDraft();const epoch=imageEpoch,key=selectedRoom,generation=readerGeneration,jpegTransport=isHttpsPhotoTransport(lastState?.photoTransport);imagePreparing=true;renderComposer();let bitmap,step='input-size';
   try{
     if(file.size>20*1024*1024 || !file.size)throw new Error();
     step='format';const inputMime=await selectedImageType(file);if(!inputMime)throw new Error();

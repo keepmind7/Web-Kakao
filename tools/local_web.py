@@ -219,10 +219,12 @@ def main():
     parser.add_argument("--mock", action="store_true")
     parser.add_argument("--gap-probe", action="store_true", help="누락 구간에 MCHATLOGS를 한 번 확인하는 읽기 실험")
     parser.add_argument("--messaging", action="store_true", help="텍스트 전송과 읽음 상태 기능 활성화")
-    parser.add_argument("--photo-transport", choices=["loco", "https-experimental"], default="loco",
-                        help="사진 경로: 기본 loco 또는 JPEG 전용 HTTPS 실험 (실제 호환성 미검증)")
+    parser.add_argument("--photo-transport", choices=["https", "loco", "https-experimental"], default="https",
+                        help="사진 전송: 기본 https (JPEG·PNG·WebP를 JPEG로 변환), 선택적 기존 loco; https-experimental은 호환 별칭")
     parser.add_argument("--port", type=int, default=8787)
     args = parser.parse_args()
+    if args.photo_transport == "https-experimental":
+        args.photo_transport = "https"
     if args.action != "open" and args.browser != "default":
         print("--browser는 open 명령에서만 사용할 수 있습니다.")
         return 2
@@ -276,7 +278,10 @@ def main():
         return 0
     if args.action == "start":
         if current:
-            if current[2].get("photoTransport", "loco") != args.photo_transport:
+            existing_photo_transport = current[2].get("photoTransport", "loco")
+            if existing_photo_transport == "https-experimental":
+                existing_photo_transport = "https"
+            if existing_photo_transport != args.photo_transport:
                 print("기존 서버와 사진 전송 모드가 다릅니다. 현재 서버와 세션을 유지했습니다. 모드 변경은 세션 정리·서버 재시작 후 적용하세요.")
                 return 2
             if bool(current[2].get("messaging")) != args.messaging:

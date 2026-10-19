@@ -12,7 +12,7 @@ const chrome=['C:/Program Files/Google/Chrome/Application/chrome.exe','C:/Progra
 if(!chrome)throw new Error('Chrome unavailable; browser test not executed');
 const folder=resolve(process.env.WEB_KAKAO_QA_OUTPUT_ROOT || 'local-only/phase2-browser',String(Date.now()));mkdirSync(folder,{recursive:true});
 const key='r_'+'a'.repeat(24),second='r_'+'b'.repeat(24),payload='<img src=x onerror="globalThis.injected=true">';
-let connected=false,attempts=0,revision=0,historyBusy=false,rejectNextQr=false,allowAuth=false,otherPreview='예시 미리보기 B',statusRequests=0;
+let connected=false,attempts=0,revision=0,historyBusy=false,rejectNextQr=false,allowAuth=false,requirePasscode=false,otherPreview='예시 미리보기 B',statusRequests=0;
 let historyTimer=null,historyGeneration=0;
 const resetHistory=()=>{historyGeneration++;clearTimeout(historyTimer);historyTimer=null;historyBusy=false;};
 const historyRooms=[],historyPhases=new Map(),messagesByRoom=new Map(),qrGrid=[[true]];
@@ -34,7 +34,7 @@ const photoMessage='m_'+'9'.repeat(24),syntheticPhoto=Buffer.from('R0lGODlhAQABA
 const syntheticPng=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=','base64');
 const makeMessages=room=>Array.from({length:40},(_,i)=>({key:'m_'+(i+1).toString(16).padStart(24,'0'),text:i===0?payload:('모의 메시지 '+(i+1)+' ').repeat(50),sender:'모의 사용자',mine:i%2===0,canReply:true,at:1800000000000+i*1000}));
 const controlToken=randomBytes(32).toString('hex');
-const app=createLocalServer({controlToken,mode:'live',messaging:true,photoFetcher:async()=>({data:syntheticPhoto,type:'image/gif'}),encode:()=>qrGrid,transport:async op=>op==='allowlist'?{httpStatus:200,body:{allowlisted:true}}:op==='generate'?{httpStatus:200,body:{status:0,url:'OFFLINE-NOT-FOR-LOGIN',remainingSeconds:60}}:rejectNextQr?{httpStatus:200,body:{status:-151}}:allowAuth?{httpStatus:200,body:{status:0,user:{userId:'246810'},accessToken:'FAKE_OFFLINE_TOKEN'}}:{httpStatus:200,body:{status:-150,nextRequestIntervalInSeconds:1}},readerFactory:()=>({
+const app=createLocalServer({controlToken,mode:'live',messaging:true,photoFetcher:async()=>({data:syntheticPhoto,type:'image/gif'}),encode:()=>qrGrid,transport:async op=>op==='allowlist'?{httpStatus:200,body:{allowlisted:true}}:op==='generate'?{httpStatus:200,body:{status:0,url:'OFFLINE-NOT-FOR-LOGIN',remainingSeconds:60}}:rejectNextQr?{httpStatus:200,body:{status:-151}}:requirePasscode?{httpStatus:200,body:{status:-100,passcode:'0000',nextRequestIntervalInSeconds:1}}:allowAuth?{httpStatus:200,body:{status:0,user:{userId:'246810'},accessToken:'FAKE_OFFLINE_TOKEN'}}:{httpStatus:200,body:{status:-150,nextRequestIntervalInSeconds:1}},readerFactory:()=>({
   snapshot:()=>({phase:connected?'connected':attempts?'disconnected':'idle',attempts,canConnect:!connected,roomCount:connected?2-removedRooms.size:0,revision,...(adversarialFixture?{roomsRevision:roomsVersion,settingsRevision:settingsVersion,outboxRevision:outboxVersion,pageRevisions:Object.fromEntries(pageVersions)}:{}),historyBusy,pushBatches:0,connectedAt:connected?Date.now():null}),
   connect(){resetHistory();if(attempts++) {historyPhases.clear();messagesByRoom.clear();contexts.clear();readStates.clear();}connected=true;revision++;return true;},
   rooms:()=>({revision,rooms:connected?[{key,title:'모의 대화방 A',preview:'예시 미리보기'},{key:second,title:'모의 대화방 B',preview:otherPreview}].filter(row=>!removedRooms.has(row.key)).map(row=>({...row,...(adversarialFixture?{lastAt:1800000300000}:{}),baseTitle:row.title,title:localTitles.get(row.key) || row.title,localTitle:localTitles.get(row.key) || null,pinOrder:roomSettings.get(row.key)?.pinOrder ?? null,muted:roomSettings.get(row.key)?.muted===true,canSend:true,kind:'DirectChat',...roomCapabilities.get(row.key),unreadLocalCount:unread.get(row.key) || 0,unreadCoverage:'observed'})):[]}),
@@ -363,6 +363,9 @@ await check('closing the photo dialog disables download',async()=>{assert.equal(
         assert.equal(await evaluate("!el('image-format-note').hidden && el('image-format-note').textContent.includes('흰색')"),true);
         await cancelPhoto();assert.equal(sendCalls.length,before);check(type+' converts to an opaque JPEG with a white alpha background before explicit send');
       }
+      await evaluate("(async()=>{lastState.photoTransport='loco';await prepareImage(await qaPhotoFile());})()");
+      await until("el('image-send-dialog').open && !imagePreparing");const legacy=await evaluate('qaPhotoPixels()');assert.equal(legacy.mime,'image/png');assert.equal(legacy.left[3],0);await cancelPhoto();
+      check('explicit legacy LOCO preparation preserves PNG alpha without HTTPS conversion');
       for(const declared of ['','image/x-png']){
         await evaluate(`(async()=>{lastState.photoTransport='https-experimental';await prepareImage(await qaPhotoFile('image/png','${declared}'));})()`);
         await until("el('image-send-dialog').open && !imagePreparing");assert.equal((await evaluate('qaPhotoPixels()')).mime,'image/jpeg');
@@ -423,7 +426,54 @@ await check('closing the photo dialog disables download',async()=>{assert.equal(
       check('converted WebP preview bytes reach the actual photo POST handler exactly once as JPEG');
     }finally{
       await evaluate("globalThis.qaFallbackRestore?.();if(globalThis.qaBlobOriginal)HTMLCanvasElement.prototype.toBlob=qaBlobOriginal;clearImageDraft();sendNotes.delete(selectedRoom);scheduleRefresh()").catch(()=>{});
-      writeFileSync(resolve(folder,'synthetic-photo-conversion.json'),JSON.stringify({passed:results.length===14,checks:results,actualAccountUsed:false,actualMessagesSent:0,syntheticSends:sendCalls.length-before},null,2));
+      writeFileSync(resolve(folder,'synthetic-photo-conversion.json'),JSON.stringify({passed:results.length===15,checks:results,actualAccountUsed:false,actualMessagesSent:0,syntheticSends:sendCalls.length-before},null,2));
+    }
+  }
+  async function checkDefaultHttpsLifecycle(){
+    const results=[],beforeSend=sendCalls.length,beforeAuth=app.lab.snapshot().requests;
+    let completed=false;
+    const record=name=>{results.push({name,passed:true});lifecycleChecks.push(name);};
+    const clearLocal=async name=>{
+      await evaluate("showAccount(true);el('cancel').click()");
+      await until("!hasAccount && selectedRoom===null && el('message-list').childElementCount===0 && !busy && !refreshing && !el('start').disabled");
+      assert.equal(app.lab.snapshot().credentialInMemory,false);assert.equal(connected,false);
+      assert.equal(await evaluate("lastState.photoTransport==='https' && imageDraft===null && !imagePreparing && pendingSend===null && uncertainPhoto===null && drafts.size===0 && replyDrafts.size===0 && pinnedRooms.size===0 && !el('image-preview').hasAttribute('src') && el('qr').hidden && el('passcode').hidden && el('compose-text').value===''") ,true);
+      record(name);
+    };
+    try{
+      settings=defaultSettings();roomSettings.clear();roomCapabilities.clear();unknownSend=false;unknownPhoto=false;revision++;
+      await clearLocal('default HTTPS local-session clear removes credentials room data drafts previews and pending sends');
+      allowAuth=false;requirePasscode=true;rejectNextQr=false;
+      await evaluate("el('start').click()");await until("!el('qr').hidden");
+      await until("!el('passcode').hidden && el('code').textContent==='0000'");
+      assert.equal(await evaluate("lastState.photoTransport==='https' && !hasAccount"),true);
+      requirePasscode=false;await clearLocal('cancel during QR approval clears both QR and passcode and allows a new QR');
+      for(let cycle=0;cycle<2;cycle++){
+        allowAuth=false;await evaluate("el('start').click()");await until("!el('qr').hidden && lastState.photoTransport==='https'");
+        allowAuth=true;await until("!el('reader-connect').disabled");await evaluate("el('reader-connect').click()");
+        await until("lastState.reader.phase==='connected' && document.querySelectorAll('.room-item').length===2 && !busy && !refreshing");
+        await evaluate(`showAccount(false);el('read-sync').checked=false;void selectRoom('${key}')`);
+        await until(`currentPage?.key==='${key}' && currentPage.messages.length===40 && el('compose-text').value==='' && !el('attach-image').disabled && !busy && !refreshing && !ackInFlight`);
+        assert.equal(await evaluate("lastState.photoTransport==='https' && el('mode').textContent.includes('HTTPS 사진 전송')"),true);
+        record('QR login '+(cycle+1)+' and fresh room connection retain default HTTPS without an explicit photo option');
+        const start=sendCalls.length;
+        await evaluate(`el('compose-text').value='Synthetic default HTTPS lifecycle ${cycle+1}';el('compose-text').dispatchEvent(new Event('input'));el('send-message').click()`);
+        await until("pendingSend===null && el('compose-text').value===''");assert.equal(sendCalls.length,start+1);assert.equal(sendCalls.at(-1).text,'Synthetic default HTTPS lifecycle '+(cycle+1));
+        if(cycle===0){
+          const path=resolve(folder,'default-https-lifecycle.png');writeFileSync(path,syntheticPng);const doc=await call('DOM.getDocument'),input=await call('DOM.querySelector',{nodeId:doc.root.nodeId,selector:'#image-file'});await call('DOM.setFileInputFiles',{nodeId:input.nodeId,files:[path]});
+        }else await evaluate(`(()=>{const data=new DataTransfer();data.items.add(new File([Uint8Array.from(atob('${syntheticPng.toString('base64')}'),c=>c.charCodeAt(0))],'synthetic.png',{type:'image/png'}));el('compose-text').dispatchEvent(new ClipboardEvent('paste',{clipboardData:data,bubbles:true,cancelable:true}));})()`);
+        await until("el('image-send-dialog').open && !el('image-send').disabled");const image=await evaluate('imageDraft.image');assert.equal(decodeImage(image)?.mime,'image/jpeg');
+        await evaluate("el('image-send').click();el('image-send').click()");await until('pendingSend===null && imageDraft===null');assert.equal(sendCalls.length,start+2);assert.equal(sendCalls.at(-1).mime,'image/jpeg');assert.equal(photoPayloads.at(-1),image);
+        record('default HTTPS cycle '+(cycle+1)+' sends text and converted PNG bytes once through the app HTTP route');
+        await evaluate("el('compose-text').value='Synthetic draft that must be cleared';el('compose-text').dispatchEvent(new Event('input'))");
+        await clearLocal('authenticated local-session clear '+(cycle+1)+' discards the account and composed draft while preserving HTTPS selection');
+      }
+      assert.equal(sendCalls.length-beforeSend,4);assert.equal(app.lab.snapshot().requests.generate-beforeAuth.generate,3);
+      assert.equal(results.length,8);
+      completed=true;
+    }finally{
+      requirePasscode=false;allowAuth=true;
+      writeFileSync(resolve(folder,'synthetic-default-https-lifecycle.json'),JSON.stringify({passed:completed,checks:results,syntheticSends:sendCalls.length-beforeSend,qrGenerations:app.lab.snapshot().requests.generate-beforeAuth.generate,actualAccountUsed:false,actualMessagesSent:0},null,2));
     }
   }
   async function checkCapabilities(){
@@ -596,7 +646,8 @@ await check('closing the photo dialog disables download',async()=>{assert.equal(
   await until("document.querySelectorAll('.room-item').length===2");
   assert.equal(await evaluate("document.getElementById('title').textContent"),'대화 서버 연결됨');
   assert.equal(await evaluate("getComputedStyle(document.querySelector('.app-shell')).display"),'grid');
-  if(process.env.WEB_KAKAO_QA_PHOTO_ONLY==='1'){await checkPhotoConversion();console.log(JSON.stringify({passed:true,scope:'synthetic photo conversion and submit only',checks:lifecycleChecks,actualAccountUsed:false,artifacts:folder}));}
+  if(process.env.WEB_KAKAO_QA_HTTPS_LIFECYCLE_ONLY==='1'){await checkDefaultHttpsLifecycle();console.log(JSON.stringify({passed:true,scope:'synthetic default HTTPS QR and clear lifecycle',checks:lifecycleChecks,actualAccountUsed:false,artifacts:folder}));}
+  else if(process.env.WEB_KAKAO_QA_PHOTO_ONLY==='1'){await checkPhotoConversion();console.log(JSON.stringify({passed:true,scope:'synthetic photo conversion and submit only',checks:lifecycleChecks,actualAccountUsed:false,artifacts:folder}));}
   else if(process.env.WEB_KAKAO_QA_ADVERSARIAL_ONLY==='1'){await checkAdversarialBrowser();console.log(JSON.stringify({passed:true,scope:'synthetic adversarial browser only',checks:lifecycleChecks,actualAccountUsed:false,artifacts:folder}));}
   else if(process.env.WEB_KAKAO_QA_UI_ONLY==='1'){await checkMobileAndThemes();await checkThemeBrowser();await checkHeaderLayout();console.log(JSON.stringify({passed:true,scope:'synthetic A UI theme and mobile only',checks:lifecycleChecks,actualAccountUsed:false,artifacts:folder}));}
   else if(process.env.WEB_KAKAO_QA_THEME_ONLY==='1'){await checkThemeBrowser();console.log(JSON.stringify({passed:true,scope:'synthetic theme only',checks:lifecycleChecks,actualAccountUsed:false,artifacts:folder}));}
@@ -815,7 +866,7 @@ await check('closing the photo dialog disables download',async()=>{assert.equal(
     {step:'pixels',setup:"globalThis.createImageBitmap=async()=>({width:40000001,height:1,close(){}})"},
     {step:'canvas',setup:"HTMLCanvasElement.prototype.getContext=()=>null"},
     {step:'encode',setup:"HTMLCanvasElement.prototype.toBlob=callback=>callback(null)"},
-    {step:'output-size',setup:"HTMLCanvasElement.prototype.toBlob=callback=>callback(new Blob([new Uint8Array(10*1024*1024+1)],{type:'image/png'}))"},
+    {step:'output-size',setup:"HTMLCanvasElement.prototype.toBlob=(callback,mime)=>callback(new Blob([new Uint8Array(10*1024*1024+1)],{type:mime}))"},
     {step:'read',setup:"globalThis.FileReader=class{readAsDataURL(){queueMicrotask(()=>this.onerror(new Event('error')));}}"},
     {step:'preview',setup:"HTMLDialogElement.prototype.showModal=()=>{throw new DOMException('synthetic preview rejection','InvalidStateError');}"},
   ];
@@ -983,6 +1034,7 @@ await check('closing the photo dialog disables download',async()=>{assert.equal(
   await checkThemeBrowser();
   await checkAdversarialBrowser();
   await checkPhotoConversion();
+  await checkDefaultHttpsLifecycle();
   await evaluate("if(document.getElementById('account-panel').hidden)document.getElementById('account-toggle').click()");assert.equal(await evaluate("document.getElementById('account-panel').hidden"),false);
   await evaluate("document.getElementById('cancel').click()");await until("document.getElementById('reader-panel').hidden && document.getElementById('message-list').childElementCount===0");
   assert.equal(await evaluate("document.getElementById('chat-title').textContent"),'대화방을 선택해 주세요');
