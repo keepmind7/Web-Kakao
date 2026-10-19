@@ -94,5 +94,75 @@ class ExistingServerModeTests(unittest.TestCase):
                 self.assertIsNone(req.get_header("X-csrf-token"))
 
 
+class PhotoTransportLauncherTests(unittest.TestCase):
+    setUp = ExistingServerModeTests.setUp
+
+    def test_running_photo_mode_mismatch_is_preserved_without_restart(self):
+        for existing, requested in [("loco", "https-experimental"), ("https-experimental", "loco")]:
+            state = {"build": 8, "mode": "live", "photoTransport": existing,
+                     "phase": "authenticated", "credentialInMemory": True}
+            with self.subTest(existing=existing), patch.object(local_web, "connect", return_value=("http://127.0.0.1:1", Mock(), state)), \
+                 patch.object(sys, "argv", ["local_web.py", "start", "--photo-transport", requested]), \
+                 patch.object(local_web.subprocess, "Popen") as spawn, \
+                 patch.object(local_web.webbrowser, "open") as browser, contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(local_web.main(), 2)
+                spawn.assert_not_called()
+                browser.assert_not_called()
+                self.assertTrue(state["credentialInMemory"])
+                self.assertEqual(state["phase"], "authenticated")
+
+    def test_same_photo_mode_and_legacy_default_reuse_without_starting(self):
+        for mode in [None, "loco", "https-experimental"]:
+            state = {"build": 8, "mode": "live", "phase": "authenticated"}
+            if mode is not None:
+                state["photoTransport"] = mode
+            args = ["local_web.py", "start"] + (["--photo-transport", mode] if mode else [])
+            with self.subTest(mode=mode), patch.object(local_web, "connect", return_value=("http://127.0.0.1:1", Mock(), state)), \
+                 patch.object(sys, "argv", args), patch.object(local_web.subprocess, "Popen") as spawn, contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(local_web.main(), 0)
+                spawn.assert_not_called()
+
+    def test_start_forwards_explicit_photo_mode_and_does_not_inherit_unsafe_environment(self):
+        runtime = local_web.FOLDER / "synthetic-node.exe"
+        runtime.write_bytes(b"synthetic-not-executable")
+        for mode in ["loco", "https-experimental"]:
+            state = {"build": 8, "mode": "live", "photoTransport": mode}
+            process = Mock(pid=12345)
+            process.poll.return_value = None
+            with self.subTest(mode=mode), patch.object(local_web, "RUNTIME", runtime), \
+                 patch.object(local_web, "connect", side_effect=[FileNotFoundError(), ("http://127.0.0.1:1", Mock(), state)]), \
+                 patch.object(local_web, "assert_port_available"), patch.object(local_web, "ensure_private_directory"), \
+                 patch.object(local_web, "verify_private_file"), patch.object(local_web, "broad_write_warnings", return_value=[]), \
+                 patch.object(local_web.subprocess, "Popen", return_value=process) as spawn, \
+                 patch.dict(local_web.os.environ, {"KAKAO_PHOTO_TRANSPORT": "untrusted", "NODE_OPTIONS": "untrusted", "HTTPS_PROXY": "untrusted"}), \
+                 patch.object(sys, "argv", ["local_web.py", "start", "--photo-transport", mode]), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(local_web.main(), 0)
+                command = spawn.call_args.args[0]
+                self.assertEqual(command[command.index("--photo-transport") + 1], mode)
+                environment = spawn.call_args.kwargs["env"]
+                for key in ["KAKAO_PHOTO_TRANSPORT", "NODE_OPTIONS", "HTTPS_PROXY"]:
+                    self.assertNotIn(key, environment)
+                self.assertEqual(spawn.call_args.kwargs["creationflags"], local_web.subprocess.CREATE_NO_WINDOW)
+
+    def test_status_includes_mode_without_authentication_values(self):
+        state = {"build": 8, "mode": "live", "photoTransport": "https-experimental",
+                 "csrf": "PRIVATE_SYNTHETIC", "accessToken": "PRIVATE_SYNTHETIC", "grid": [[True]]}
+        with patch.object(local_web, "connect", return_value=("http://127.0.0.1:1", Mock(), state)), \
+             patch.object(sys, "argv", ["local_web.py", "status"]), contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(local_web.main(), 0)
+            self.assertEqual(json.loads(output.getvalue()), {"url": "http://127.0.0.1:1", "build": 8, "mode": "live", "photoTransport": "https-experimental"})
+            self.assertNotIn("PRIVATE_SYNTHETIC", output.getvalue())
+
+    def test_invalid_photo_mode_is_rejected_before_connect_or_spawn(self):
+        with patch.object(sys, "argv", ["local_web.py", "start", "--photo-transport", "untrusted"]), \
+             patch.object(local_web, "connect") as connect, patch.object(local_web.subprocess, "Popen") as spawn, \
+             contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as error:
+                local_web.main()
+            self.assertEqual(error.exception.code, 2)
+            connect.assert_not_called()
+            spawn.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

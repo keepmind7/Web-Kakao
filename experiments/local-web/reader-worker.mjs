@@ -30,12 +30,14 @@ process.on('message',async message=>{
       checkPinnedSource({workingCopy:true});
       const sdk=await import('../../local-only/spikes/modern/src/kakao/forge-protocol.ts');
       const messaging=message.messaging===true;
+      const photoTransport=message.photoTransport ?? 'loco';
+      if(!['loco','https-experimental'].includes(photoTransport))throw new Error('invalid_photo_transport');
       const guard=Client=>guardReaderClient(Client,diagnostic,{messaging});
       const Booking=guard(sdk.BookingClient),Ticket=guard(sdk.TicketClient),Carriage=guard(sdk.CarriageClient);
       const Media=guardReaderClient(sdk.CarriageClient,diagnostic,{messaging,media:true});
       const sessionSalt=typeof message.sessionSalt==='string' && /^[a-f0-9]{64}$/.test(message.sessionSalt)?Buffer.from(message.sessionSalt,'hex'):undefined;
       const settingsSecret=typeof message.settingsSecret==='string' && /^[a-f0-9]{64}$/.test(message.settingsSecret)?Buffer.from(message.settingsSecret,'hex'):null;
-      session=createReaderSession(credential,{booking:()=>new Booking(),ticket:()=>new Ticket(),carriage:()=>new Carriage(),media:()=>new Media(),toLong:sdk.toLong,messaging,sessionSalt,settingsSecret,gapProbe:message.gapProbe===true,readProbe:true,observeRead:details=>diagnostic.note('read-verification',details),observeHistory:details=>diagnostic.note('history-page',details),observeUpload:details=>diagnostic.note('photo-upload',details),observeSend:details=>diagnostic.note('send-stage',details)},event=>{
+      session=createReaderSession(credential,{booking:()=>new Booking(),ticket:()=>new Ticket(),carriage:()=>new Carriage(),media:()=>new Media(),toLong:sdk.toLong,messaging,photoTransport,sessionSalt,settingsSecret,gapProbe:message.gapProbe===true,readProbe:true,observeRead:details=>diagnostic.note('read-verification',details),observeHistory:details=>diagnostic.note('history-page',details),observeUpload:details=>diagnostic.note('photo-upload',details),observeSend:details=>diagnostic.note('send-stage',details)},event=>{
         send(event);
       });
       await session.start();clearTimeout(operationTimer);operationBusy=false;

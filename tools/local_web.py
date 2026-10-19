@@ -172,7 +172,7 @@ def connect(*, legacy=False, expected_pid=None):
 
 def public_status(url, state):
     # Allowlist only: never serialize QR grid, passcode, cookies, CSRF or credentials.
-    return {"url": url, **{key: state[key] for key in ["build", "gapProbe", "messaging", "preferences", "outboxRecovery", "viewPin", "mode", "phase", "stage", "httpStatus", "apiStatus", "qrIssued", "credentialInMemory", "actualChatConnected", "chatConnectionActive", "actualMessageSent", "canStart", "canProbe", "attempts", "sessionBlocked"] if key in state}}
+    return {"url": url, **{key: state[key] for key in ["build", "gapProbe", "messaging", "photoTransport", "preferences", "outboxRecovery", "viewPin", "mode", "phase", "stage", "httpStatus", "apiStatus", "qrIssued", "credentialInMemory", "actualChatConnected", "chatConnectionActive", "actualMessageSent", "canStart", "canProbe", "attempts", "sessionBlocked"] if key in state}}
 
 
 def find_browser(name):
@@ -219,6 +219,8 @@ def main():
     parser.add_argument("--mock", action="store_true")
     parser.add_argument("--gap-probe", action="store_true", help="누락 구간에 MCHATLOGS를 한 번 확인하는 읽기 실험")
     parser.add_argument("--messaging", action="store_true", help="텍스트 전송과 읽음 상태 기능 활성화")
+    parser.add_argument("--photo-transport", choices=["loco", "https-experimental"], default="loco",
+                        help="사진 경로: 기본 loco 또는 JPEG 전용 HTTPS 실험 (실제 호환성 미검증)")
     parser.add_argument("--port", type=int, default=8787)
     args = parser.parse_args()
     if args.action != "open" and args.browser != "default":
@@ -274,6 +276,9 @@ def main():
         return 0
     if args.action == "start":
         if current:
+            if current[2].get("photoTransport", "loco") != args.photo_transport:
+                print("기존 서버와 사진 전송 모드가 다릅니다. 현재 서버와 세션을 유지했습니다. 모드 변경은 세션 정리·서버 재시작 후 적용하세요.")
+                return 2
             if bool(current[2].get("messaging")) != args.messaging:
                 print("기존 서버와 요청한 대화 기능 모드가 다릅니다. 현재 세션을 유지했습니다. 모드를 바꾸려면 세션 정리 후 서버를 다시 시작하세요.")
                 return 2
@@ -318,6 +323,7 @@ def main():
             command.append("--gap-probe")
         if args.messaging:
             command.append("--messaging")
+        command.extend(["--photo-transport", args.photo_transport])
         try:
             with (FOLDER / "server.stdout.log").open("ab") as stdout, (FOLDER / "server.stderr.log").open("ab") as stderr:
                 process = subprocess.Popen(command, cwd=ROOT, env=env, stdout=stdout, stderr=stderr,

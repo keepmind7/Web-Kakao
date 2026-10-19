@@ -27,7 +27,8 @@ export function safeMessages(rows){
   for(const row of rows.slice(-MESSAGE_LIMIT))if(messageKeyValid(row?.key))unique.set(row.key,{key:row.key,text:text(row.text,4000),sender:text(row.sender,80),mine:row.mine===true,canReply:row.canReply===true,reply:row.reply && typeof row.reply.text==='string'?{text:text(row.reply.text,4000),sender:text(row.reply.sender,80),verified:row.reply.verified===true}:null,at:at(row.at),photos:(Array.isArray(row.photos)?row.photos:[]).slice(0,30).map(photo=>({url:photoUrl(photo?.url),width:Number.isInteger(photo?.width)&&photo.width>0&&photo.width<=20000?photo.width:null,height:Number.isInteger(photo?.height)&&photo.height>0&&photo.height<=20000?photo.height:null})).filter(photo=>photo.url),unreadCount:row.mine===true && Number.isSafeInteger(row.unreadCount) && row.unreadCount>=0 && row.unreadCount<=100?row.unreadCount:null});
   return [...unique.values()];
 }
-export function createReadOnlyReader({spawn=fork,now=Date.now,onBlocked=()=>{},gapProbe=false,messaging=false,preferenceStore=createPreferenceStore()}={}){
+export function createReadOnlyReader({spawn=fork,now=Date.now,onBlocked=()=>{},gapProbe=false,messaging=false,photoTransport='loco',preferenceStore=createPreferenceStore()}={}){
+  if(!['loco','https-experimental'].includes(photoTransport))throw new Error('invalid_photo_transport');
   const instanceId=randomBytes(12).toString('hex');
   let child=null,signal=null,abortHandler=null,deadline=null,phase='idle',stage=null,status=null,attempts=0,consecutiveFailures=0,rooms=[],pages=new Map(),request=0,pending=null,revision=0,connectedAt=null;
   let historyRequests=0,historySuccesses=0,pushBatches=0,duplicates=0,sourceRoomCount=0,truncated=false;
@@ -46,7 +47,7 @@ export function createReadOnlyReader({spawn=fork,now=Date.now,onBlocked=()=>{},g
   let roomsRevision=0,settingsRevision=0,outboxRevision=0,sendRequests=0,sendAccepted=0;
   const pageRevisions=new Map(),cacheLost=new Map(),cacheEpochs=new Map(),retired=new Map();
   const touch=key=>{if(roomKeyValid(key))pageRevisions.set(key,(pageRevisions.get(key) ?? 0)+1);};
-  const publicEntry=entry=>{if(!entry)return null;const {key,clientId,kind,phase,status,messageKey,reason}=entry;return {key,clientId,kind,phase,status,...(messageKey?{messageKey}:{}),...(phase==='failed' && reason==='open_member_unverified'?{reason}:{})};};
+  const publicEntry=entry=>{if(!entry)return null;const {key,clientId,kind,phase,status,messageKey,reason}=entry;return {key,clientId,kind,phase,status,...(messageKey?{messageKey}:{}),...(phase==='failed' && ['open_member_unverified','photo_jpeg_required'].includes(reason)?{reason}:{})};};
   function unknownPending(){if(['send','photo'].includes(pending?.action)){const entry=outbox.get(pending.clientId);if(entry && entry.phase==='sending'){entry.phase='unknown';outboxRevision++;touch(entry.key);}}}
   function capacity(){
     if(outbox.size<1000)return true;
@@ -192,7 +193,7 @@ export function createReadOnlyReader({spawn=fork,now=Date.now,onBlocked=()=>{},g
         worker.on('message',message=>{
           if(child!==worker)return;
           if(message?.type==='reader-alive'){lastActivityAt=now();return;}
-          if(message?.type==='reader-ready' && !credentialSent){credentialSent=true;send({type:'reader-start',gapProbe:gapProbe===true,messaging,sessionSalt,settingsSecret:profile.key().toString('hex'),credential:{userId:credential.userId,deviceUUID:credential.deviceUUID,accessToken:credential.accessToken}});}
+          if(message?.type==='reader-ready' && !credentialSent){credentialSent=true;send({type:'reader-start',gapProbe:gapProbe===true,messaging,photoTransport,sessionSalt,settingsSecret:profile.key().toString('hex'),credential:{userId:credential.userId,deviceUUID:credential.deviceUUID,accessToken:credential.accessToken}});}
           else if(message?.type==='reader-failed')fail(['booking','getconf','checkin','loginlist','history','ping','push','transport','decode','disconnected','worker','send','photo','context','read','discovery'].includes(message.stage)?message.stage:'worker',message.status);
           else if(message?.type==='reader-rooms' && ['loginlist','push'].includes(message.source)){
             const nextRooms=safeRooms(message.rooms);
@@ -225,7 +226,7 @@ export function createReadOnlyReader({spawn=fork,now=Date.now,onBlocked=()=>{},g
             else if(!pending.invalidated && ['context','read'].includes(kind))entries.set(message.key,message.phase==='accepted'?'acknowledged':'failed');
             if(['send','photo'].includes(kind)){
               const entry=outbox.get(pending.clientId);
-              if(entry){if(message.phase==='accepted' && entry.phase!=='accepted')sendAccepted++;entry.phase=['accepted','failed','unknown'].includes(message.phase)?message.phase:'unknown';outboxRevision++;entry.status=Number.isInteger(message.status)?message.status:null;if(/^m_[a-f0-9]{24}$/.test(message.messageKey))entry.messageKey=message.messageKey;if(entry.phase==='failed' && message.reason==='open_member_unverified')entry.reason=message.reason;else delete entry.reason;}
+              if(entry){if(message.phase==='accepted' && entry.phase!=='accepted')sendAccepted++;entry.phase=['accepted','failed','unknown'].includes(message.phase)?message.phase:'unknown';outboxRevision++;entry.status=Number.isInteger(message.status)?message.status:null;if(/^m_[a-f0-9]{24}$/.test(message.messageKey))entry.messageKey=message.messageKey;if(entry.phase==='failed' && ['open_member_unverified','photo_jpeg_required'].includes(message.reason))entry.reason=message.reason;else delete entry.reason;}
             }else if(kind==='context'){
               if(pending.invalidated)contexts.delete(message.key);
               else contexts.set(message.key,['ready','unavailable','idle'].includes(message.receiptPhase)?message.receiptPhase:message.phase==='accepted'?'ready':'unavailable');

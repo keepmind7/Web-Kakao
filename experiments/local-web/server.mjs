@@ -30,11 +30,12 @@ const assets = new Map([
   ['/style.css', ['style.css', 'text/css; charset=utf-8']],
   ['/local-launch.js', ['local-launch.js', 'text/javascript; charset=utf-8']],
 ]);
-export function createLocalServer({ transport, mode = 'mock', encode = encodeQr, probe = runRoomProbe, readerFactory = createReadOnlyReader, gapProbe=false,messaging=false,preferenceStore=createPreferenceStore(),photoFetcher,controlToken,presenceOptions={} } = {}) {
+export function createLocalServer({ transport, mode = 'mock', encode = encodeQr, probe = runRoomProbe, readerFactory = createReadOnlyReader, gapProbe=false,messaging=false,photoTransport='loco',preferenceStore=createPreferenceStore(),photoFetcher,controlToken,presenceOptions={} } = {}) {
+  if(!['loco','https-experimental'].includes(photoTransport))throw new Error('invalid_photo_transport');
   const access=createLocalAccess({controlToken});
   const lab = createAuthLab({ transport: transport ?? (mode === 'live' ? createTransport() : mockTransport()), encodeQr: encode, mode, credentialRetentionMs:null });
   const photos=createPhotoCache({fetcher:photoFetcher});
-  const newReader=()=>readerFactory({gapProbe,messaging,preferenceStore,onBlocked:()=>{photos.clear();reader.close();lab.blockConnection();}});
+  const newReader=()=>readerFactory({gapProbe,messaging,photoTransport,preferenceStore,onBlocked:()=>{photos.clear();reader.close();lab.blockConnection();}});
   let reader=newReader();
   const forgetAccount=()=>{try{reader.close();}finally{try{photos.clear();}finally{lab.cancel();}}};
   // Only internal cleanup may own onEmpty; options inject bounded clocks/timers for QA.
@@ -44,7 +45,7 @@ export function createLocalServer({ transport, mode = 'mock', encode = encodeQr,
     if(disposed)return;disposed=true;presence.close();
     try{for(const finish of streams.values())finish();}finally{forgetAccount();}
   };
-  const snapshot=()=>{const tabPresence=presence.snapshot(),auth=lab.snapshot(),reading=reader.snapshot();if(!auth.credentialInMemory)photos.clear();return {build:8,sessionPolicy:'tab-open',tabPresence,preferences:typeof reader.settingsSnapshot==='function',outboxRecovery:typeof reader.outbox==='function' && typeof reader.acknowledgeOutbox==='function',viewPin:typeof reader.view==='function',gapProbe:gapProbe===true,messaging:messaging===true,...auth,actualMessageSent:auth.actualMessageSent || mode==='live' && reading.sendAccepted>0,actualChatConnected:auth.actualChatConnected || Number.isFinite(reading.connectedAt),chatConnectionActive:reading.phase==='connected',reader:reading,canOpenReader:mode==='live' && !auth.sessionBlocked && auth.credentialInMemory && auth.phase==='authenticated' && reading.canConnect};};
+  const snapshot=()=>{const tabPresence=presence.snapshot(),auth=lab.snapshot(),reading=reader.snapshot();if(!auth.credentialInMemory)photos.clear();return {build:8,sessionPolicy:'tab-open',tabPresence,preferences:typeof reader.settingsSnapshot==='function',outboxRecovery:typeof reader.outbox==='function' && typeof reader.acknowledgeOutbox==='function',viewPin:typeof reader.view==='function',gapProbe:gapProbe===true,messaging:messaging===true,photoTransport,...auth,actualMessageSent:auth.actualMessageSent || mode==='live' && reading.sendAccepted>0,actualChatConnected:auth.actualChatConnected || Number.isFinite(reading.connectedAt),chatConnectionActive:reading.phase==='connected',reader:reading,canOpenReader:mode==='live' && !auth.sessionBlocked && auth.credentialInMemory && auth.phase==='authenticated' && reading.canConnect};};
   const csrf = randomBytes(32).toString('hex');
   const withPhotoCapabilities=page=>Array.isArray(page?.messages)?{...page,messages:page.messages.map(message=>Array.isArray(message?.photos)?{...message,photos:message.photos.map(photo=>{const match=typeof photo?.src==='string' && /^\/api\/photo\?room=(r_[a-f0-9]{24})&message=(m_[a-f0-9]{24})&index=([0-9]|[12][0-9])$/.exec(photo.src);return match?{...photo,src:photo.src+'&cap='+access.photoCapability(match[1],match[2],match[3])}:photo;})}:message)}:page;
   let origin,receivingImage=false;
@@ -247,13 +248,16 @@ export function createLocalServer({ transport, mode = 'mock', encode = encodeQr,
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const mode = process.argv.includes('--live') ? 'live' : 'mock';
+  const photoIndex=process.argv.indexOf('--photo-transport');
+  const photoTransport=photoIndex<0?'loco':process.argv[photoIndex+1];
+  if(!['loco','https-experimental'].includes(photoTransport))throw new Error('invalid_photo_transport');
   const index = process.argv.indexOf('--port');
   const port = index < 0 ? 8787 : Number(process.argv[index + 1]);
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error('invalid_port');
   const root=await ensurePrivateDirectoryAsync(privateDataRoot());
   const folder=await ensurePrivateDirectoryAsync(resolve(root,'web-auth'));
   await verifyPrivateFileAsync(resolve(folder,'runtime.json'),{maxBytes:4096});
-  const app = createLocalServer({ mode,gapProbe:process.argv.includes('--gap-probe'),messaging:process.argv.includes('--messaging'),preferenceStore:createPreferenceStore({folder:resolve(root,'preferences'),asyncSecurity:true}) });
+  const app = createLocalServer({ mode,gapProbe:process.argv.includes('--gap-probe'),messaging:process.argv.includes('--messaging'),photoTransport,preferenceStore:createPreferenceStore({folder:resolve(root,'preferences'),asyncSecurity:true}) });
   const url = await app.listen(port);
   writeFileSync(resolve(folder, 'runtime.json'), JSON.stringify({ app: APP, url, mode, pid: process.pid,controlToken:app.controlToken }),{mode:0o600});
   app.server.on('close',()=>{

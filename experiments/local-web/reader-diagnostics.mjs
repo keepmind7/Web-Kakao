@@ -25,6 +25,7 @@ export function safeFault(error){
   return {category:names.has(error?.name)?error.name:'other',frames:['onData','decrypt','fromBuffer','deserialize','syncMsg','history','request'].filter(name=>new RegExp('\\b'+name+'\\b').test(stack))};
 }
 const UPLOAD_STAGES=new Set(['ship','route','connect','post','offset','stream','await_complete','received_complete','complete_observed','transport','deadline','exception']);
+for(const stage of ['https_start','https_route','https_upload','https_uploaded','https_write','https_ack','https_deadline','https_exception'])UPLOAD_STAGES.add(stage);
 const safeValue=(object,key)=>{try{return object?.[key];}catch{return undefined;}};
 const safeOwn=(object,key)=>{try{return Object.hasOwn(object ?? {},key);}catch{return false;}};
 const bounded=(value,min,max)=>Number.isSafeInteger(value) && value>=min && value<=max;
@@ -96,7 +97,7 @@ export function createReaderDiagnostic({writeSnapshot=null,writeSendSnapshot=nul
       state.lastOperation=typeof details.method==='string'?safeMethod(details.method):state.lastOperation;
       const elapsedMs=Date.now()-state.startedAt;
       if(event==='photo-upload' && UPLOAD_STAGES.has(details.stage)){
-        if(details.stage==='ship'){state.uploadStages={};streamBytes=0;}
+        if(details.stage==='ship' || details.stage==='https_start'){state.uploadStages={};streamBytes=0;}
         const bytes=Math.max(...[details.sentBytes,details.totalBytes].filter(value=>Number.isSafeInteger(value)&&value>=0&&value<=10*1024*1024),0);
         const row=state.uploadStages[details.stage] ?? {firstElapsedMs:elapsedMs,lastElapsedMs:elapsedMs,bytes:0,frames:0,count:0};
         row.lastElapsedMs=elapsedMs;row.bytes=Math.max(row.bytes,bytes);row.count++;

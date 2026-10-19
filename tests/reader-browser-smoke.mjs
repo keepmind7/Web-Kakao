@@ -4,6 +4,7 @@ import { spawn } from 'node:child_process';
 import { existsSync,mkdirSync,readFileSync,writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { createLocalServer } from '../experiments/local-web/server.mjs';
+import { decodeImage } from '../experiments/local-web/message-content.mjs';
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 
@@ -12,8 +13,11 @@ if(!chrome)throw new Error('Chrome unavailable; browser test not executed');
 const folder=resolve(process.env.WEB_KAKAO_QA_OUTPUT_ROOT || 'local-only/phase2-browser',String(Date.now()));mkdirSync(folder,{recursive:true});
 const key='r_'+'a'.repeat(24),second='r_'+'b'.repeat(24),payload='<img src=x onerror="globalThis.injected=true">';
 let connected=false,attempts=0,revision=0,historyBusy=false,rejectNextQr=false,allowAuth=false,otherPreview='예시 미리보기 B',statusRequests=0;
+let historyTimer=null,historyGeneration=0;
+const resetHistory=()=>{historyGeneration++;clearTimeout(historyTimer);historyTimer=null;historyBusy=false;};
 const historyRooms=[],historyPhases=new Map(),messagesByRoom=new Map(),qrGrid=[[true]];
 const localTitles=new Map(),unread=new Map(),contexts=new Map(),outcomes=new Map(),seenCalls=[],sendCalls=[];
+const photoPayloads=[];
 const roomCapabilities=new Map();
 const contextCalls=[],ackCalls=[],fixtureRequests=[];
 const receiptVersions=new Map([[key,1],[second,1]]),pageVersions=new Map([[key,1],[second,1]]);
@@ -32,7 +36,7 @@ const makeMessages=room=>Array.from({length:40},(_,i)=>({key:'m_'+(i+1).toString
 const controlToken=randomBytes(32).toString('hex');
 const app=createLocalServer({controlToken,mode:'live',messaging:true,photoFetcher:async()=>({data:syntheticPhoto,type:'image/gif'}),encode:()=>qrGrid,transport:async op=>op==='allowlist'?{httpStatus:200,body:{allowlisted:true}}:op==='generate'?{httpStatus:200,body:{status:0,url:'OFFLINE-NOT-FOR-LOGIN',remainingSeconds:60}}:rejectNextQr?{httpStatus:200,body:{status:-151}}:allowAuth?{httpStatus:200,body:{status:0,user:{userId:'246810'},accessToken:'FAKE_OFFLINE_TOKEN'}}:{httpStatus:200,body:{status:-150,nextRequestIntervalInSeconds:1}},readerFactory:()=>({
   snapshot:()=>({phase:connected?'connected':attempts?'disconnected':'idle',attempts,canConnect:!connected,roomCount:connected?2-removedRooms.size:0,revision,...(adversarialFixture?{roomsRevision:roomsVersion,settingsRevision:settingsVersion,outboxRevision:outboxVersion,pageRevisions:Object.fromEntries(pageVersions)}:{}),historyBusy,pushBatches:0,connectedAt:connected?Date.now():null}),
-  connect(){if(attempts++) {historyPhases.clear();messagesByRoom.clear();contexts.clear();readStates.clear();}connected=true;revision++;return true;},
+  connect(){resetHistory();if(attempts++) {historyPhases.clear();messagesByRoom.clear();contexts.clear();readStates.clear();}connected=true;revision++;return true;},
   rooms:()=>({revision,rooms:connected?[{key,title:'모의 대화방 A',preview:'예시 미리보기'},{key:second,title:'모의 대화방 B',preview:otherPreview}].filter(row=>!removedRooms.has(row.key)).map(row=>({...row,...(adversarialFixture?{lastAt:1800000300000}:{}),baseTitle:row.title,title:localTitles.get(row.key) || row.title,localTitle:localTitles.get(row.key) || null,pinOrder:roomSettings.get(row.key)?.pinOrder ?? null,muted:roomSettings.get(row.key)?.muted===true,canSend:true,kind:'DirectChat',...roomCapabilities.get(row.key),unreadLocalCount:unread.get(row.key) || 0,unreadCoverage:'observed'})):[]}),
   messages:room=>({key:room,messages:messagesByRoom.get(room) || [],latestVisible:!latestMissing.has(room),seenToken:'c'.repeat(48),receiptPhase:contexts.get(room) || 'idle',...(adversarialFixture?{entryPhase:contexts.get(room) || 'idle',contextRevision:receiptVersions.get(room)}:{}),readSync:readStates.get(room) || {phase:'idle'},outbox:[...outcomes.values()].filter(row=>row.key===room),history:{phase:historyPhases.get(room) || 'idle',gap:historyGaps.get(room)===true,receivedCount:messagesByRoom.get(room)?.length || 0,acceptedCount:messagesByRoom.get(room)?.length || 0}}),
   view:room=>[key,second].includes(room),
@@ -48,8 +52,8 @@ const app=createLocalServer({controlToken,mode:'live',messaging:true,photoFetche
   openRoom(room){contextCalls.push(room);if(adversarialFixture)for(const other of [key,second])if(other!==room)contexts.set(other,'idle');contexts.set(room,'ready');pageVersions.set(room,pageVersions.get(room)+1);revision++;return true;},
   seen(room,token,notify){seenCalls.push({room,token,notify});if(notify)readStates.set(room,{phase:'accepted',messageKey:messagesByRoom.get(room).at(-1).key});unread.set(room,0);revision++;return true;},
   sendText(room,text,clientId,replyTo){if(outcomes.has(clientId))return true;sendCalls.push({room,text,clientId,replyTo});outcomes.set(clientId,{key:room,clientId,kind:'send',phase:'sending'});outboxVersion++;pageVersions.set(room,pageVersions.get(room)+1);revision++;setTimeout(()=>{outcomes.set(clientId,{key:room,clientId,kind:'send',phase:unknownSend?'unknown':'accepted'});if(!unknownSend)messagesByRoom.get(room).push({key:'m_'+(5000+sendCalls.length).toString(16).padStart(24,'0'),text,sender:'나',mine:true,at:1800000100000,unreadCount:1,...(replyTo?{reply:{text:messagesByRoom.get(room).find(row=>row.key===replyTo)?.text,sender:'모의 사용자'}}:{})});outboxVersion++;pageVersions.set(room,pageVersions.get(room)+1);revision++;},150).unref();return true;},
-  sendPhoto(room,image,clientId){if(rejectPhoto)return false;sendCalls.push({kind:'photo',room,clientId,byteLength:Buffer.from(image,'base64').length});outcomes.set(clientId,{key:room,clientId,kind:'photo',phase:unknownPhoto?'unknown':'accepted'});outboxVersion++;pageVersions.set(room,pageVersions.get(room)+1);revision++;return true;},
-  history(room){if(historyBusy)return false;historyRooms.push(room);historyPhases.set(room,'loading');historyBusy=true;revision++;setTimeout(()=>{if(connected){historyPhases.set(room,'loaded');if(!messagesByRoom.has(room))messagesByRoom.set(room,[...makeMessages(room),...(offlineMessages.get(room) || [])]);historyBusy=false;revision++;}},500).unref();return true;},disconnect(){connected=false;revision++;},close(){connected=false;attempts=0;historyBusy=false;historyPhases.clear();messagesByRoom.clear();localTitles.clear();unread.clear();contexts.clear();outcomes.clear();revision++;},
+  sendPhoto(room,image,clientId){if(rejectPhoto)return false;photoPayloads.push(image);sendCalls.push({kind:'photo',room,clientId,byteLength:Buffer.from(image,'base64').length,mime:decodeImage(image)?.mime});outcomes.set(clientId,{key:room,clientId,kind:'photo',phase:unknownPhoto?'unknown':'accepted'});outboxVersion++;pageVersions.set(room,pageVersions.get(room)+1);revision++;return true;},
+  history(room){if(historyBusy)return false;historyRooms.push(room);historyPhases.set(room,'loading');historyBusy=true;revision++;const generation=historyGeneration;historyTimer=setTimeout(()=>{if(generation!==historyGeneration || !connected)return;historyTimer=null;historyPhases.set(room,'loaded');if(!messagesByRoom.has(room))messagesByRoom.set(room,[...makeMessages(room),...(offlineMessages.get(room) || [])]);historyBusy=false;revision++;},500);historyTimer.unref();return true;},disconnect(){resetHistory();connected=false;revision++;},close(){resetHistory();connected=false;attempts=0;historyPhases.clear();messagesByRoom.clear();localTitles.clear();unread.clear();contexts.clear();outcomes.clear();revision++;},
 })});
 app.server.on('request',req=>{if(req.url==='/api/status')statusRequests++;if(req.url.startsWith('/api/photo?'))photoRequests++;fixtureRequests.push({method:req.method,path:req.url.split('?')[0],room:new URL(req.url,'http://synthetic.invalid').searchParams.get('room')});});
 const url=await app.listen(0);
@@ -141,7 +145,7 @@ await evaluate("globalThis.downloads=[];globalThis.originalAnchorClick=HTMLAncho
 await until("document.getElementById('photo-dialog').open && document.getElementById('photo-full').naturalWidth===1 && !document.getElementById('photo-download').disabled");
 const beforeDownload=photoRequests;await evaluate("document.getElementById('photo-download').click()");await until("globalThis.downloads.length===1 && document.getElementById('photo-download').textContent==='다운로드'");
 await check('explicit photo download fetches once and saves an image file',async()=>{const name=await evaluate("globalThis.downloads[0]");assert.match(name,/^kakao-photo-\d{8}-\d{6}\.(?:png|jpg|webp|gif)$/);assert.equal(photoRequests-beforeDownload,1);return {name,photoGets:photoRequests-beforeDownload};});
-await evaluate("HTMLAnchorElement.prototype.click=globalThis.originalAnchorClick;document.getElementById('photo-dialog').close()");
+await evaluate("HTMLAnchorElement.prototype.click=globalThis.originalAnchorClick;new Promise(resolve=>{const dialog=document.getElementById('photo-dialog');dialog.addEventListener('close',()=>resolve(),{once:true});dialog.close();})");
 await check('closing the photo dialog disables download',async()=>{assert.equal(await evaluate("document.getElementById('photo-download').disabled"),true);return {disabled:true};});
       // Real rendered CSS, composited through ancestors. Small text is held to
       // 4.5 even if bold; transparent badges/quotes use their actual backdrops.
@@ -336,6 +340,92 @@ await check('closing the photo dialog disables download',async()=>{assert.equal(
       revision++;await refreshUi();
     }
   }
+  async function checkPhotoConversion(){
+    const results=[],before=sendCalls.length;
+    const check=(name)=>{results.push({name,passed:true});lifecycleChecks.push(name);};
+    await refreshUi();await evaluate(`showAccount(false);el('read-sync').checked=false;void selectRoom('${key}')`);
+    await until(`selectedRoom==='${key}' && currentPage?.messages?.length===40 && !busy && !refreshing && !ackInFlight && !pendingSend && !uncertainPhoto && !el('attach-image').disabled`);
+    await evaluate(`globalThis.qaPhotoFile=async(type='image/png',declared=type)=>{
+      const canvas=document.createElement('canvas');canvas.width=64;canvas.height=32;
+      const context=canvas.getContext('2d');context.fillStyle='#d02030';context.fillRect(32,0,32,32);
+      const blob=await new Promise(resolve=>canvas.toBlob(resolve,type,.9));if(blob.type!==type)throw Error('fixture encoder unavailable');
+      return new File([blob],'synthetic-photo',{type:declared});
+    };globalThis.qaPhotoPixels=async()=>{const blob=new Blob([Uint8Array.from(atob(imageDraft.image),char=>char.charCodeAt(0))],{type:imageDraft.mime}),bitmap=await createImageBitmap(blob),canvas=document.createElement('canvas');canvas.width=bitmap.width;canvas.height=bitmap.height;const context=canvas.getContext('2d');context.drawImage(bitmap,0,0);bitmap.close();return {mime:blob.type,bytes:blob.size,left:[...context.getImageData(8,8,1,1).data],right:[...context.getImageData(48,8,1,1).data]};};`);
+    const cancelPhoto=()=>evaluate("(async()=>{const closed=new Promise(resolve=>el('image-send-dialog').addEventListener('close',resolve,{once:true}));el('image-cancel').click();await closed;})()");
+    try{
+      for(const type of ['image/png','image/webp']){
+        await evaluate(`(async()=>{lastState.photoTransport='https-experimental';await prepareImage(await qaPhotoFile('${type}'));})()`);
+        await until("el('image-send-dialog').open && !imagePreparing && !el('image-send').disabled");
+        const pixels=await evaluate('qaPhotoPixels()');assert.equal(pixels.mime,'image/jpeg');assert.ok(pixels.bytes<=10*1024*1024);
+        assert.equal(decodeImage(await evaluate('imageDraft.image'))?.mime,'image/jpeg');
+        assert.ok(pixels.left.slice(0,3).every(channel=>channel>=245),'alpha must become white');assert.equal(pixels.left[3],255);
+        assert.ok(pixels.right[0]>170 && pixels.right[1]<75 && pixels.right[2]<100,'opaque color must survive conversion');
+        assert.equal(await evaluate("!el('image-format-note').hidden && el('image-format-note').textContent.includes('흰색')"),true);
+        await cancelPhoto();assert.equal(sendCalls.length,before);check(type+' converts to an opaque JPEG with a white alpha background before explicit send');
+      }
+      for(const declared of ['','image/x-png']){
+        await evaluate(`(async()=>{lastState.photoTransport='https-experimental';await prepareImage(await qaPhotoFile('image/png','${declared}'));})()`);
+        await until("el('image-send-dialog').open && !imagePreparing");assert.equal((await evaluate('qaPhotoPixels()')).mime,'image/jpeg');
+        await cancelPhoto();check('valid PNG bytes with '+(declared || 'empty MIME')+' prepare as JPEG');
+      }
+      await evaluate(`(async()=>{sendNotes.delete(selectedRoom);lastState.photoTransport='https-experimental';await prepareImage(new File(['GIF89a invalid'],'synthetic.png',{type:'image/png'}));})()`);
+      assert.equal(await evaluate("imageDraft===null && sendNotes.get(selectedRoom).endsWith('[format]')"),true);check('a PNG MIME label cannot bypass unsupported file signature rejection');
+      const fallback=await evaluate(`(async()=>{const original=createImageBitmap;globalThis.createImageBitmap=async()=>{throw new Error('synthetic bitmap unavailable');};try{lastState.photoTransport='https-experimental';await prepareImage(await qaPhotoFile());return imageDraft?.mime;}finally{globalThis.createImageBitmap=original;}})()`);
+      assert.equal(fallback,'image/jpeg');await cancelPhoto();check('local image decoder fallback still produces JPEG when bitmap decoding fails');
+      for(const failure of ['error','timeout']){
+        const cleanup=await evaluate(`(async()=>{
+          const saved={bitmap:createImageBitmap,image:Image,create:URL.createObjectURL,revoke:URL.revokeObjectURL,timeout:setTimeout,clear:clearTimeout};
+          const created=[],revoked=[],deadlines=[],cleared=[];let rejected=false,timerFired=false;
+          globalThis.createImageBitmap=async()=>{throw Error('synthetic native decode failure');};
+          URL.createObjectURL=function(blob){const url=saved.create.call(URL,blob);created.push(url);return url;};URL.revokeObjectURL=function(url){revoked.push(url);saved.revoke.call(URL,url);};
+          globalThis.setTimeout=(callback,delay,...args)=>{const handler=delay===10000?(...values)=>{timerFired=true;callback(...values);}:callback;const id=saved.timeout.call(globalThis,handler,delay===10000 && '${failure}'==='timeout'?5:delay,...args);if(delay===10000)deadlines.push({id,delay});return id;};globalThis.clearTimeout=id=>{cleared.push(id);saved.clear.call(globalThis,id);};
+          if('${failure}'==='timeout')globalThis.Image=class{set src(value){}removeAttribute(){}};
+          try{try{await decodeSelectedImage(new Blob([new Uint8Array([137,80,78,71,13,10,26,10]),'invalid png'],{type:'image/png'}));}catch{rejected=true;}return {rejected,created:created.length,revoked:revoked.length,sameUrl:created[0]===revoked[0],deadline:deadlines.map(row=>row.delay),timerCleared:deadlines.every(row=>cleared.includes(row.id)),timerFired};}
+          finally{globalThis.createImageBitmap=saved.bitmap;globalThis.Image=saved.image;URL.createObjectURL=saved.create;URL.revokeObjectURL=saved.revoke;globalThis.setTimeout=saved.timeout;globalThis.clearTimeout=saved.clear;}
+        })()`);
+        assert.deepEqual(cleanup,{rejected:true,created:1,revoked:1,sameUrl:true,deadline:[10000],timerCleared:true,timerFired:failure==='timeout'});
+        check('fallback decoder '+failure+' releases its local URL and original 10 second timer');
+      }
+      await evaluate(`globalThis.qaFallbackStarted=new Promise(resolve=>globalThis.qaFallbackSignal=resolve);globalThis.qaFallbackDone=new Promise(resolve=>globalThis.qaFallbackResolve=resolve);void(async()=>{
+        const file=await qaPhotoFile(),saved={bitmap:createImageBitmap,image:Image,revoke:URL.revokeObjectURL};globalThis.qaFallbackRemoved=false;globalThis.qaFallbackRevoked=0;
+        globalThis.qaFallbackRestore=()=>{globalThis.createImageBitmap=saved.bitmap;globalThis.Image=saved.image;URL.revokeObjectURL=saved.revoke;};
+        globalThis.createImageBitmap=async()=>{throw Error('synthetic native decode failure');};globalThis.Image=class{constructor(){globalThis.qaFallbackImage=this;this.naturalWidth=64;this.naturalHeight=32;}set src(value){globalThis.qaFallbackUrl=value;qaFallbackSignal();}removeAttribute(){globalThis.qaFallbackRemoved=true;}};
+        URL.revokeObjectURL=function(url){if(url===globalThis.qaFallbackUrl)globalThis.qaFallbackRevoked++;saved.revoke.call(URL,url);};
+        try{lastState.photoTransport='https-experimental';await prepareImage(file);}finally{qaFallbackRestore();qaFallbackResolve();}
+      })();`);
+      await evaluate('qaFallbackStarted');await evaluate(`void selectRoom('${second}')`);
+      await until(`selectedRoom==='${second}' && currentPage?.key==='${second}' && !busy && !refreshing && !ackInFlight`);
+      await evaluate('qaFallbackImage.onload();qaFallbackDone');
+      assert.equal(await evaluate('qaFallbackRemoved && qaFallbackRevoked===1 && imageDraft===null && !imagePreparing'),true);
+      assert.equal(sendCalls.length,before);check('room change during fallback decoding releases the stale source without preview or send');
+      await evaluate(`void selectRoom('${key}')`);await until(`selectedRoom==='${key}' && currentPage?.key==='${key}' && !busy && !refreshing && !ackInFlight`);
+      const qualityPass=await evaluate(`(async()=>{const original=HTMLCanvasElement.prototype.toBlob,attempts=[];const file=await qaPhotoFile();HTMLCanvasElement.prototype.toBlob=function(callback,mime,quality){attempts.push(quality);if(attempts.length<3)callback(new Blob([new Uint8Array(10*1024*1024+1)],{type:mime}));else original.call(this,callback,mime,quality);};try{lastState.photoTransport='https-experimental';await prepareImage(file);return {attempts,mime:imageDraft?.mime};}finally{HTMLCanvasElement.prototype.toBlob=original;}})()`);
+      assert.deepEqual(qualityPass,{attempts:[.9,.8,.7],mime:'image/jpeg'});await cancelPhoto();check('oversized JPEG preparation adjusts quality locally at most three times');
+      const qualityFailure=await evaluate(`(async()=>{const original=HTMLCanvasElement.prototype.toBlob,attempts=[];const file=await qaPhotoFile();HTMLCanvasElement.prototype.toBlob=function(callback,mime,quality){attempts.push(quality);callback(new Blob([new Uint8Array(10*1024*1024+1)],{type:mime}));};try{sendNotes.delete(selectedRoom);lastState.photoTransport='https-experimental';await prepareImage(file);return {attempts,draft:imageDraft!==null,note:sendNotes.get(selectedRoom)};}finally{HTMLCanvasElement.prototype.toBlob=original;}})()`);
+      assert.deepEqual(qualityFailure.attempts,[.9,.8,.7]);assert.equal(qualityFailure.draft,false);assert.ok(qualityFailure.note.endsWith('[output-size]'));check('three oversized JPEG results fail before upload without a fourth encoding');
+      const mismatch=await evaluate(`(async()=>{const original=HTMLCanvasElement.prototype.toBlob,file=await qaPhotoFile();HTMLCanvasElement.prototype.toBlob=callback=>callback(new Blob(['synthetic wrong mime'],{type:'image/png'}));try{sendNotes.delete(selectedRoom);lastState.photoTransport='https-experimental';await prepareImage(file);return imageDraft===null && sendNotes.get(selectedRoom).endsWith('[encode]');}finally{HTMLCanvasElement.prototype.toBlob=original;}})()`);
+      assert.equal(mismatch,true);check('a browser output MIME mismatch cannot reach the JPEG-only uploader');
+      // Cancellation between encoding passes must discard the old bytes and stop
+      // additional quality attempts, even after a room change has finished.
+      await evaluate(`globalThis.qaBlobOriginal=HTMLCanvasElement.prototype.toBlob;globalThis.qaBlobAttempts=0;globalThis.qaBlobStarted=new Promise(resolve=>globalThis.qaBlobSignal=resolve);globalThis.qaHeldBlobDone=new Promise(resolve=>globalThis.qaHeldBlobResolve=resolve);void(async()=>{const file=await qaPhotoFile();HTMLCanvasElement.prototype.toBlob=function(callback,mime){qaBlobAttempts++;globalThis.qaBlobRelease=()=>callback(new Blob([new Uint8Array(10*1024*1024+1)],{type:mime}));qaBlobSignal();};lastState.photoTransport='https-experimental';await prepareImage(file);qaHeldBlobResolve();})();`);
+      await evaluate('qaBlobStarted');await evaluate(`void selectRoom('${second}')`);
+      await until(`selectedRoom==='${second}' && currentPage?.key==='${second}' && !busy && !refreshing && !ackInFlight`);
+      await evaluate('HTMLCanvasElement.prototype.toBlob=qaBlobOriginal;qaBlobRelease();qaHeldBlobDone');
+      assert.equal(await evaluate('qaBlobAttempts===1 && imageDraft===null && !imagePreparing && !el("image-send-dialog").open'),true);
+      assert.equal(sendCalls.length,before);check('room change during JPEG encoding discards old bytes and stops subsequent quality passes');
+      // Submit the exact JPEG preview bytes through the actual app HTTP route.
+      await evaluate("(async()=>{lastState.photoTransport='https-experimental';await prepareImage(await qaPhotoFile('image/webp'));})()");
+      await until("el('image-send-dialog').open && !el('image-send').disabled");const expected=await evaluate('imageDraft.image');
+      assert.equal(decodeImage(expected)?.mime,'image/jpeg');
+      await evaluate("el('image-send').click();el('image-send').click()");
+      await until('pendingSend===null && imageDraft===null && !imagePreparing');
+      assert.equal(sendCalls.length,before+1);assert.equal(sendCalls.at(-1).room,second);assert.equal(sendCalls.at(-1).mime,'image/jpeg');assert.equal(photoPayloads.at(-1),expected);
+      check('converted WebP preview bytes reach the actual photo POST handler exactly once as JPEG');
+    }finally{
+      await evaluate("globalThis.qaFallbackRestore?.();if(globalThis.qaBlobOriginal)HTMLCanvasElement.prototype.toBlob=qaBlobOriginal;clearImageDraft();sendNotes.delete(selectedRoom);scheduleRefresh()").catch(()=>{});
+      writeFileSync(resolve(folder,'synthetic-photo-conversion.json'),JSON.stringify({passed:results.length===14,checks:results,actualAccountUsed:false,actualMessagesSent:0,syntheticSends:sendCalls.length-before},null,2));
+    }
+  }
   async function checkCapabilities(){
     roomCapabilities.set(key,{kind:'OpenMultiChat',canSend:true,canText:true,canPhoto:false,canReply:false,canRead:false,canContext:false});revision++;
     await refreshUi();
@@ -506,7 +596,8 @@ await check('closing the photo dialog disables download',async()=>{assert.equal(
   await until("document.querySelectorAll('.room-item').length===2");
   assert.equal(await evaluate("document.getElementById('title').textContent"),'대화 서버 연결됨');
   assert.equal(await evaluate("getComputedStyle(document.querySelector('.app-shell')).display"),'grid');
-  if(process.env.WEB_KAKAO_QA_ADVERSARIAL_ONLY==='1'){await checkAdversarialBrowser();console.log(JSON.stringify({passed:true,scope:'synthetic adversarial browser only',checks:lifecycleChecks,actualAccountUsed:false,artifacts:folder}));}
+  if(process.env.WEB_KAKAO_QA_PHOTO_ONLY==='1'){await checkPhotoConversion();console.log(JSON.stringify({passed:true,scope:'synthetic photo conversion and submit only',checks:lifecycleChecks,actualAccountUsed:false,artifacts:folder}));}
+  else if(process.env.WEB_KAKAO_QA_ADVERSARIAL_ONLY==='1'){await checkAdversarialBrowser();console.log(JSON.stringify({passed:true,scope:'synthetic adversarial browser only',checks:lifecycleChecks,actualAccountUsed:false,artifacts:folder}));}
   else if(process.env.WEB_KAKAO_QA_UI_ONLY==='1'){await checkMobileAndThemes();await checkThemeBrowser();await checkHeaderLayout();console.log(JSON.stringify({passed:true,scope:'synthetic A UI theme and mobile only',checks:lifecycleChecks,actualAccountUsed:false,artifacts:folder}));}
   else if(process.env.WEB_KAKAO_QA_THEME_ONLY==='1'){await checkThemeBrowser();console.log(JSON.stringify({passed:true,scope:'synthetic theme only',checks:lifecycleChecks,actualAccountUsed:false,artifacts:folder}));}
   else if(process.env.WEB_KAKAO_QA_CONFLICTS_ONLY==='1'){await checkConflicts();console.log(JSON.stringify({passed:true,scope:'synthetic HTTP409 only',checks:lifecycleChecks,actualAccountUsed:false,artifacts:folder}));}
@@ -702,6 +793,48 @@ await check('closing the photo dialog disables download',async()=>{assert.equal(
   assert.equal(sendCalls.at(-1).replyTo,'m_'+'1'.padStart(24,'0'));
   assert.equal(await evaluate("document.querySelector('.message-quote span').textContent"),payload);assert.equal(await evaluate("document.querySelector('.message-quote img')===null && globalThis.injected===undefined"),true);
   const beforePhotos=sendCalls.length;
+  // Exercise a filesystem File through the real input/change handler rather
+  // than imposing File.type in JavaScript. CDP bypasses the native picker UI.
+  const selectedPngPath=resolve(folder,'synthetic-picker.png');writeFileSync(selectedPngPath,syntheticPng);
+  const photoDocument=await call('DOM.getDocument');
+  const photoInput=await call('DOM.querySelector',{nodeId:photoDocument.root.nodeId,selector:'#image-file'});
+  await evaluate("el('image-file').addEventListener('change',event=>globalThis.pickerFileType=event.target.files[0]?.type,{capture:true,once:true})");
+  await call('DOM.setFileInputFiles',{nodeId:photoInput.nodeId,files:[selectedPngPath]});
+  await until("el('image-send-dialog').open && el('image-preview').naturalWidth===1 && !imagePreparing");
+  assert.equal(await evaluate('globalThis.pickerFileType'),'image/png');
+  assert.equal(sendCalls.length,beforePhotos);
+  await evaluate("(async()=>{const closed=new Promise(resolve=>el('image-send-dialog').addEventListener('close',resolve,{once:true}));el('image-cancel').click();await closed;})()");
+  lifecycleChecks.push('filesystem PNG input decodes and opens preview without sending');
+  // Native decoding and injected browser failures must identify the failed stage,
+  // leave no sendable draft and permit a fresh valid preview after each failure.
+  const validImage=`new File([Uint8Array.from(atob('${syntheticPng.toString('base64')}'),c=>c.charCodeAt(0))],'synthetic.png',{type:'image/png'})`;
+  const preparationFailures=[
+    {step:'format',file:"new File(['gif'],'synthetic.gif',{type:'image/gif'})"},
+    {step:'input-size',file:"new File([new Uint8Array(20*1024*1024+1)],'synthetic.png',{type:'image/png'})"},
+    {step:'decode',file:"new File([new Uint8Array([137,80,78,71,13,10,26,10]),'invalid png'],'synthetic.png',{type:'image/png'})"},
+    {step:'pixels',setup:"globalThis.createImageBitmap=async()=>({width:40000001,height:1,close(){}})"},
+    {step:'canvas',setup:"HTMLCanvasElement.prototype.getContext=()=>null"},
+    {step:'encode',setup:"HTMLCanvasElement.prototype.toBlob=callback=>callback(null)"},
+    {step:'output-size',setup:"HTMLCanvasElement.prototype.toBlob=callback=>callback(new Blob([new Uint8Array(10*1024*1024+1)],{type:'image/png'}))"},
+    {step:'read',setup:"globalThis.FileReader=class{readAsDataURL(){queueMicrotask(()=>this.onerror(new Event('error')));}}"},
+    {step:'preview',setup:"HTMLDialogElement.prototype.showModal=()=>{throw new DOMException('synthetic preview rejection','InvalidStateError');}"},
+  ];
+  for(const scenario of preparationFailures){
+    const result=await evaluate(`(async()=>{
+      const saved={decode:createImageBitmap,context:HTMLCanvasElement.prototype.getContext,blob:HTMLCanvasElement.prototype.toBlob,reader:FileReader,preview:HTMLDialogElement.prototype.showModal};
+      sendNotes.delete(selectedRoom);
+      try{${scenario.setup || ''};await prepareImage(${scenario.file || validImage});return {note:sendNotes.get(selectedRoom),draft:imageDraft!==null,preparing:imagePreparing,dialog:el('image-send-dialog').open,sendDisabled:el('image-send').disabled};}
+      finally{globalThis.createImageBitmap=saved.decode;HTMLCanvasElement.prototype.getContext=saved.context;HTMLCanvasElement.prototype.toBlob=saved.blob;globalThis.FileReader=saved.reader;HTMLDialogElement.prototype.showModal=saved.preview;}
+    })()`);
+    assert.ok(result.note.endsWith('['+scenario.step+']'),scenario.step+' must have a specific error');
+    assert.deepEqual({...result,note:undefined},{note:undefined,draft:false,preparing:false,dialog:false,sendDisabled:true});
+    await evaluate(`prepareImage(${validImage})`);
+    await until("el('image-send-dialog').open && el('image-preview').naturalWidth===1 && !imagePreparing");
+    await evaluate("(async()=>{const closed=new Promise(resolve=>el('image-send-dialog').addEventListener('close',resolve,{once:true}));el('image-cancel').click();await closed;})()");
+    assert.equal(sendCalls.length,beforePhotos,'preparation failure and recovery must not send');
+    lifecycleChecks.push('photo preparation '+scenario.step+' failure is specific, cleans up and recovers without sending');
+  }
+  await evaluate('sendNotes.delete(selectedRoom);renderComposer()');
   assert.equal(await evaluate("(()=>{const data=new DataTransfer();data.setData('text/plain','일반 텍스트');const event=new ClipboardEvent('paste',{clipboardData:data,bubbles:true,cancelable:true});return document.getElementById('compose-text').dispatchEvent(event) && !event.defaultPrevented;})()"),true);
   await evaluate("document.getElementById('compose-text').value='붙여넣기 중 유지할 초안';document.getElementById('compose-text').dispatchEvent(new Event('input'))");
   assert.equal(await evaluate(`(()=>{const data=new DataTransfer();data.items.add(new File([Uint8Array.from(atob('${syntheticPng.toString('base64')}'),c=>c.charCodeAt(0))],'clipboard.png',{type:'image/png'}));const event=new ClipboardEvent('paste',{clipboardData:data,bubbles:true,cancelable:true});document.getElementById('compose-text').dispatchEvent(event);return event.defaultPrevented;})()`),true);
@@ -849,6 +982,7 @@ await check('closing the photo dialog disables download',async()=>{assert.equal(
   await checkMobileAndThemes();
   await checkThemeBrowser();
   await checkAdversarialBrowser();
+  await checkPhotoConversion();
   await evaluate("if(document.getElementById('account-panel').hidden)document.getElementById('account-toggle').click()");assert.equal(await evaluate("document.getElementById('account-panel').hidden"),false);
   await evaluate("document.getElementById('cancel').click()");await until("document.getElementById('reader-panel').hidden && document.getElementById('message-list').childElementCount===0");
   assert.equal(await evaluate("document.getElementById('chat-title').textContent"),'대화방을 선택해 주세요');

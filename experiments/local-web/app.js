@@ -278,7 +278,7 @@ async function refreshPendingSend(){
       sendNotes.set(pending.room,'서버에 전송했습니다.');
     }else{
       const status=outcome.status,rejected=Number.isInteger(status) && status!==0 && status>=-2147483648 && status<=2147483647;
-      sendNotes.set(pending.room,outcome.phase==='failed' && outcome.reason==='open_member_unverified'?'본인 참여 정보를 확인하지 못해 전송하지 않았습니다. 입력한 내용은 유지됩니다.':rejected?`서버가 전송 요청을 거절했습니다. (코드 ${status})`:'전송하지 못했습니다. 입력한 내용은 유지됩니다.');
+      sendNotes.set(pending.room,outcome.phase==='failed' && outcome.reason==='photo_jpeg_required'?'사진을 JPEG로 준비하지 못해 전송하지 않았습니다. 화면을 새로고침한 뒤 사진을 다시 선택해 주세요.':outcome.phase==='failed' && outcome.reason==='open_member_unverified'?'본인 참여 정보를 확인하지 못해 전송하지 않았습니다. 입력한 내용은 유지됩니다.':rejected?`서버가 전송 요청을 거절했습니다. (코드 ${status})`:'전송하지 못했습니다. 입력한 내용은 유지됩니다.');
     }
     outboxEpoch++;restoredOutbox=restoredOutbox.filter(entry=>entry.clientId!==pending.clientId);
     pendingSend=null;
@@ -454,7 +454,7 @@ function render(state) {
       el('message').textContent='이전 인증 요청을 서버가 거절해 추가 시도를 중단했습니다. 로컬 세션을 지워도 이 차단은 해제되지 않습니다. 표시된 오류와 휴대폰의 연결 기기를 확인해 주세요.';
     }
   }
-  el('mode').textContent = state.mode === 'live' ? '실제 서버 인증 실험 · 이 노트북에서만 접근' : '모의 화면 · 실제 카카오톡 로그인 아님';
+  el('mode').textContent = (state.mode === 'live' ? '실제 서버 인증 실험 · 이 노트북에서만 접근' : '모의 화면 · 실제 카카오톡 로그인 아님')+(state.photoTransport==='https-experimental'?' · HTTPS 사진 전송 · JPEG로 변환':'');
   el('start').disabled = busy || !state.canStart || !csrf;
   el('start').textContent = state.phase === 'idle' ? 'QR 로그인 시작' : '새 QR 발급';
   el('cancel').disabled = busy || ['idle','cancelled'].includes(state.phase) || !csrf;
@@ -927,20 +927,64 @@ el('message-menu').addEventListener('keydown',event=>{
 document.addEventListener('pointerdown',event=>{if(messageMenuTarget && !el('message-menu').contains(event.target))closeMessageMenu();if(!el('room-actions-menu').hidden && !el('room-actions-menu').contains(event.target) && !el('room-actions-toggle').contains(event.target))closeRoomActions();});
 window.addEventListener('resize',()=>{closeMessageMenu();closeRoomActions();renderComposer();});
 function clearImageDraft(){imageEpoch++;if(imageDraft?.url)URL.revokeObjectURL(imageDraft.url);imageDraft=null;imagePreparing=false;el('image-preview').removeAttribute('src');el('image-file').value='';if(el('image-send-dialog').open)el('image-send-dialog').close();}
+async function selectedImageType(file){
+  const bytes=new Uint8Array(await file.slice(0,12).arrayBuffer());
+  if([137,80,78,71,13,10,26,10].every((value,index)=>bytes[index]===value))return 'image/png';
+  if(bytes[0]===255 && bytes[1]===216 && bytes[2]===255)return 'image/jpeg';
+  if(bytes[0]===82 && bytes[1]===73 && bytes[2]===70 && bytes[3]===70 && bytes[8]===87 && bytes[9]===69 && bytes[10]===66 && bytes[11]===80)return 'image/webp';
+  return null;
+}
+async function decodeSelectedImage(file){
+  try{return await createImageBitmap(file);}catch{
+    // Some browsers cannot use the bitmap decoder for a locally selected image.
+    // This fallback still uses only a temporary local blob, never a remote URL.
+    const url=URL.createObjectURL(file),image=new Image();let timer;
+    try{
+      await new Promise((resolve,reject)=>{image.onload=resolve;image.onerror=reject;timer=setTimeout(()=>reject(new Error()),10000);image.src=url;});
+      return {width:image.naturalWidth,height:image.naturalHeight,image,close(){image.removeAttribute('src');URL.revokeObjectURL(url);}};
+    }catch(error){image.removeAttribute('src');URL.revokeObjectURL(url);throw error;}
+    finally{clearTimeout(timer);image.onload=null;image.onerror=null;}
+  }
+}
 async function prepareImage(file){
   if(!file || imagePreparing || pendingSend || uncertainPhoto || !imageContextReady())return;
-  clearImageDraft();const epoch=imageEpoch,key=selectedRoom,generation=readerGeneration;imagePreparing=true;renderComposer();let bitmap;
+  clearImageDraft();const epoch=imageEpoch,key=selectedRoom,generation=readerGeneration,jpegTransport=lastState?.photoTransport==='https-experimental';imagePreparing=true;renderComposer();let bitmap,step='input-size';
   try{
-    if(!['image/jpeg','image/png','image/webp'].includes(file.type) || file.size>20*1024*1024 || !file.size)throw new Error();
-    bitmap=await createImageBitmap(file);if(epoch!==imageEpoch || !imageContextReady(key,generation))return;if(bitmap.width*bitmap.height>40000000)throw new Error();
-    const scale=Math.min(1,4096/Math.max(bitmap.width,bitmap.height)),canvas=document.createElement('canvas');canvas.width=Math.max(1,Math.round(bitmap.width*scale));canvas.height=Math.max(1,Math.round(bitmap.height*scale));canvas.getContext('2d').drawImage(bitmap,0,0,canvas.width,canvas.height);
-    const mime=file.type==='image/jpeg'?'image/jpeg':'image/png';const blob=await new Promise(resolve=>canvas.toBlob(resolve,mime,.9));
+    if(file.size>20*1024*1024 || !file.size)throw new Error();
+    step='format';const inputMime=await selectedImageType(file);if(!inputMime)throw new Error();
     if(epoch!==imageEpoch || !imageContextReady(key,generation))return;
-    if(!blob || blob.size>10*1024*1024)throw new Error();
+    step='decode';bitmap=await decodeSelectedImage(new Blob([file],{type:inputMime}));if(epoch!==imageEpoch || !imageContextReady(key,generation))return;
+    step='pixels';if(bitmap.width*bitmap.height>40000000)throw new Error();
+    step='canvas';
+    const mime=jpegTransport || inputMime==='image/jpeg'?'image/jpeg':'image/png';
+    const scale=Math.min(1,4096/Math.max(bitmap.width,bitmap.height)),canvas=document.createElement('canvas');canvas.width=Math.max(1,Math.round(bitmap.width*scale));canvas.height=Math.max(1,Math.round(bitmap.height*scale));
+    const context=canvas.getContext('2d');if(mime==='image/jpeg'){context.fillStyle='#fff';context.fillRect(0,0,canvas.width,canvas.height);}context.drawImage(bitmap.image || bitmap,0,0,canvas.width,canvas.height);
+    step='encode';
+    let blob;const qualities=jpegTransport?[.9,.8,.7]:[.9];
+    for(const quality of qualities){
+      blob=await new Promise(resolve=>canvas.toBlob(resolve,mime,quality));
+      if(epoch!==imageEpoch || !imageContextReady(key,generation))return;
+      if(!blob || blob.type!==mime)throw new Error();
+      if(blob.size<=10*1024*1024)break;
+    }
+    step='output-size';if(blob.size>10*1024*1024)throw new Error();
+    step='read';
     const image=await new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(reader.result.split(',')[1]);reader.onerror=reject;reader.readAsDataURL(blob);});
     if(epoch!==imageEpoch || !imageContextReady(key,generation))return;
-    imageDraft={room:key,generation,image,url:URL.createObjectURL(blob)};el('image-preview').src=imageDraft.url;el('image-recipient').textContent=(roomNow()?.title || '선택한 대화방')+'에 보냅니다.';el('image-send-dialog').showModal();
-  }catch{if(epoch===imageEpoch && hasAccount){sendNotes.set(key,'사진을 준비하지 못했습니다. JPEG·PNG·WebP 20MiB 이하 파일을 선택해 주세요. 변환 후에는 10MiB 이하만 보낼 수 있습니다.');}}
+    step='preview';
+    imageDraft={room:key,generation,image,mime,bytes:blob.size,url:URL.createObjectURL(blob)};el('image-preview').src=imageDraft.url;el('image-recipient').textContent=(roomNow()?.title || '선택한 대화방')+'에 보냅니다.';
+    el('image-format-note').textContent=jpegTransport?'JPEG로 변환해 보냅니다. 투명한 부분은 흰색 배경으로 바뀌며, 큰 사진은 화질을 조정합니다.':'';el('image-format-note').hidden=!jpegTransport;el('image-send-dialog').showModal();
+  }catch{if(epoch===imageEpoch && hasAccount){
+    const messages={format:'파일 형식을 확인하지 못했습니다. JPEG·PNG·WebP 파일을 선택해 주세요.',
+      'input-size':'원본 사진은 0바이트보다 크고 20MiB 이하여야 합니다.',decode:'브라우저가 사진을 해독하지 못했습니다.',
+      pixels:'사진은 4천만 픽셀 이하여야 합니다.',canvas:'브라우저가 사진을 그리지 못했습니다.',
+      encode:'브라우저가 사진을 변환하지 못했습니다.','output-size':'변환한 사진이 10MiB를 넘습니다. 해상도나 용량을 줄여 주세요.',
+      read:'변환한 사진을 읽지 못했습니다.',preview:'사진 미리보기를 열지 못했습니다.'};
+    // Do not leave a sendable draft behind if opening its preview failed.
+    if(imageDraft){clearImageDraft();renderComposer();}
+    sendNotes.set(key,(messages[step] || '사진을 준비하지 못했습니다.')+' ['+step+']');
+    renderComposer();
+  }}
   finally{bitmap?.close();if(epoch===imageEpoch){imagePreparing=false;if(!imageDraft)el('image-file').value='';renderComposer();}}
 }
 el('attach-image').addEventListener('click',()=>{

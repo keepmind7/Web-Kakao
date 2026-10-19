@@ -3,12 +3,15 @@ import { createReaderStore,logArray,serverId,compareReadPosition } from './reade
 import { responseStatus } from './reader-response.mjs';
 import { decodeImage,messageKeyValid } from './message-content.mjs';
 import { uploadPhoto } from './media-upload.mjs';
+import { uploadPhotoHttps } from './media-upload-https.mjs';
 import { PROFILE } from './kakao-auth.mjs';
 
 export const allowedReaderMethod = (method,{messaging=false}={}) => ['GETCONF','CHECKIN','LOGINLIST','SYNCMSG','MCHATLOGS','PING','CHATINFO'].includes(method)
   || messaging===true && ['WRITE','CHATONROOM','NOTIREAD','SHIP','SYNCLINK','INFOLINK','MEMBER'].includes(method);
 
 export function createReaderSession(credential,factory,emit) {
+  const photoTransport=factory.photoTransport ?? 'loco';
+  if(!['loco','https-experimental'].includes(photoTransport))throw new Error('invalid_photo_transport');
   let carriage,store,closed=false,busy=false,resolveStop,pingTimer=null,pingPending=false,pingMisses=0;
   const cursors=new Map();
   const gapProbes=new Map();
@@ -313,7 +316,7 @@ export function createReaderSession(credential,factory,emit) {
       if(action==='send' && (typeof payload.text!=='string' || !payload.text.trim() || [...payload.text].length>4000))return false;
       const extra=action==='send' && payload.replyTo!==undefined?messageKeyValid(payload.replyTo) && store.replyForMessage(key,payload.replyTo):null;
       if(action==='send' && payload.replyTo!==undefined && !extra)return false;
-      const image=action==='photo'?decodeImage(payload.image):null;if(action==='photo' && (!image || typeof factory.media!=='function'))return false;
+      const image=action==='photo'?decodeImage(payload.image):null;if(action==='photo' && (!image || photoTransport==='loco' && typeof factory.media!=='function'))return false;
       const readTarget=action==='read'?store.readTargetForMessage(key,payload.message):null;
       const watermark=readTarget?.logId;
       if(action==='read' && !watermark)return false;
@@ -325,7 +328,7 @@ export function createReaderSession(credential,factory,emit) {
       const result=(phase,status=null,messageKey,reason,diagnosticReason)=>{
         if(phase==='failed' && !writeAttempted)trace('blocked',{phase,status,reason:reason ?? diagnosticReason ?? 'permission_changed'});
         trace('result',{phase,status,...(reason || diagnosticReason?{reason:reason ?? diagnosticReason}:{})});
-        emit({type:'reader-action',key,requestId,action,phase,status,entryPhase:entryReady(key)?'acknowledged':'failed',...(action==='context'?{receiptPhase:entryReady(key)?entries.get(key).receiptReady?'ready':'unavailable':'idle'}:{}),...(messageKey?{messageKey}:{}),...(reason==='open_member_unverified'?{reason}:{})});
+        emit({type:'reader-action',key,requestId,action,phase,status,entryPhase:entryReady(key)?'acknowledged':'failed',...(action==='context'?{receiptPhase:entryReady(key)?entries.get(key).receiptReady?'ready':'unavailable':'idle'}:{}),...(messageKey?{messageKey}:{}),...(['open_member_unverified','photo_jpeg_required'].includes(reason)?{reason}:{})});
       };
       trace('start');
       try{
@@ -352,12 +355,17 @@ export function createReaderSession(credential,factory,emit) {
           activePhoto={key,controller};
           const isCurrent=()=>!closed && activeRoom===key && selectionVersion===selection && store.receiptVersion(key)===version && store.canAction(key,'photo') && (!readOnSend || store.canAction(key,'read')) && (!requiresEntry || entryReady(key));
           let outcome;
-          try{outcome=await uploadPhoto({carriage,createClient:factory.media,toLong:factory.toLong,chatId:store.serverRoomId(key),userId:credential.userId,messageId:String(++nextMessageId),data:image.data,signal:AbortSignal.any([uploadAbort.signal,controller.signal]),isCurrent,readOnSend,resolve:factory.resolveUpload,profile:PROFILE,observe:factory.observeUpload});}
+          try{
+            const options={carriage,toLong:factory.toLong,chatId:store.serverRoomId(key),userId:credential.userId,messageId:String(++nextMessageId),data:image.data,signal:AbortSignal.any([uploadAbort.signal,controller.signal]),isCurrent,readOnSend,observe:factory.observeUpload};
+            outcome=photoTransport==='https-experimental'
+              ?await uploadPhotoHttps({...options,timeout:bound(20000),resolve:factory.resolveHttpsUpload,request:factory.requestHttpsUpload})
+              :await uploadPhoto({...options,createClient:factory.media,resolve:factory.resolveUpload,profile:PROFILE});
+          }
           finally{if(activePhoto?.controller===controller)activePhoto=null;}
           if(closed)return false;
           let update=null;
-          if(outcome.phase==='accepted' && outcome.chatLog){update=store.writeAccepted(key,outcome.completeBody ?? {chatLog:outcome.chatLog},'[사진]',{type:2});if(update)publish(update,'sent');}
-          result(outcome.phase==='accepted' && !update?'unknown':outcome.phase,outcome.status,update?.messageKey);
+          if(outcome.phase==='accepted' && outcome.chatLog){update=store.writeAccepted(key,outcome.completeBody ?? {chatLog:outcome.chatLog},'[사진]',{type:2,...(outcome.attachment?{attachment:outcome.attachment}:{})});if(update)publish(update,'sent');}
+          result(outcome.phase==='accepted' && !update?'unknown':outcome.phase,outcome.status,update?.messageKey,outcome.reason);
           return true;
         }
         const expectedMessageId=action==='send'?++nextMessageId:null;

@@ -1,5 +1,5 @@
 import { createHmac,randomBytes,timingSafeEqual } from 'node:crypto';
-export const localControlFields=['build','preferences','gapProbe','messaging','outboxRecovery','viewPin','mode','phase','stage','httpStatus','apiStatus','qrIssued','credentialInMemory','actualChatConnected','chatConnectionActive','actualMessageSent','canStart','canProbe','attempts','sessionBlocked'];
+export const localControlFields=['build','preferences','gapProbe','messaging','photoTransport','outboxRecovery','viewPin','mode','phase','stage','httpStatus','apiStatus','qrIssued','credentialInMemory','actualChatConnected','chatConnectionActive','actualMessageSent','canStart','canProbe','attempts','sessionBlocked'];
 export function localControlStatus(snapshot){return Object.fromEntries(localControlFields.filter(key=>Object.hasOwn(snapshot,key)).map(key=>[key,snapshot[key]]));}
 export function createLocalAccess({controlToken=randomBytes(32).toString('hex'),now=Date.now}={}) {
   if(typeof controlToken!=='string' || !/^[a-f0-9]{64}$/.test(controlToken))throw new Error('invalid_local_control');
