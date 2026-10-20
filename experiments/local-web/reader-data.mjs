@@ -163,7 +163,7 @@ export function createReaderStore(body, ownUserId, salt=randomBytes(32),settings
     return key;
   }
   for(const row of rows.slice(0,ROOM_LIMIT))addRoom(row);
-  function merge(key,logs,requireRoomId=false) {
+  function merge(key,logs,requireRoomId=false,{preserveAck=false}={}) {
     const room=rooms.get(key);if(!room)return null;
     const messages=cache.get(key) ?? new Map();
     cache.delete(key);cache.set(key,messages);
@@ -193,7 +193,14 @@ export function createReaderStore(body, ownUserId, salt=randomBytes(32),settings
       // source log; view() shows the cached original or an unverified label.
       const quote=attachment && typeof attachment.src_message==='string'?{text:marks(clean(attachment.src_message,4000)),logId:quoteLogId(log.attachment,attachment)}:null;
       const target={id,authorId:sender,type,text:text(log)};
-      messages.set(id,{key:opaque('m_',room.serverRoomId+':'+id),text:text(log),photos:photoAttachments(log),authorId:sender,name,mine,quote,canReply:Boolean(replyExtra(target)),replyTarget:target,at:timestamp(log.sendAt ?? log.createdAt ?? log.created_at)});
+      const previous=messages.get(id),photos=photoAttachments(log),at=timestamp(log.sendAt ?? log.createdAt ?? log.created_at);
+      // Only an already identity-checked own ACK is additive. Ordinary MSG and
+      // history replacements retain their existing explicit-change semantics.
+      const compatible=preserveAck && previous?.authorId===ownUserId && sender===ownUserId && previous.verifiedType===type;
+      const photoData=attachmentObject(log.attachment),hasPhotoFields=photoData && ['url','thumbnailUrl','imageUrls','thumbnailUrls'].some(field=>Object.hasOwn(photoData,field));
+      const hasTime=['sendAt','createdAt','created_at'].some(field=>log[field]!==undefined);
+      const verifiedType=['type','msgType','t'].some(field=>log[field]!==undefined)?type:undefined;
+      messages.set(id,{key:opaque('m_',room.serverRoomId+':'+id),text:text(log),photos:compatible && !hasPhotoFields && !photos.length?previous.photos:photos,authorId:sender,name,mine,quote,verifiedType,canReply:Boolean(replyExtra(target)),replyTarget:target,at:compatible && !hasTime?previous.at:at});
     }
     const ordered=[...messages.keys()].sort((a,b)=>BigInt(a)<BigInt(b)?-1:BigInt(a)>BigInt(b)?1:0);
     for(const id of ordered.slice(0,Math.max(0,ordered.length-MESSAGE_LIMIT)))messages.delete(id);
@@ -214,7 +221,7 @@ export function createReaderStore(body, ownUserId, salt=randomBytes(32),settings
       }
       const original=item.quote?.logId?messages.get(item.quote.logId):null;
       const reply=item.quote?original?{text:original.text,sender:senderOf(original),verified:true}:{text:item.quote.text,sender:'원본 확인 불가',verified:false}:null;
-      const {replyTarget,authorId,name,quote,...publicItem}=item;return {...publicItem,sender:senderOf(item),reply,unreadCount};
+      const {replyTarget,authorId,name,quote,verifiedType,...publicItem}=item;return {...publicItem,sender:senderOf(item),reply,unreadCount};
     }),latestVisible:Boolean(room.historyEnd && messages.has(room.historyEnd))};
   }
   function watermark(value){
@@ -343,9 +350,9 @@ export function createReaderStore(body, ownUserId, salt=randomBytes(32),settings
       room.ownMember={userId:ownUserId,role:member.mt,token:member.opt ?? -1};room.contextVerified=true;return true;
     },
     linkSyncSnapshot:()=>new Map([...rooms.values()].map(room=>[room.key,room.receiptVersion])),
-    missingOpenLinkIds(limit=16){
+    missingOpenLinkIds(limit=16,keys){
       const bounded=Number.isFinite(limit)?Math.min(16,Math.max(0,Math.floor(limit))):0,ids=new Set();
-      for(const room of rooms.values())if(ids.size<bounded && openKinds.has(room.kind) && !room.left && room.link===null){const id=signedLinkId(room.linkId);if(id)ids.add(id);}
+      for(const room of rooms.values())if(ids.size<bounded && (!keys || keys.includes(room.key)) && openKinds.has(room.kind) && !room.left && room.link===null){const id=signedLinkId(room.linkId);if(id)ids.add(id);}
       return [...ids];
     },
     syncLinks(response,versions){
@@ -479,7 +486,7 @@ export function createReaderStore(body, ownUserId, salt=randomBytes(32),settings
       const types=sources.flatMap(row=>fieldsOf(row,['type','msgType','t']));
       const logs=sources.flatMap(row=>fieldsOf(row,['logId']));
       if(logs.some(value=>serverId(value)!==id) || authors.some(value=>serverId(value)!==ownUserId) || types.some(value=>!Number.isInteger(value) || value!==type))return null;
-      const update=this.push({chatId:room.serverRoomId,chatLog:{...original,chatId:room.serverRoomId,logId:id,authorId:ownUserId,type,msg:message,attachment:original?.attachment ?? attachment,sendAt:original?.sendAt ?? body?.sendAt}})[0];
+      const update=this.push({chatId:room.serverRoomId,chatLog:{...original,chatId:room.serverRoomId,logId:id,authorId:ownUserId,type,msg:message,attachment:original?.attachment ?? attachment,sendAt:original?.sendAt ?? body?.sendAt}},{preserveAck:true})[0];
       return update?{...update,messageKey:opaque('m_',room.serverRoomId+':'+id)}:null;
     },
     seedAtEnd:key=>Boolean(rooms.get(key)?.seed?.logId && rooms.get(key).seed.logId===rooms.get(key).historyEnd),
@@ -497,7 +504,7 @@ export function createReaderStore(body, ownUserId, salt=randomBytes(32),settings
       const logs=logArray(response);
       return {key,...merge(key,logs ?? [],requireRoomId),fieldPresent:Array.isArray(logs),receivedCount:logs?.length ?? 0};
     },
-    push(body) {
+    push(body,{preserveAck=false}={}) {
       const logs=logArray(body) ?? (object(body) && serverId(body.logId) ? [body] : []);
       const updates=new Map(),nickname=logs.length===1 && object(body?.chatLog)?body.authorNickname:undefined; // Pinned msg.ts: MSG top-level authorNickname.
       for(const log of logs.slice(0,200)) {
@@ -511,7 +518,7 @@ export function createReaderStore(body, ownUserId, salt=randomBytes(32),settings
         const sender=serverId(log.authorId ?? log.senderId ?? log.userId ?? log.writerId ?? log.sender?.userId);
         if(nickname!==undefined)learn(room,sender,nickname);
         if(logId && (!room.historyEnd || BigInt(logId)>BigInt(room.historyEnd)))room.historyEnd=logId;
-        const merged=merge(key,[log]);if(!merged?.acceptedCount)continue;
+        const merged=merge(key,[log],false,{preserveAck});if(!merged?.acceptedCount)continue;
         const at=timestamp(log.sendAt ?? log.createdAt);
         if(at && (!room.lastAt || at>=room.lastAt)){room.lastAt=at;room.preview=text(log).slice(0,160);}
         const kind=Number(log.type ?? log.msgType ?? log.t ?? 1);

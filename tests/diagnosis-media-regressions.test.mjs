@@ -1,0 +1,28 @@
+// D6 actual LOCO uploader with synthetic transport/DNS and controlled time only.
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {EventEmitter} from 'node:events';
+import {uploadPhoto} from '../experiments/local-web/media-upload.mjs';
+const png=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=','base64');
+const deferred=()=>{let resolve;const promise=new Promise(done=>{resolve=done;});return {promise,resolve};};
+const flush=async()=>{for(let n=0;n<70;n++)await Promise.resolve();};
+function fixture({hold,timeout=20,rejectShip=false,rejectPost=false}={}){
+  const gates=Object.fromEntries(['ship','dns','connect','post','write'].map(k=>[k,deferred()])),calls=[],events=[],controller=new AbortController();let created=0,disconnects=0,outcome=null;
+  const media=Object.assign(new EventEmitter(),{async connect(_address,_port,ms){calls.push({method:'connect',timeout:ms});if(hold==='connect')await gates.connect.promise;},async request(method,_body,ms){calls.push({method,timeout:ms});if(hold==='post')await gates.post.promise;return {status:rejectPost?-203:0,body:{o:0}};},async writeEncrypted(){calls.push({method:'file'});if(hold==='write')await gates.write.promise;this.emit('push',{method:'COMPLETE',status:0,body:{chatId:'123',chatLog:{logId:'42',chatId:'123',authorId:'999',type:2,msgId:'345'}}});},disconnect(){disconnects++;}});
+  const options={carriage:{async request(method,_body,ms){calls.push({method,timeout:ms});if(hold==='ship')await gates.ship.promise;return {status:rejectShip?-203:0,body:{k:'SYNTHETIC_UPLOAD_ROUTE',vh:'unused.invalid',p:443}};}},createClient(){created++;return media;},async resolve(){calls.push({method:'dns'});if(hold==='dns')await gates.dns.promise;return '192.0.2.1';},toLong:String,chatId:'123',userId:'999',messageId:'345',data:png,profile:{os:'android',appVersion:'26.1.2'},timeout,signal:controller.signal,observe:event=>events.push(event)};
+  return {options,calls,events,gates,controller,media,get outcome(){return outcome;},get created(){return created;},get disconnects(){return disconnects;},run(){const pending=uploadPhoto(options);pending.then(value=>{outcome=value;});return pending;},async dispose(pending){controller.abort();Object.values(gates).forEach(g=>g.resolve());await pending;}};
+}
+for(const hold of ['ship','dns','connect','post','write'])test('D6 shared lifetime ends a held '+hold+' wait with correct POST boundary and no late continuation',async t=>{
+  t.mock.timers.enable({apis:['setTimeout','Date']});const f=fixture({hold});let pending;try{pending=f.run();await flush();t.mock.timers.tick(10020);await flush();assert.equal(f.outcome?.phase,['post','write'].includes(hold)?'unknown':'failed');assert.equal(f.calls.filter(c=>c.method==='POST').length,['post','write'].includes(hold)?1:0);const count=f.calls.length;f.gates[hold].resolve();await flush();assert.equal(f.calls.length,count);assert.equal(f.events.filter(e=>e.stage==='deadline').length,1);if(['ship','dns'].includes(hold))assert.equal(f.created,0);else assert.equal(f.disconnects,1);}finally{await f.dispose(pending);t.mock.timers.reset();}
+});
+test('D6 SHIP and DNS elapsed time reduces connect/POST budget rather than resetting it',async t=>{
+  t.mock.timers.enable({apis:['setTimeout','Date']});const f=fixture({timeout:10000});const shipGate=deferred(),dnsGate=deferred(),connectGate=deferred(),postGate=deferred();let pending;
+  f.options.carriage.request=async(method,_body,ms)=>{f.calls.push({method,timeout:ms});await shipGate.promise;return {status:0,body:{k:'SYNTHETIC_ROUTE',vh:'unused.invalid',p:443}};};f.options.resolve=async()=>{f.calls.push({method:'dns'});await dnsGate.promise;return '192.0.2.1';};f.media.connect=async(_a,_p,ms)=>{f.calls.push({method:'connect',timeout:ms});await connectGate.promise;};f.media.request=async(method,_b,ms)=>{f.calls.push({method,timeout:ms});await postGate.promise;return {status:0,body:{o:0}};};
+  try{pending=f.run();await flush();t.mock.timers.tick(5000);shipGate.resolve();await flush();t.mock.timers.tick(6000);dnsGate.resolve();await flush();assert.ok(f.calls.find(c=>c.method==='connect').timeout<=9000);t.mock.timers.tick(2000);connectGate.resolve();await flush();assert.ok(f.calls.find(c=>c.method==='POST').timeout<=7000);t.mock.timers.tick(7000);await flush();assert.equal(f.outcome?.phase,'unknown');assert.equal(f.calls.filter(c=>c.method==='POST').length,1);}finally{shipGate.resolve();dnsGate.resolve();connectGate.resolve();postGate.resolve();await f.dispose(pending);t.mock.timers.reset();}
+});
+for(const stage of ['ship','dns','post'])test('D6 explicit abort during '+stage+' is local failure before POST and unknown after it',async()=>{
+  const f=fixture({hold:stage});const pending=f.run();try{await flush();f.controller.abort();assert.equal((await pending).phase,stage==='post'?'unknown':'failed');assert.equal(f.calls.filter(c=>c.method==='POST').length,stage==='post'?1:0);}finally{await f.dispose(pending);}
+});
+test('D6 normal completion and explicit SHIP/POST rejection retain existing behavior with no WRITE/retry',async()=>{
+  for(const options of [{},{rejectShip:true},{rejectPost:true}]){const f=fixture(options),pending=f.run();try{const result=await pending;assert.equal(result.phase,options.rejectShip||options.rejectPost?'failed':'accepted');assert.equal(f.calls.some(c=>c.method==='WRITE'),false);assert.equal(f.calls.filter(c=>c.method==='SHIP').length,1);assert.equal(f.calls.filter(c=>c.method==='POST').length,options.rejectShip?0:1);assert.equal(f.events.some(e=>e.stage==='deadline'),false);if(!options.rejectShip){assert.equal(f.disconnects,1);assert.equal(f.media.listenerCount('push'),0);}}finally{await f.dispose(pending);}}
+});

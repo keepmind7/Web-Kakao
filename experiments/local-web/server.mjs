@@ -38,6 +38,14 @@ export function createLocalServer({ transport, mode = 'mock', encode = encodeQr,
   const photos=createPhotoCache({fetcher:photoFetcher});
   const newReader=()=>readerFactory({gapProbe,messaging,photoTransport,preferenceStore,onBlocked:()=>{photos.clear();reader.close();lab.blockConnection();}});
   let reader=newReader();
+  // Shared worker view: accepted intent order, not an acknowledgment from Kakao.
+  // A page UUID has its own sequence space; the local session is shared by tabs.
+  let viewScope=null;
+  const currentViewScope=()=>{
+    const attempts=reader.snapshot().attempts;
+    if(!viewScope || viewScope.reader!==reader || viewScope.attempts!==attempts)viewScope={reader,attempts,issued:0,accepted:0,clients:new Map()};
+    return viewScope;
+  };
   const forgetAccount=()=>{try{reader.close();}finally{try{photos.clear();}finally{lab.cancel();}}};
   // Only internal cleanup may own onEmpty; options inject bounded clocks/timers for QA.
   const presence=createTabPresence({...presenceOptions,onEmpty:forgetAccount}),streams=new Map();
@@ -46,7 +54,7 @@ export function createLocalServer({ transport, mode = 'mock', encode = encodeQr,
     if(disposed)return;disposed=true;presence.close();
     try{for(const finish of streams.values())finish();}finally{forgetAccount();}
   };
-  const snapshot=()=>{const tabPresence=presence.snapshot(),auth=lab.snapshot(),reading=reader.snapshot();if(!auth.credentialInMemory)photos.clear();return {build:8,sessionPolicy:'tab-open',tabPresence,preferences:typeof reader.settingsSnapshot==='function',outboxRecovery:typeof reader.outbox==='function' && typeof reader.acknowledgeOutbox==='function',viewPin:typeof reader.view==='function',gapProbe:gapProbe===true,messaging:messaging===true,photoTransport,...auth,actualMessageSent:auth.actualMessageSent || mode==='live' && reading.sendAccepted>0,actualChatConnected:auth.actualChatConnected || Number.isFinite(reading.connectedAt),chatConnectionActive:reading.phase==='connected',reader:reading,canOpenReader:mode==='live' && !auth.sessionBlocked && auth.credentialInMemory && auth.phase==='authenticated' && reading.canConnect};};
+  const snapshot=()=>{const tabPresence=presence.snapshot(),auth=lab.snapshot(),reading=reader.snapshot();if(!auth.credentialInMemory)photos.clear();return {build:8,sessionPolicy:'tab-open',tabPresence,preferences:typeof reader.settingsSnapshot==='function',outboxRecovery:typeof reader.outbox==='function' && typeof reader.acknowledgeOutbox==='function',viewPin:typeof reader.view==='function',viewOrdering:true,gapProbe:gapProbe===true,messaging:messaging===true,photoTransport,...auth,actualMessageSent:auth.actualMessageSent || mode==='live' && reading.sendAccepted>0,actualChatConnected:auth.actualChatConnected || Number.isFinite(reading.connectedAt),chatConnectionActive:reading.phase==='connected',reader:reading,canOpenReader:mode==='live' && !auth.sessionBlocked && auth.credentialInMemory && auth.phase==='authenticated' && reading.canConnect};};
   const csrf = randomBytes(32).toString('hex');
   const withPhotoCapabilities=page=>Array.isArray(page?.messages)?{...page,messages:page.messages.map(message=>Array.isArray(message?.photos)?{...message,photos:message.photos.map(photo=>{const match=typeof photo?.src==='string' && /^\/api\/photo\?room=(r_[a-f0-9]{24})&message=(m_[a-f0-9]{24})&index=([0-9]|[12][0-9])$/.exec(photo.src);return match?{...photo,src:photo.src+'&cap='+access.photoCapability(match[1],match[2],match[3])}:photo;})}:message)}:page;
   let origin,receivingImage=false;
@@ -116,6 +124,9 @@ export function createLocalServer({ transport, mode = 'mock', encode = encodeQr,
     if (req.headers.origin !== origin || !(localSession || controlled && (controlPath || localLaunch)) && (typeof provided !== 'string' || !/^[a-f0-9]{64}$/.test(provided) || !timingSafeEqual(Buffer.from(provided), Buffer.from(csrf)))) return reply(403, { error: 'same_origin_required' });
     if (!/^application\/json(?:;|$)/i.test(req.headers['content-type'] ?? '')) return reply(415, { error: 'json_required' });
     if(accountPath && !readerScopeMatches())return reply(409,{error:'reader_scope_changed'});
+    // Capture authenticated arrival before awaiting a potentially slow body.
+    // Reconnects reuse instanceId, so both reader ownership and attempt matter.
+    const viewRequest=req.url==='/api/reader/view'?{scope:currentViewScope(),order:++viewScope.issued}:null;
     const imageRequest=req.url==='/api/reader/photo';
     if(imageRequest && (!messaging || !lab.snapshot().credentialInMemory || receivingImage))return reply(409,{error:'action_not_ready'});
     if(imageRequest)receivingImage=true;
@@ -134,7 +145,10 @@ export function createLocalServer({ transport, mode = 'mock', encode = encodeQr,
         const session=Object.keys(body).join(',')==='ticket'?access.exchange(body.ticket):null;
         return session?reply(200,{accepted:true,session}):reply(403,{error:'launch_ticket_required'});
       }
-      if(['/api/reader/history','/api/reader/context','/api/reader/view'].includes(req.url)){
+      if(req.url==='/api/reader/view'){
+        const fields=Object.keys(body).sort().join(',');
+        if(!roomKeyValid(body.room) || fields!=='room' && (fields!=='room,viewClientId,viewSequence' || !clientIdValid(body.viewClientId) || !Number.isSafeInteger(body.viewSequence) || body.viewSequence<1))return reply(400,{error:'invalid_view'});
+      }else if(['/api/reader/history','/api/reader/context'].includes(req.url)){
         if(Object.keys(body).length!==1 || !roomKeyValid(body.room))return reply(400,{error:'room_required'});
       }else if(req.url==='/api/reader/outbox/ack'){
         if(Object.keys(body).join(',')!=='clientId' || !clientIdValid(body.clientId))return reply(400,{error:'invalid_client_id'});
@@ -196,7 +210,19 @@ export function createLocalServer({ transport, mode = 'mock', encode = encodeQr,
     }
     if(['/api/reader/view','/api/reader/outbox/ack'].includes(req.url)){
       if(!lab.snapshot().credentialInMemory)return reply(409,{error:'authentication_required'});
+      if(viewRequest){
+        const scope=currentViewScope(),client=body.viewClientId;
+        if(scope!==viewRequest.scope)return reply(409,{error:'reader_scope_changed'});
+        if(viewRequest.order<scope.accepted || client && (scope.clients.get(client) ?? 0)>=body.viewSequence)return reply(409,{error:'stale_view'});
+        // Fail closed instead of discarding sequence watermarks and permitting
+        // a delayed old page to reclaim the view. Reset on a new connection.
+        if(client && !scope.clients.has(client) && scope.clients.size>=128)return reply(409,{error:'view_client_limit'});
+      }
       const accepted=req.url==='/api/reader/view'?reader.view?.(body.room):reader.acknowledgeOutbox?.(body.clientId);
+      if(accepted && viewRequest){
+        viewRequest.scope.accepted=viewRequest.order;
+        if(body.viewClientId)viewRequest.scope.clients.set(body.viewClientId,body.viewSequence);
+      }
       return accepted?reply(202,{accepted:true}):reply(409,{error:'action_not_ready'});
     }
     if(['/api/preferences','/api/preferences/forget','/api/notifications/claim'].includes(req.url)){

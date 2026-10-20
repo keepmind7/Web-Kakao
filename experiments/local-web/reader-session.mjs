@@ -18,6 +18,7 @@ export function createReaderSession(credential,factory,emit) {
   const readProbed=new Set();
   const entries=new Map();let activeRoom=null,selectionVersion=0;
   const discoveryQueue=new Map(),discoveryAttempts=new Map();let discoveryPromise=null,discoveryInFlight=null,discoverTimer=null;
+  const linkRepairs=new Map();let activeLinkRepair=null;
   const now=factory.now ?? (()=>performance.now());
   let titleQueue=[],titlePromise=null,titleChanged=false,aliveAt=-Infinity;
   const memberLookups=new Set();
@@ -37,11 +38,12 @@ export function createReaderSession(credential,factory,emit) {
   };
   const stopped=new Promise(resolve=>{resolveStop=resolve;});
   const close=()=>{
-    if(closed)return;closed=true;uploadAbort.abort();
+    if(closed)return;closed=true;uploadAbort.abort();activeLinkRepair?.controller.abort();linkRepairs.clear();
     clearInterval(pingTimer);clearTimeout(discoverTimer);carriage?.stopPing();carriage?.disconnect();store?.clear();cursors.clear();memberLookups.clear();gapProbes.clear();readProbed.clear();entries.clear();activeRoom=null;discoveryQueue.clear();discoveryAttempts.clear();titleQueue=[];resolveStop();
   };
   function activate(key){
     if(activeRoom===key)return;
+    activeLinkRepair?.controller.abort();
     const previous=activeRoom;activeRoom=key;selectionVersion++;entries.clear();store?.pin(key); // The active room is never display-LRU evicted.
     if(previous)invalidatePhoto(previous);
     if(previous && store?.has(previous))publish({...store.current(previous),entryInvalidated:true},'receipt');
@@ -85,13 +87,53 @@ export function createReaderSession(credential,factory,emit) {
       }catch{/* Optional lookup expiry/refusal leaves the current labels. */}
     }
   }
+  const needsLinkRepair=key=>factory.messaging===true && store?.has(key) && store.isOpen(key) && store.missingOpenLinkIds(1,[key]).length>0;
+  const eligibleLinkRepair=()=>[...linkRepairs].find(([key,attempt])=>attempt.ready && !attempt.terminal && attempt.count<3 && now()>=attempt.retryAt && needsLinkRepair(key));
+  // A discovered CHATINFO room is existing membership, not permission to JOIN
+  // or send. Enrich only that room; explicit entry still verifies our member.
+  async function repairLink(key){
+    const attempt=linkRepairs.get(key);if(!attempt || attempt.count>=3 || !needsLinkRepair(key))return;
+    attempt.ready=false;attempt.count++;
+    const controller=new AbortController(),selection=selectionVersion,id=store.linkId(key),deadline=now()+6500;
+    let version=store.receiptVersion(key);activeLinkRepair={key,controller};
+    const current=()=>!closed && !controller.signal.aborted && selectionVersion===selection && store?.has(key) && store.receiptVersion(key)===version && store.linkId(key)===id && needsLinkRepair(key);
+    const wait=operation=>new Promise((resolve,reject)=>{
+      let done=false;
+      const finish=(fn,value)=>{if(done)return;done=true;controller.signal.removeEventListener('abort',abort);fn(value);};
+      const abort=()=>finish(reject,new Error('link_metadata_cancelled'));
+      controller.signal.addEventListener('abort',abort,{once:true});
+      try{if(!current())throw new Error('link_metadata_stale');Promise.resolve(operation()).then(value=>finish(resolve,value),error=>finish(reject,error));}catch(error){finish(reject,error);}
+    });
+    const request=(method,body,max)=>{const remaining=deadline-now();if(remaining<=0 || !current())throw new Error('link_metadata_stale');return wait(()=>carriage.request(method,body,Math.max(1,Math.min(max,remaining)),{optional:true}));};
+    const timer=setTimeout(()=>controller.abort(),6500);timer.unref?.();
+    try{
+      try{
+        const response=await request('SYNCLINK',{ltk:0},4000);
+        if(current() && responseStatus(response)===0 && (response.method===undefined || response.method==='SYNCLINK')){
+          store.syncLinks(response.body,new Map([[key,version]]));version=store.receiptVersion(key);
+        }
+      }catch{/* A bounded optional refusal can use the existing-link fallback. */}
+      if(current()){
+        const versions=new Map([[key,version]]);
+        try{
+          const response=await request('INFOLINK',{lis:[factory.toLong(id)]},2500);
+          if(current() && responseStatus(response)===0 && (response.method===undefined || response.method==='INFOLINK'))store.infoLinks(response.body,[id],versions);
+        }catch{/* Leave unavailable metadata disabled; never infer membership. */}
+      }
+    }finally{
+      clearTimeout(timer);if(activeLinkRepair?.controller===controller)activeLinkRepair=null;
+      if(!closed){attempt.ready=false;attempt.terminal=attempt.count>=3 || !needsLinkRepair(key);attempt.retryAt=now()+3000;emit({type:'reader-rooms',rooms:store.rooms(),stats:store.stats(),source:'push'});}
+    }
+  }
   function scheduleDiscovery(){
     clearTimeout(discoverTimer);
-    if(closed || busy || discoveryPromise || titlePromise || !eligibleDiscovery() && !titleQueue.length)return;
+    if(closed || busy || discoveryPromise || titlePromise || !eligibleDiscovery() && !eligibleLinkRepair() && !titleQueue.length)return;
     discoverTimer=setTimeout(()=>{
       if(closed || busy || discoveryPromise || titlePromise)return;
       const next=eligibleDiscovery();
       if(!next){
+        const link=eligibleLinkRepair();
+        if(link){discoveryPromise=repairLink(link[0]).finally(()=>{discoveryPromise=null;scheduleDiscovery();});return;}
         const key=titleQueue.shift();if(!key)return;
         titlePromise=Promise.resolve().then(async()=>{
           if(closed)return;
@@ -122,6 +164,10 @@ export function createReaderSession(credential,factory,emit) {
           const key=store.discover(id,response.body);if(!key)return;
           // Publish the vetted room before any messages referencing its handle.
           publish(null,'push');
+          if(needsLinkRepair(key) && linkRepairs.size<500){
+            linkRepairs.set(key,{count:0,retryAt:0,ready:true,terminal:false});
+            await repairLink(key);if(closed)return;
+          }
           for(const packet of packets)for(const update of store.push(packet))publish(packets.partial?{...update,partial:true}:update,'push');
           if(packets.partial && !packets.length)publish({...store.current(key),partial:true},'push');
         }catch(error){
@@ -155,10 +201,10 @@ export function createReaderSession(credential,factory,emit) {
                 const update=store.readUpdate(packet.body);if(update)publish(update,'receipt');return;
               }
               if(factory.messaging===true && ['NEWMEM','LEFT'].includes(packet?.method)){
-                const update=store.invalidateReceipts(packet.body,{left:packet.method==='LEFT'});if(update){entries.delete(update.key);invalidatePhoto(update.key);publish(update,'receipt');}return;
+                const update=store.invalidateReceipts(packet.body,{left:packet.method==='LEFT'});if(update){if(activeLinkRepair?.key===update.key)activeLinkRepair.controller.abort();entries.delete(update.key);invalidatePhoto(update.key);publish(update,'receipt');}return;
               }
               if(factory.messaging===true && ['SYNCLINKCR','SYNCLINKDL','SYNCLINKPF','SYNCMEMT','LINKKICKED','LNKDELETED'].includes(packet?.method)){
-                for(const update of store.linkUpdate(packet.method,packet.body)){entries.delete(update.key);invalidatePhoto(update.key);publish(update,'receipt');}return;
+                for(const update of store.linkUpdate(packet.method,packet.body)){if(activeLinkRepair?.key===update.key)activeLinkRepair.controller.abort();entries.delete(update.key);invalidatePhoto(update.key);publish(update,'receipt');}return;
               }
               if(!['MSG','SYNCJOIN'].includes(packet?.method))return;
               for(const id of store.unknownRooms(packet.body)){
@@ -190,8 +236,10 @@ export function createReaderSession(credential,factory,emit) {
               }
               scheduleDiscovery();
               const updates=store.push(packet.body);
+              for(const update of updates){const attempt=linkRepairs.get(update.key);if(attempt && !attempt.terminal && attempt.count<3 && now()>=attempt.retryAt && needsLinkRepair(update.key))attempt.ready=true;}
               for(const update of updates)emit({type:'reader-messages',...update,source:'push'});
               if(updates.length)emit({type:'reader-rooms',rooms:store.rooms(),stats:store.stats(),source:'push'});
+              scheduleDiscovery();
             } catch { fail('decode'); }
           };
           carriage.on('push',onPush);
@@ -234,9 +282,10 @@ export function createReaderSession(credential,factory,emit) {
     view(key){if(closed || !store?.has(key))return false;activate(key);return true;},
     async history(key,requestId) {
       const started=now(),remaining=()=>18000-(now()-started);
+      const selection=selectionVersion;
       if(titlePromise)await titlePromise;
       if(discoveryPromise)await discoveryPromise;
-      if(closed || !store || !carriage || busy || !store.has(key))return false;
+      if(closed || !store || !carriage || busy || !store.has(key) || selectionVersion!==selection)return false;
       activate(key);
       // A zero max was rejected by the actual server. Use only a bound already
       // supplied by LOGINLIST/MSG; do not guess an ID or issue another command.
@@ -305,8 +354,12 @@ export function createReaderSession(credential,factory,emit) {
     },
     async action(key,requestId,action,payload={}){
       const started=Date.now(),bound=max=>{const remaining=22500-(Date.now()-started);if(remaining<=0)throw new Error('action_deadline');return Math.min(max,remaining);};
+      const selection=selectionVersion;
       if(titlePromise)await titlePromise;
       if(discoveryPromise)await discoveryPromise;
+      // Context/read/photo belong to the selected view, including time spent
+      // waiting for metadata. Explicit text sends retain their distinct intent.
+      if(['context','read','photo'].includes(action) && selectionVersion!==selection)return false;
       if(factory.messaging!==true || closed || busy || !store?.has(key))return false;
       if(!['send','photo','context','read'].includes(action))return false;
       const capability=action==='send' && payload.replyTo!==undefined?'reply':action;

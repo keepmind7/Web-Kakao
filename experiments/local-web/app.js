@@ -3,8 +3,9 @@ const el = id => document.getElementById(id);
 const isHttpsPhotoTransport=value=>value==='https' || value==='https-experimental';
 let csrf = null, busy = false, expiresAt = null;
 let refreshing=false,hasAccount=false,readerGeneration=0,readerRevision=-1,selectedRoom=null,roomsCache=[],lastState=null,actionEpoch=0,readerAttempt=null;
-let pendingSelection=null,reconnectRoom=null,readerInstance=null;
+let pendingSelection=null,selectionView=null,reconnectRoom=null,readerInstance=null;
 let roomsRevision=-1,outboxRevision=-1,outboxEpoch=0,viewPin=null,viewPinEpoch=0,outboxAcknowledging=false,acknowledgingClientId=null;
+const viewClientId=crypto.randomUUID();let viewSequence=0,viewPinPending=null;
 let localAuthorizationRequired=false,foregroundFocused=document.hasFocus();
 // Port-scoped session from the launch ticket exchange; sessionStorage only survives reload in this tab.
 let localSession=null;try{const saved=sessionStorage.getItem('webKakaoLocalSession');if(/^[a-f0-9]{64}$/.test(saved ?? ''))localSession=saved;}catch{}
@@ -28,7 +29,7 @@ function requestStamp(){return {generation:readerGeneration,action:actionEpoch,r
 function stampCurrent(stamp){return stamp.generation===readerGeneration && stamp.action===actionEpoch && stamp.resume===resumeEpoch;}
 function staleResult(){const error=new Error('Stale local response');error.name='StaleLocalResult';return error;}
 function unavailable(){localFailureVersion++;freshness='unavailable';readerRevision=-1;renderComposer();}
-function invalidateViewPin(){viewPin=null;viewPinEpoch++;}
+function invalidateViewPin(){viewPin=null;viewPinEpoch++;viewPinPending=null;}
 function requireLocalAuthorization(){localAuthorizationRequired=true;csrf=null;stopTabPresence();unavailable();}
 function renderLocalAuthorization(){
   el('title').textContent='브라우저 접근 승인 필요';
@@ -262,19 +263,24 @@ function markSendUnknown(pending){
   renderComposer();
 }
 async function refreshPendingSend(){
-  if(!pendingSend || !hasAccount)return;
-  const pending=pendingSend,stamp=requestStamp();
+  if(pendingSend)await refreshSendOutcome(pendingSend);
+  if(uncertainPhoto)await refreshSendOutcome(uncertainPhoto,true);
+}
+async function refreshSendOutcome(pending,uncertain=false){
+  const owns=()=>hasAccount && (uncertain?uncertainPhoto===pending:pendingSend===pending);
+  if(!owns())return;
+  const stamp=requestStamp();
   try{
     const recovery=lastState?.outboxRecovery===true;
-    const page=await localJson(recovery?'/api/reader/outbox?clientId='+encodeURIComponent(pending.clientId):'/api/reader/messages?room='+encodeURIComponent(pending.room),()=>pendingSend===pending);
-    if(pendingSend!==pending || !hasAccount || !stampCurrent(stamp))return;
+    const page=await localJson(recovery?'/api/reader/outbox?clientId='+encodeURIComponent(pending.clientId):'/api/reader/messages?room='+encodeURIComponent(pending.room),owns);
+    if(!owns() || !stampCurrent(stamp))return;
     if(!recovery && page?.key!==pending.room){unavailable();return;}
     const outcome=recovery?page.entry:page.outbox?.find(entry=>entry.clientId===pending.clientId);
-    if(outcome && (outcome.clientId!==pending.clientId || outcome.key!==pending.room)){unavailable();return;}
-    if(!outcome || outcome.phase==='sending')return;
-    if(outcome.phase==='unknown'){markSendUnknown(pending);return;}
+    if(outcome && (outcome.clientId!==pending.clientId || outcome.key!==pending.room || outcome.kind!==undefined && outcome.kind!==(pending.kind==='photo'?'photo':'send'))){unavailable();return;}
+    if(!outcome || !['accepted','failed','unknown'].includes(outcome.phase))return;
+    if(outcome.phase==='unknown'){if(!uncertain)markSendUnknown(pending);return;}
     if(outcome.phase==='accepted'){
-      if(pending.kind==='photo'){clearImageDraft();}
+      if(pending.kind==='photo'){if(imageDraft?.room===pending.room)clearImageDraft();}
       else{drafts.delete(pending.room);if(selectedRoom===pending.room && el('compose-text').value===pending.text)el('compose-text').value='';if(replyDrafts.get(pending.room)?.key===pending.replyTo)replyDrafts.delete(pending.room);}
       sendNotes.set(pending.room,'서버에 전송했습니다.');
     }else{
@@ -282,9 +288,9 @@ async function refreshPendingSend(){
       sendNotes.set(pending.room,outcome.phase==='failed' && outcome.reason==='photo_jpeg_required'?'사진을 JPEG로 준비하지 못해 전송하지 않았습니다. 화면을 새로고침한 뒤 사진을 다시 선택해 주세요.':outcome.phase==='failed' && outcome.reason==='open_member_unverified'?'본인 참여 정보를 확인하지 못해 전송하지 않았습니다. 입력한 내용은 유지됩니다.':rejected?`서버가 전송 요청을 거절했습니다. (코드 ${status})`:'전송하지 못했습니다. 입력한 내용은 유지됩니다.');
     }
     outboxEpoch++;restoredOutbox=restoredOutbox.filter(entry=>entry.clientId!==pending.clientId);
-    pendingSend=null;
+    if(uncertain)uncertainPhoto=null;else pendingSend=null;
     renderComposer();
-    if(pending.focusInput && selectedRoom===pending.room && document.hasFocus() && !document.hidden
+    if(!pendingSend && pending.focusInput && selectedRoom===pending.room && document.hasFocus() && !document.hidden
       && ['BODY','send-message','compose-text'].includes(document.activeElement?.id || document.activeElement?.tagName)
       && !messageViewCovered() && !el('compose-text').disabled)el('compose-text').focus({preventScroll:true});
     if(outcome.phase==='accepted' && selectedRoom===pending.room){
@@ -316,9 +322,14 @@ async function acknowledgeUnknown(entry){
   }catch{return false;}
   finally{outboxEpoch++;outboxAcknowledging=false;acknowledgingClientId=null;renderComposer();}
 }
+function currentSelectionView(intent=selectionView){return Boolean(intent && selectionView===intent && intent.key===selectedRoom && intent.generation===readerGeneration && intent.attempt===readerAttempt);}
+function selectedViewAccepted(){
+  if(currentSelectionView() && selectionView.phase==='rejected')return false;
+  return lastState?.viewPin!==true || currentSelectionView() && selectionView.phase==='accepted' && viewPin===JSON.stringify([readerGeneration,readerAttempt,selectedRoom]);
+}
 async function maybeSeen(){
   const room=roomNow(),page=currentPage;
-  if(freshness!=='fresh' || ackInFlight || busy || settingsBusy || pendingSend || messageQuery || messageViewCovered() || !userSelected || document.hidden || !document.hasFocus() || !nearBottom()
+  if(freshness!=='fresh' || !selectedViewAccepted() || ackInFlight || busy || settingsBusy || pendingSend || messageQuery || messageViewCovered() || !userSelected || document.hidden || !document.hasFocus() || !nearBottom()
     || !hasAccount || lastState?.reader?.phase!=='connected' || lastState.reader.operationBusy
     || page?.key!==selectedRoom || !page.latestVisible || !page.seenToken || ['loading','failed','unrecognized'].includes(page.history?.phase))return;
   const lastMessage=page.messages?.at(-1)?.key;
@@ -347,8 +358,8 @@ async function maybeSeen(){
 async function advanceRoom(){
   if(freshness!=='fresh' || ackInFlight || busy || pendingSend || document.hidden || !document.hasFocus() || messageViewCovered() || !hasAccount || lastState?.reader?.phase!=='connected' || lastState.reader.operationBusy)return;
   const beforePin=requestStamp(),roomBeforePin=selectedRoom;
-  await pinSelectedRoom();
-  if(!stampCurrent(beforePin) || roomBeforePin!==selectedRoom || document.hidden || !document.hasFocus() || messageViewCovered() || !userSelected)return;
+  if(!await pinSelectedRoom())return;
+  if(!stampCurrent(beforePin) || roomBeforePin!==selectedRoom || !selectedViewAccepted() || document.hidden || !document.hasFocus() || messageViewCovered() || !userSelected)return;
   const needsEntry=currentPage?.entryPhase!==undefined?currentPage.entryPhase==='idle':currentPage?.receiptPhase==='idle';
   const contextKey=JSON.stringify([readerGeneration,readerAttempt,selectedRoom,contextGeneration()]);
   if(lastState.messaging===true && roomCan('context') && currentPage?.key===selectedRoom && (currentPage.messages?.length || ['OpenDirectChat','OpenMultiChat'].includes(roomNow()?.kind)) && needsEntry && !contextDispatches.has(contextKey) && (contextRetryAt.get(contextKey) ?? 0)<=performance.now() && currentPage.history?.phase!=='loading'){
@@ -368,17 +379,50 @@ async function advanceRoom(){
   await maybeSeen();
 }
 async function pinSelectedRoom(){
-  if(lastState?.viewPin!==true || freshness!=='fresh' || !hasAccount || lastState.reader?.phase!=='connected' || !roomNow() || document.hidden || !document.hasFocus() || messageViewCovered())return;
+  const intent=currentSelectionView()?selectionView:null;
+  // Keep a rejected intent blocked through polls, focus and cache invalidation.
+  // Only a new explicit selection/history or reconnect creates a new intent.
+  if(intent?.phase==='rejected')return false;
+  const accept=()=>{if(intent && currentSelectionView(intent))intent.phase='accepted';return true;};
+  if(lastState?.viewPin!==true)return accept();
+  if(freshness!=='fresh' || !hasAccount || lastState.reader?.phase!=='connected' || !roomNow() || document.hidden || !document.hasFocus() || messageViewCovered())return false;
+  // Focus invalidates the pin cache, not this intent's outstanding admission.
+  if(intent?.viewRequest)return intent.viewRequest.promise;
   const pin=JSON.stringify([readerGeneration,readerAttempt,selectedRoom]);
-  if(viewPin===pin)return;
-  const epoch=viewPinEpoch;viewPin=pin;
-  try{if(!await postLocal('/api/reader/view',{room:selectedRoom}) && epoch===viewPinEpoch && viewPin===pin)viewPin=null;}
-  catch(error){if(epoch===viewPinEpoch && viewPin===pin)viewPin=null;throw error;}
+  if(viewPin===pin)return accept();
+  if(viewPinPending?.pin===pin && viewPinPending.epoch===viewPinEpoch)return viewPinPending.promise;
+  const key=selectedRoom,epoch=viewPinEpoch,stamp=requestStamp(),pending={pin,epoch};
+  viewPinPending=pending;
+  if(intent)intent.viewRequest=pending;
+  const ownsIntent=()=>intent && currentSelectionView(intent) && intent.viewRequest===pending;
+  const current=()=>viewPinPending===pending && epoch===viewPinEpoch && stampCurrent(stamp) && key===selectedRoom && pin===JSON.stringify([readerGeneration,readerAttempt,selectedRoom]);
+  pending.promise=(async()=>{
+    try{
+      // Static assets may update before an already running server is restarted.
+      const body=lastState?.viewOrdering===true?{room:key,viewClientId,viewSequence:++viewSequence}:{room:key};
+      const accepted=await postLocal('/api/reader/view',body);
+      if(ownsIntent())intent.phase=accepted?'accepted':'rejected';
+      if(!current())return false;
+      if(accepted)viewPin=pin;
+      return accepted;
+    }catch(error){if(ownsIntent())intent.phase='rejected';throw error;
+    }finally{if(viewPinPending===pending)viewPinPending=null;if(intent?.viewRequest===pending)delete intent.viewRequest;}
+  })();
+  return pending.promise;
+}
+async function loadSelectedHistory(){
+  if(!hasAccount || !selectedRoom || busy)return;
+  if(currentSelectionView(pendingSelection) && pendingSelection.manual)return flushSelection();
+  pendingSelection=selectionView={key:selectedRoom,generation:readerGeneration,attempt:readerAttempt,phase:'waiting',manual:true};
+  invalidateViewPin();
+  return flushSelection();
 }
 async function flushSelection(){
   const pending=pendingSelection;
   if(!pending || pending.inFlight || busy || lastState?.reader?.historyBusy || lastState?.reader?.operationBusy)return;
-  if(!hasAccount || pending.generation!==readerGeneration || pending.key!==selectedRoom || lastState?.reader?.phase!=='connected'){pendingSelection=null;return;}
+  if(!hasAccount || !currentSelectionView(pending) || lastState?.reader?.phase!=='connected'){pendingSelection=null;return;}
+  // A manual click during a status check remains queued, including loaded pages.
+  if(pending.manual && freshness!=='fresh')return;
   if(pending.rejectedRevision!==undefined && pending.rejectedRevision===lastState.reader.revision)return;
   // Explicit selection waits for the newest accepted page, which may come from
   // polling instead of its own GET. Reconnect intents still force one catch-up.
@@ -387,6 +431,14 @@ async function flushSelection(){
     if(currentPage.history.phase!=='idle'){pendingSelection=null;return;}
   }
   if(roomsCache.find(room=>room.key===pending.key)?.historyAvailable===false){pendingSelection=null;return;}
+  try{
+    if(!await pinSelectedRoom()){
+      if(pendingSelection===pending && pending.phase==='rejected')pendingSelection=null;
+      return;
+    }
+  }catch{if(pendingSelection===pending && pending.phase==='rejected')pendingSelection=null;return;}
+  // Other flushes and explicit selections can finish while the view is pending.
+  if(pendingSelection!==pending || !currentSelectionView(pending) || pending.inFlight || busy || lastState?.reader?.historyBusy || lastState?.reader?.operationBusy || !selectedViewAccepted())return;
   const revision=lastState.reader.revision;pending.inFlight=true;
   const accepted=await act('/api/reader/history',{room:pending.key});
   if(pendingSelection!==pending)return;
@@ -433,7 +485,7 @@ function render(state) {
     userSelected=false;currentPage=null;
     resetMessageSearch(true);
     if(accountEnded){drafts.clear();replyDrafts.clear();sendNotes.clear();pinnedRooms.clear();roomFilter='all';pendingSend=null;uncertainPhoto=null;restoredOutbox=[];personalSettings=null;settingsRevision=-1;settingsEpoch++;for(const notice of shownNotifications.values())notice.close();shownNotifications.clear();el('browser-notifications').checked=false;el('persist-preferences').checked=false;el('notification-status').textContent='';el('preferences-status').textContent='';if(el('photo-dialog').open)el('photo-dialog').close();clearTimeout(copyStatusTimer);el('message-action-status').hidden=true;document.title='Web Kakao · 대화';el('compose-text').value='';el('read-sync').checked=false;if(el('rename-dialog').open)el('rename-dialog').close();}
-    pendingSelection=null;
+    pendingSelection=null;selectionView=null;
     renderedRooms=null;renderedMessages=null;renderedMessageRoom=null;
     el('room-list').replaceChildren();el('message-list').replaceChildren();el('reader-workspace').hidden=true;
     el('room-search').value='';el('history-note').textContent='대화 목록에서 방을 선택해 주세요.';renderChatHeading();
@@ -574,14 +626,16 @@ async function selectRoom(key){
   closeMessageMenu();closeRoomActions();document.querySelector('.app-shell').classList.add('mobile-chat');userSelected=true;showAccount(false);
   const generation=readerGeneration,stamp=requestStamp();
   if(key===selectedRoom && pendingSelection?.key===key)return;
-  const intent={key,generation,awaitingPage:true};pendingSelection=intent;
+  invalidateViewPin();
+  const intent=selectionView={key,generation,attempt:readerAttempt,phase:'waiting',awaitingPage:true};pendingSelection=intent;
   if(selectedRoom)drafts.set(selectedRoom,el('compose-text').value);
   if(key!==selectedRoom){if(!pendingSend)clearImageDraft();resetMessageSearch(false);renderedMessages=null;renderedMessageRoom=null;el('message-list').replaceChildren();}
   selectedRoom=key;reconnectRoom=key;userSelected=true;currentPage=null;el('compose-text').value=drafts.get(key) || '';renderRooms();el('history-note').textContent='메시지 표시를 준비하고 있습니다.';
   renderChatHeading();showAccount(false);
   if(lastState)render(lastState);
-  await pinSelectedRoom();
+  let accepted=false;try{accepted=await pinSelectedRoom();}catch{/* Keep this view unconfirmed; never continue its automatic history. */}
   if(!hasAccount || !stampCurrent(stamp) || key!==selectedRoom || pendingSelection!==intent)return;
+  if(!accepted){if(intent.phase==='rejected')pendingSelection=null;return;}
   await refreshMessages(key,generation);
   if(!hasAccount || !stampCurrent(stamp) || key!==selectedRoom || pendingSelection!==intent)return;
   // Live pushes already update cached rooms. Selecting a loaded room is local;
@@ -743,11 +797,15 @@ async function refreshSettings(state){
 }
 async function changeSettings(path,body){
   if(!preferenceReady() || settingsBusy)return false;
-  const generation=readerGeneration,stamp=requestStamp();settingsBusy=true;settingsEpoch++;renderComposer();
+  const generation=readerGeneration,stamp=requestStamp(),epoch=++settingsEpoch;
+  // Reconnect changes readerGeneration but retains this account's pending write.
+  // Account replacement advances settingsEpoch; only that owner may unlock it.
+  const owns=()=>hasAccount && epoch===settingsEpoch,current=()=>owns() && generation===readerGeneration;
+  settingsBusy=true;renderComposer();
   let success=false;
-  try{success=await postLocal(path,body);if(!success)el('preferences-status').textContent='설정을 저장하지 못했습니다. 다시 확인해 주세요.';}
-  catch{if(stampCurrent(stamp))el('preferences-status').textContent='설정을 저장하지 못했습니다. 연결 상태를 확인해 주세요.';}
-  finally{settingsBusy=false;if(generation===readerGeneration){settingsRevision=-1;readerRevision=-1;await refresh();renderComposer();}}
+  try{success=await postLocal(path,body);if(!current())return false;if(!success)el('preferences-status').textContent='설정을 저장하지 못했습니다. 다시 확인해 주세요.';}
+  catch{if(current() && stampCurrent(stamp))el('preferences-status').textContent='설정을 저장하지 못했습니다. 연결 상태를 확인해 주세요.';}
+  finally{if(owns()){settingsBusy=false;settingsRevision=-1;readerRevision=-1;await refresh();if(owns())renderComposer();}}
   return success;
 }
 async function saveSettings(patch){return changeSettings('/api/preferences',patch);}
@@ -788,7 +846,7 @@ async function refreshReader(state){
     selectedRoom=restore || roomsCache[0]?.key || null;userSelected=false;currentPage=null;el('compose-text').value=drafts.get(selectedRoom) || '';renderedMessages=null;renderedMessageRoom=null;el('message-list').replaceChildren();el('history-note').textContent='메시지 표시를 준비하고 있습니다.';
     // Keep the explicitly opened room as the target across repeated reconnects.
     // Restoring its history never grants userSelected/read eligibility.
-    if(restore)pendingSelection={key:restore,generation};
+    if(restore)pendingSelection=selectionView={key:restore,generation,attempt:readerAttempt,phase:'waiting'};
   }
   el('reader-workspace').hidden=!roomsCache.length;renderRooms();
   renderChatHeading();
@@ -847,7 +905,7 @@ el('cancel').addEventListener('click', () => act('/api/cancel'));
 el('room-check').addEventListener('click', () => act('/api/room-probe'));
 el('reader-connect').addEventListener('click',()=>act('/api/reader/connect'));
 el('reader-disconnect').addEventListener('click',()=>act('/api/reader/disconnect'));
-el('history-load').addEventListener('click',()=>{if(selectedRoom)act('/api/reader/history',{room:selectedRoom});});
+el('history-load').addEventListener('click',()=>loadSelectedHistory());
 el('room-search').addEventListener('input',renderRooms);
 for(const filter of ['all','unread','pinned'])el('filter-'+filter).addEventListener('click',()=>{if(preferenceReady())void saveSettings({roomFilter:filter});else{roomFilter=filter;renderRooms();renderComposer();}});
 el('pin-room').addEventListener('click',()=>{if(!hasAccount || !roomNow())return;if(preferenceReady()){const order=pinnedRooms.has(selectedRoom)?null:Math.max(-1,...roomsCache.map(row=>row.pinOrder ?? -1))+1;void saveRoomSettings({pinOrder:order});}else{if(pinnedRooms.has(selectedRoom))pinnedRooms.delete(selectedRoom);else pinnedRooms.add(selectedRoom);renderRooms();renderComposer();}});
@@ -900,8 +958,9 @@ el('send-reset').addEventListener('click',async()=>{
   }else if(uncertainPhoto){
     const pending=uncertainPhoto,stamp=requestStamp();
     if(window.confirm('휴대폰에서 사진의 도착 여부를 확인하셨나요? 이 버튼은 사진을 다시 보내지 않습니다.')){
-      uncertainPhoto=null;clearImageDraft();
-      if(!await acknowledgeUnknown(pending) && hasAccount && stampCurrent(stamp) && !uncertainPhoto)uncertainPhoto=pending;
+      await refreshSendOutcome(pending,true);
+      if(uncertainPhoto!==pending || !hasAccount || !stampCurrent(stamp))return;
+      if(await acknowledgeUnknown(pending) && uncertainPhoto===pending && hasAccount && stampCurrent(stamp)){uncertainPhoto=null;clearImageDraft();}
       renderComposer();
     }
   }else{

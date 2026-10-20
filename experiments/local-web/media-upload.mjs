@@ -52,7 +52,7 @@ function completeMatches(body,{chatId,userId,messageId,requireLog}){
 export async function uploadPhoto(options){
   let posting=false,stage='ship';
   const trace=(next,details={})=>{stage=next;try{options.observe?.({stage,...details});}catch{/* Observation cannot change an upload outcome. */}};
-  try{return await performUpload({...options,trace,onPosting:()=>{posting=true;}});}catch(error){trace(stage,{failure:'exception',...uploadFault(error)});return {phase:posting?'unknown':'failed',status:null};}
+  try{return await performUpload({...options,trace,onPosting:()=>{posting=true;}});}catch(error){trace(stage==='deadline'?'exception':stage,{failure:'exception',...uploadFault(error)});return {phase:posting?'unknown':'failed',status:null};}
 }
 async function performUpload({carriage,createClient,toLong,chatId,userId,messageId,data,signal,isCurrent=()=>true,readOnSend=false,resolve=resolvePublicDestination,profile,timeout=20000,onPosting,trace}){
   if(typeof readOnSend!=='boolean')throw new TypeError('invalid_read_on_send');
@@ -60,8 +60,16 @@ async function performUpload({carriage,createClient,toLong,chatId,userId,message
   if(typeof messageId!=='string' || !/^[1-9]\d{0,18}$/.test(messageId) || BigInt(messageId)>9223372036854775807n)throw new Error('invalid_message_id');
   chatId=signedId(chatId);userId=signedId(userId);
   if(!chatId || !userId)throw new Error('invalid_upload_identity');
+  if(!Number.isFinite(timeout) || timeout<=0 || timeout>2147473647)throw new Error('invalid_upload_timeout');
   const lifetime=new AbortController(),uploadSignal=signal?AbortSignal.any([signal,lifetime.signal]):lifetime.signal;
   const assertLive=()=>{if(uploadSignal.aborted || isCurrent()!==true)throw new Error('upload_cancelled');};
+  // Retain the existing timeout+10s policy, measured once from SHIP onward.
+  // DNS and metadata cannot defer the start or replenish the upload budget.
+  const deadline=Date.now()+timeout+10000;
+  let captureDeadline=()=>{},deadlineDetails=()=>({});
+  const expire=()=>{if(uploadSignal.aborted)return;captureDeadline();trace('deadline',{failure:'timeout',...deadlineDetails()});lifetime.abort();};
+  const remaining=()=>{assertLive();const ms=deadline-Date.now();if(ms<=0){expire();assertLive();}return Math.max(1,Math.min(timeout,ms));};
+  const timer=setTimeout(expire,timeout+10000);timer.unref?.();
   // Every wait, including raw writes, shares cancellation independently of
   // whether the transport settles its own promises after disconnect.
   const awaitLive=async operation=>{
@@ -77,9 +85,10 @@ async function performUpload({carriage,createClient,toLong,chatId,userId,message
       }catch(error){finish(reject,error);}
     });
   };
+  try{
   assertLive();
   trace('ship',{totalBytes:data.length});
-  const ship=await awaitLive(()=>carriage.request('SHIP',{c:toLong(chatId),s:toLong(String(data.length)),t:2,cs:createHash('sha1').update(data).digest('hex').toUpperCase(),e:image.ext},timeout,{recoverable:true}));
+  const ship=await awaitLive(()=>carriage.request('SHIP',{c:toLong(chatId),s:toLong(String(data.length)),t:2,cs:createHash('sha1').update(data).digest('hex').toUpperCase(),e:image.ext},remaining(),{recoverable:true}));
   if(responseStatus(ship)!==0)return {phase:'failed',status:responseStatus(ship)};
   assertLive();
   const token=ship.body?.k,host=ship.body?.vh,port=Number(ship.body?.p);
@@ -89,6 +98,7 @@ async function performUpload({carriage,createClient,toLong,chatId,userId,message
   let write=null,writeStarted=0,writeFrozen=false,baseline=null;
   const captureTerminal=()=>{if(write && !writeFrozen){writeFrozen=true;write.elapsedMs=duration(writeStarted);write.terminal=socketSnapshot(client,baseline);}};
   const writeDetails=()=>write?{write}:{};
+  captureDeadline=captureTerminal;deadlineDetails=writeDetails;
   const writeChunk=async chunk=>{
     if(!baseline){const socket=metadataValue(client,'socket');baseline={bytesWritten:counter(metadataValue(socket,'bytesWritten')),bytesRead:counter(metadataValue(socket,'bytesRead'))};}
     writeStarted=Date.now();writeFrozen=false;
@@ -116,10 +126,9 @@ async function performUpload({carriage,createClient,toLong,chatId,userId,message
   const onError=error=>{if(finalized || uploadSignal.aborted)return;captureTerminal();trace('transport',{failure:'closed_or_error',...uploadFault(error),...writeDetails()});lifetime.abort();};
   const onAbort=()=>{captureTerminal();finish({error:true});disconnect();};
   client.on('push',onPush);client.on('error',onError);client.on('disconnected',onError);uploadSignal.addEventListener('abort',onAbort,{once:true});
-  const timer=setTimeout(()=>{if(finalized || uploadSignal.aborted)return;captureTerminal();trace('deadline',{failure:'timeout',...writeDetails()});lifetime.abort();},timeout+10000);timer.unref?.();
   try{
     trace('connect');
-    await awaitLive(()=>client.connect(address,port,timeout));assertLive();
+    await awaitLive(()=>client.connect(address,port,remaining()));assertLive();
     // POST may already create a message; everything uncertain after this point
     // is reported as unknown. The caller retains its request UUID.
     trace('post');
@@ -127,8 +136,9 @@ async function performUpload({carriage,createClient,toLong,chatId,userId,message
     // metadata. Scope/silence are the options this UI actually offers. dt follows
     // the declared companion role, not a guess based on screen size/model.
     const post=await awaitLive(()=>{
+      const postTimeout=remaining();
       posting=true;onPosting();
-      return client.request('POST',{k:token,s:toLong(String(data.length)),f:'photo.'+image.ext,t:2,c:toLong(chatId),mid:toLong(messageId),ns:!readOnSend,u:toLong(userId),os:profile.os,av:profile.appVersion,nt:0,mm:'45005',ex:'{}',sp:null,scp:1,silence:false,...(typeof profile.subDeviceMode==='boolean'?{dt:profile.subDeviceMode?4:1}:{}),w:image.width,h:image.height},timeout);
+      return client.request('POST',{k:token,s:toLong(String(data.length)),f:'photo.'+image.ext,t:2,c:toLong(chatId),mid:toLong(messageId),ns:!readOnSend,u:toLong(userId),os:profile.os,av:profile.appVersion,nt:0,mm:'45005',ex:'{}',sp:null,scp:1,silence:false,...(typeof profile.subDeviceMode==='boolean'?{dt:profile.subDeviceMode?4:1}:{}),w:image.width,h:image.height},postTimeout);
     });
     if(responseStatus(post)!==0)return {phase:responseStatus(post)===null?'unknown':'failed',status:responseStatus(post)};
     const offset=Number(post.body?.o);
@@ -150,5 +160,6 @@ async function performUpload({carriage,createClient,toLong,chatId,userId,message
     // Preserve verified outer identity as evidence for the session/store boundary.
     return {phase:status===0?'accepted':status===null?'unknown':'failed',status,chatLog:status===0?result.packet.body?.chatLog:null,...(status===0?{completeBody:result.packet.body}:{})};
   }catch(error){captureTerminal();trace('exception',{...uploadFault(error),...writeDetails()});return {phase:posting?'unknown':'failed',status:null};}
-  finally{captureTerminal();finalized=true;clearTimeout(timer);uploadSignal.removeEventListener('abort',onAbort);client.off('push',onPush);client.off('disconnected',onError);lifetime.abort();recordStream();disconnect();/* Keep the inert error listener for late socket errors. */}
+  finally{captureTerminal();finalized=true;uploadSignal.removeEventListener('abort',onAbort);client.off('push',onPush);client.off('disconnected',onError);lifetime.abort();recordStream();disconnect();/* Keep the inert error listener for late socket errors. */}
+  }finally{clearTimeout(timer);lifetime.abort();}
 }

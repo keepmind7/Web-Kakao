@@ -7,6 +7,7 @@ import { createLocalServer } from '../experiments/local-web/server.mjs';
 import { decodeImage } from '../experiments/local-web/message-content.mjs';
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
+import http from 'node:http';
 
 const chrome=['C:/Program Files/Google/Chrome/Application/chrome.exe','C:/Program Files (x86)/Google/Chrome/Application/chrome.exe'].find(existsSync);
 if(!chrome)throw new Error('Chrome unavailable; browser test not executed');
@@ -20,6 +21,8 @@ const localTitles=new Map(),unread=new Map(),contexts=new Map(),outcomes=new Map
 const photoPayloads=[];
 const roomCapabilities=new Map();
 const contextCalls=[],ackCalls=[],fixtureRequests=[];
+const viewCalls=[];
+let activeRoom=null;
 const receiptVersions=new Map([[key,1],[second,1]]),pageVersions=new Map([[key,1],[second,1]]);
 let adversarialFixture=false,roomsVersion=1,settingsVersion=1,outboxVersion=1,photoRequests=0;
 const readStates=new Map(),historyGaps=new Map(),latestMissing=new Set();
@@ -39,7 +42,7 @@ const app=createLocalServer({controlToken,mode:'live',messaging:true,photoFetche
   connect(){resetHistory();if(attempts++) {historyPhases.clear();messagesByRoom.clear();contexts.clear();readStates.clear();}connected=true;revision++;return true;},
   rooms:()=>({revision,rooms:connected?[{key,title:'모의 대화방 A',preview:'예시 미리보기'},{key:second,title:'모의 대화방 B',preview:otherPreview}].filter(row=>!removedRooms.has(row.key)).map(row=>({...row,...(adversarialFixture?{lastAt:1800000300000}:{}),baseTitle:row.title,title:localTitles.get(row.key) || row.title,localTitle:localTitles.get(row.key) || null,pinOrder:roomSettings.get(row.key)?.pinOrder ?? null,muted:roomSettings.get(row.key)?.muted===true,canSend:true,kind:'DirectChat',...roomCapabilities.get(row.key),unreadLocalCount:unread.get(row.key) || 0,unreadCoverage:'observed'})):[]}),
   messages:room=>({key:room,messages:messagesByRoom.get(room) || [],latestVisible:!latestMissing.has(room),seenToken:'c'.repeat(48),receiptPhase:contexts.get(room) || 'idle',...(adversarialFixture?{entryPhase:contexts.get(room) || 'idle',contextRevision:receiptVersions.get(room)}:{}),readSync:readStates.get(room) || {phase:'idle'},outbox:[...outcomes.values()].filter(row=>row.key===room),history:{phase:historyPhases.get(room) || 'idle',gap:historyGaps.get(room)===true,receivedCount:messagesByRoom.get(room)?.length || 0,acceptedCount:messagesByRoom.get(room)?.length || 0}}),
-  view:room=>[key,second].includes(room),
+  view:room=>{if(![key,second].includes(room))return false;activeRoom=room;viewCalls.push(room);return true;},
   outbox:clientId=>clientId?(outcomes.get(clientId) || null):[...outcomes.values()].filter(row=>!row.acknowledged && ['sending','unknown'].includes(row.phase)),
   acknowledgeOutbox(clientId){const row=outcomes.get(clientId);if(row?.phase!=='unknown')return false;ackCalls.push(clientId);outcomes.set(clientId,{...row,acknowledged:true});outboxVersion++;revision++;return true;},
   rename(room,title){if(title===null)localTitles.delete(room);else localTitles.set(room,title);revision++;return true;},
@@ -49,11 +52,11 @@ const app=createLocalServer({controlToken,mode:'live',messaging:true,photoFetche
   forgetSettings(){settings=defaultSettings();roomSettings.clear();localTitles.clear();revision++;return true;},
   claimNotifications:()=>settings.notifications?notificationQueue.splice(0,5):[],
   photo:(_room,msg)=>msg===photoMessage?'https://talkv.kakao.com/offline-test-only':null,
-  openRoom(room){contextCalls.push(room);if(adversarialFixture)for(const other of [key,second])if(other!==room)contexts.set(other,'idle');contexts.set(room,'ready');pageVersions.set(room,pageVersions.get(room)+1);revision++;return true;},
+  openRoom(room){activeRoom=room;contextCalls.push(room);if(adversarialFixture)for(const other of [key,second])if(other!==room)contexts.set(other,'idle');contexts.set(room,'ready');pageVersions.set(room,pageVersions.get(room)+1);revision++;return true;},
   seen(room,token,notify){seenCalls.push({room,token,notify});if(notify)readStates.set(room,{phase:'accepted',messageKey:messagesByRoom.get(room).at(-1).key});unread.set(room,0);revision++;return true;},
   sendText(room,text,clientId,replyTo){if(outcomes.has(clientId))return true;sendCalls.push({room,text,clientId,replyTo});outcomes.set(clientId,{key:room,clientId,kind:'send',phase:'sending'});outboxVersion++;pageVersions.set(room,pageVersions.get(room)+1);revision++;setTimeout(()=>{outcomes.set(clientId,{key:room,clientId,kind:'send',phase:unknownSend?'unknown':'accepted'});if(!unknownSend)messagesByRoom.get(room).push({key:'m_'+(5000+sendCalls.length).toString(16).padStart(24,'0'),text,sender:'나',mine:true,at:1800000100000,unreadCount:1,...(replyTo?{reply:{text:messagesByRoom.get(room).find(row=>row.key===replyTo)?.text,sender:'모의 사용자'}}:{})});outboxVersion++;pageVersions.set(room,pageVersions.get(room)+1);revision++;},150).unref();return true;},
   sendPhoto(room,image,clientId){if(rejectPhoto)return false;photoPayloads.push(image);sendCalls.push({kind:'photo',room,clientId,byteLength:Buffer.from(image,'base64').length,mime:decodeImage(image)?.mime});outcomes.set(clientId,{key:room,clientId,kind:'photo',phase:unknownPhoto?'unknown':'accepted'});outboxVersion++;pageVersions.set(room,pageVersions.get(room)+1);revision++;return true;},
-  history(room){if(historyBusy)return false;historyRooms.push(room);historyPhases.set(room,'loading');historyBusy=true;revision++;const generation=historyGeneration;historyTimer=setTimeout(()=>{if(generation!==historyGeneration || !connected)return;historyTimer=null;historyPhases.set(room,'loaded');if(!messagesByRoom.has(room))messagesByRoom.set(room,[...makeMessages(room),...(offlineMessages.get(room) || [])]);historyBusy=false;revision++;},500);historyTimer.unref();return true;},disconnect(){resetHistory();connected=false;revision++;},close(){resetHistory();connected=false;attempts=0;historyPhases.clear();messagesByRoom.clear();localTitles.clear();unread.clear();contexts.clear();outcomes.clear();revision++;},
+  history(room){if(historyBusy)return false;activeRoom=room;historyRooms.push(room);historyPhases.set(room,'loading');historyBusy=true;revision++;const generation=historyGeneration;historyTimer=setTimeout(()=>{if(generation!==historyGeneration || !connected)return;historyTimer=null;historyPhases.set(room,'loaded');if(!messagesByRoom.has(room))messagesByRoom.set(room,[...makeMessages(room),...(offlineMessages.get(room) || [])]);historyBusy=false;revision++;},500);historyTimer.unref();return true;},disconnect(){resetHistory();connected=false;revision++;},close(){resetHistory();connected=false;attempts=0;historyPhases.clear();messagesByRoom.clear();localTitles.clear();unread.clear();contexts.clear();outcomes.clear();revision++;},
 })});
 app.server.on('request',req=>{if(req.url==='/api/status')statusRequests++;if(req.url.startsWith('/api/photo?'))photoRequests++;fixtureRequests.push({method:req.method,path:req.url.split('?')[0],room:new URL(req.url,'http://synthetic.invalid').searchParams.get('room')});});
 const url=await app.listen(0);
@@ -181,6 +184,131 @@ await check('closing the photo dialog disables download',async()=>{assert.equal(
       writeFileSync(resolve(folder,'synthetic-adversarial.json'),JSON.stringify({passed:results.length>0 && results.every(row=>row.passed),checks:results,polling:{scheduledAtEntry:pollingAtEntry,scheduledAfterSection:pollingRestored},actualAccountUsed:false,externalNetworkUsed:false},null,2));
     }
     assert.ok(results.length>=16,'adversarial fixture must execute its independent checks');assert.deepEqual(results.filter(row=>!row.passed).map(row=>({name:row.name,error:row.error})),[],'independent adversarial browser contracts failed');
+  }
+  async function checkRejectedSelection(){
+    // Two real synthetic targets and the real HTTP parser. Only the first A
+    // request body is held; no product response is replaced with a fake 409.
+    const results=[],transportTrace=[],requests=new Set();let target,socket,held,heldBody,heldEntered=false,heldStatus;
+    const baseline={adversarialFixture,enableSettings,settings};
+    const quiet="clearTimeout(pollTimer);pollTimer=null;clearTimeout(queuedRefreshTimer);queuedRefreshTimer=null;refreshPending=false;showAccount(false);Object.defineProperty(document,'hidden',{configurable:true,get:()=>false});Object.defineProperty(document,'visibilityState',{configurable:true,get:()=> 'visible'});document.hasFocus=()=>true;el('read-sync').checked=false;";
+    const ready="typeof lastState!=='undefined' && lastState?.reader?.phase==='connected' && !busy && !refreshing && !ackInFlight";
+    const counts=()=>({views:viewCalls.length,history:historyRooms.length,context:contextCalls.length,seen:seenCalls.length,send:sendCalls.length});
+    const check=async(name,fn)=>{try{const observed=await fn();results.push({name,passed:true,...(observed?{observed}:{})});lifecycleChecks.push(name);}catch(error){results.push({name,passed:false,error:String(error.message).slice(0,1000)});}};
+    const waitNode=async predicate=>{const end=Date.now()+10000;while(!predicate()){if(Date.now()>end)throw Error('synthetic D2 transport wait timeout');await sleep(20);}};
+    const requestListener=req=>{if(req.url==='/api/reader/view' && held)heldEntered=true;};
+    const bindingListener=event=>{
+      const message=JSON.parse(event.data);
+      if(message.method!=='Runtime.bindingCalled' || message.params.name!=='syntheticHeldView')return;
+      const options=JSON.parse(message.params.payload);heldBody=options.body;heldEntered=false;
+      held=http.request(url+'/api/reader/view',{method:'POST',headers:{...Object.fromEntries(options.headers),origin:url,'content-length':Buffer.byteLength(heldBody)}},response=>{
+        const chunks=[];response.on('data',chunk=>chunks.push(chunk));response.on('end',()=>{
+          heldStatus=response.statusCode;
+          // Body/headers contain ephemeral fixture authorization. They remain
+          // in memory and are never included in artifacts or error messages.
+          void evaluate(`globalThis.syntheticFinishView(${JSON.stringify({status:response.statusCode,body:Buffer.concat(chunks).toString('utf8')})})`).catch(()=>{});
+        });
+      });requests.add(held);held.once('close',()=>requests.delete(held));
+      held.once('error',()=>{void evaluate("globalThis.syntheticFailView?.()").catch(()=>{});});
+      held.write(heldBody.slice(0,12));
+    };
+    try{
+      assert.notEqual(app.server.address().port,8787,'D2 must use an ephemeral synthetic server');
+      await evaluate("globalThis.syntheticD2Environment={hidden:Object.getOwnPropertyDescriptor(document,'hidden'),visibility:Object.getOwnPropertyDescriptor(document,'visibilityState'),focus:document.hasFocus,readSync:el('read-sync').checked};");
+      adversarialFixture=true;enableSettings=true;settings=defaultSettings();settingsVersion++;roomsVersion++;removedRooms.clear();
+      for(const room of [key,second]){messagesByRoom.set(room,makeMessages(room));historyPhases.set(room,'loaded');contexts.set(room,'idle');roomCapabilities.set(room,{kind:'DirectChat',canSend:true,canText:true,canReply:true,canPhoto:true,canRead:true,canContext:true});pageVersions.set(room,pageVersions.get(room)+1);}revision++;
+      await refreshUi();await evaluate(quiet);
+      // Same CDP/launch-ticket pattern as the adversarial secondTab helper.
+      target=await call('Target.createTarget',{url:await launchUrl()});
+      const targets=await(await fetch(`http://127.0.0.1:${port}/json/list`)).json();const remote=targets.find(row=>row.id===target.targetId);assert.ok(remote);
+      socket=new WebSocket(remote.webSocketDebuggerUrl);await new Promise((resolve,reject)=>{socket.addEventListener('open',resolve,{once:true});socket.addEventListener('error',reject,{once:true});});
+      let sequence=0;const pending=new Map();socket.addEventListener('message',event=>{const message=JSON.parse(event.data),entry=pending.get(message.id);if(!entry)return;pending.delete(message.id);clearTimeout(entry.timer);message.error?entry.reject(Error('D2 second target CDP error')):entry.resolve(message.result);});
+      const tabCall=(method,params={})=>new Promise((resolve,reject)=>{const id=++sequence,timer=setTimeout(()=>{pending.delete(id);reject(Error('D2 second target timeout'));},5000);pending.set(id,{resolve,reject,timer});socket.send(JSON.stringify({id,method,params}));});
+      const evalTab=async expression=>{const value=await tabCall('Runtime.evaluate',{expression,returnByValue:true,awaitPromise:true});if(value.exceptionDetails)throw Error('D2 second target evaluation failed');return value.result?.value;};
+      const waitTab=async expression=>{const end=Date.now()+10000;while(!await evalTab(expression)){if(Date.now()>end)throw Error('D2 second target readiness timeout');await sleep(30);}};
+      await waitTab(ready);await evalTab(quiet);
+      await call('Runtime.addBinding',{name:'syntheticHeldView'});ws.addEventListener('message',bindingListener);app.server.on('request',requestListener);
+      await evaluate(`globalThis.syntheticOriginalFetch=fetch;globalThis.syntheticHoldNextView=false;globalThis.fetch=(path,options={})=>{
+        if(String(path)==='/api/reader/view' && globalThis.syntheticHoldNextView){globalThis.syntheticHoldNextView=false;return new Promise((resolve,reject)=>{globalThis.syntheticFinishView=value=>resolve(new Response(value.body,{status:value.status,headers:{'content-type':'application/json'}}));globalThis.syntheticFailView=()=>reject(Error('synthetic held request failed'));syntheticHeldView(JSON.stringify({body:options.body,headers:[...new Headers(options.headers)]}));});}
+        return syntheticOriginalFetch(path,options);
+      };`);
+      const rejectSelection=async()=>{
+        historyPhases.set(key,'idle');contexts.set(key,'idle');pageVersions.set(key,pageVersions.get(key)+1);revision++;held=null;heldStatus=undefined;heldEntered=false;
+        await evaluate(`globalThis.syntheticSelectionDone=false;globalThis.syntheticHoldNextView=true;void selectRoom('${key}').finally(()=>globalThis.syntheticSelectionDone=true);`);
+        await waitNode(()=>held && heldEntered);
+        const waiting=counts(),waitingRequests=fixtureRequests.length;
+        // Invalidating a view cache while its actual HTTP verdict is pending
+        // cannot discard that verdict or create a replacement automatic intent.
+        await evaluate("window.dispatchEvent(new Event('blur'));window.dispatchEvent(new Event('focus'));invalidateViewPin();void flushSelection();void advanceRoom();void maybeSeen();");await sleep(80);
+        await check('D2 waiting view does not automatically load enter or read',async()=>{const after=counts();for(const name of ['history','context','seen'])assert.equal(after[name],waiting[name],name);assert.equal(fixtureRequests.slice(waitingRequests).filter(row=>row.path==='/api/reader/view').length,0,'pending view remains the sole request after cache invalidation');return {automaticRequests:0,replacementViewRequests:0,cacheInvalidationWhilePending:true};});
+        await evalTab(`void selectRoom('${second}')`);await waitTab(ready+` && selectedRoom==='${second}' && !pendingSelection`);await evalTab("document.hasFocus=()=>false;clearTimeout(pollTimer);pollTimer=null;");
+        assert.equal(activeRoom,second,'B must be the last accepted server view before releasing A');
+        const before=counts(),requestStart=fixtureRequests.length;held.end(heldBody.slice(12));
+        await until('globalThis.syntheticSelectionDone && !busy && !refreshing && !ackInFlight');await sleep(550);
+        transportTrace.push({stage:'released-stale-view',status:heldStatus,activeRoom:activeRoom===second?'B':'A',delta:Object.fromEntries(Object.entries(counts()).map(([name,value])=>[name,value-before[name]])),messageGets:fixtureRequests.slice(requestStart).filter(row=>row.path==='/api/reader/messages').length});
+        await check('D2 actual HTTP stale view 409 leaves B active and dispatches zero automatic history context read',async()=>{
+          assert.equal(heldStatus,409);assert.equal(activeRoom,second);const after=counts();for(const name of ['views','history','context','seen'])assert.equal(after[name],before[name],name);
+          return {httpStatus:heldStatus,finalActiveRoom:'B',automaticRequests:0,messageGets:fixtureRequests.slice(requestStart).filter(row=>row.path==='/api/reader/messages').length};
+        });
+        return counts();
+      };
+      let rejected=await rejectSelection();
+      // A new message and receipt revision prevent stale dispatch caches from
+      // making the absence of requests vacuous. GETs remain harmless observations.
+      unread.set(key,3);contexts.set(key,'idle');readStates.delete(key);historyPhases.set(key,'loaded');
+      messagesByRoom.get(key).push({key:'m_'+'6'.repeat(24),text:'Synthetic D2 incoming',sender:'Synthetic peer',mine:false,at:1800000400000});
+      receiptVersions.set(key,receiptVersions.get(key)+1);pageVersions.set(key,pageVersions.get(key)+1);roomsVersion++;revision++;
+      await evaluate("el('read-sync').checked=true;");
+      for(let n=0;n<4;n++){await refreshUi();await evaluate("(()=>{clearTimeout(pollTimer);pollTimer=null;const pane=document.querySelector('.chat-scroll');pane.scrollTop=pane.scrollHeight;pane.dispatchEvent(new Event('scroll'));showAccount(true);showAccount(false);el('rename-dialog').showModal();el('rename-dialog').close();window.dispatchEvent(new Event('blur'));window.dispatchEvent(new Event('focus'));invalidateViewPin();})()");await evaluate('(async()=>{await flushSelection();await advanceRoom();await maybeSeen();})()');}
+      await sleep(150);
+      await check('D2 rejected intent stays inert through polls receipt changes scroll overlays focus and direct automatic callbacks',async()=>{
+        const after=counts();for(const name of ['views','history','context','seen'])assert.equal(after[name],rejected[name],name);assert.equal(activeRoom,second);return {rounds:4,automaticRequests:0,finalActiveRoom:'B'};
+      });
+      await evaluate("el('read-sync').checked=false;");historyPhases.set(key,'idle');pageVersions.set(key,pageVersions.get(key)+1);revision++;const manual=counts();
+      await evaluate(`void selectRoom('${key}')`);await until(ready+' && !pendingSelection');await sleep(550);
+      await check('D2 explicit same-room reselection can accept a new view and load once',async()=>{assert.equal(viewCalls.length-manual.views,1);assert.deepEqual(historyRooms.slice(manual.history),[key]);assert.equal(activeRoom,key);return {views:1,history:1};});
+      // Reject a fresh attempt again before exercising the independent manual
+      // load control. B is a genuine later intention in the other target.
+      await evalTab('document.hasFocus=()=>true;');await rejectSelection();
+      historyPhases.set(key,'loaded');pageVersions.set(key,pageVersions.get(key)+1);revision++;await refreshUi();const explicit=counts();
+      assert.equal(await evaluate("el('history-load').disabled"),false,'manual history must remain available for a rejected view');
+      await evaluate("el('history-load').click()");await until(ready+' && !pendingSelection');await sleep(550);
+      await check('D2 explicit manual history starts a fresh view intention and queries once',async()=>{assert.equal(viewCalls.length-explicit.views,1);assert.deepEqual(historyRooms.slice(explicit.history),[key]);assert.equal(activeRoom,key);return {views:1,history:1};});
+      // A rejected intention must not poison an intentional transport reconnect.
+      const reconnect=counts();await evaluate("el('reader-disconnect').click()");await until("lastState.reader.phase==='disconnected' && !busy && !refreshing && !el('reader-connect').disabled");
+      await evaluate("el('reader-connect').click()");await until(ready+' && !pendingSelection');await sleep(550);
+      await check('D2 reconnect restore accepts view and catches up once without automatic entry or read',async()=>{assert.deepEqual(historyRooms.slice(reconnect.history),[key]);assert.equal(contextCalls.length,reconnect.context);assert.equal(seenCalls.length,reconnect.seen);assert.equal(await evaluate('!userSelected && reconnectRoom===selectedRoom'),true);assert.equal(activeRoom,key);return {history:1,context:0,read:0};});
+    }finally{
+      ws.removeEventListener('message',bindingListener);app.server.off('request',requestListener);for(const request of requests)request.destroy();
+      await evaluate("if(globalThis.syntheticOriginalFetch)globalThis.fetch=globalThis.syntheticOriginalFetch;delete globalThis.syntheticFinishView;delete globalThis.syntheticFailView;").catch(()=>{});
+      await evaluate("if(globalThis.syntheticD2Environment){const saved=globalThis.syntheticD2Environment;if(saved.hidden)Object.defineProperty(document,'hidden',saved.hidden);else delete document.hidden;if(saved.visibility)Object.defineProperty(document,'visibilityState',saved.visibility);else delete document.visibilityState;document.hasFocus=saved.focus;el('read-sync').checked=saved.readSync;delete globalThis.syntheticD2Environment;}").catch(()=>{});
+      await call('Runtime.removeBinding',{name:'syntheticHeldView'}).catch(()=>{});if(target)await call('Target.closeTarget',{targetId:target.targetId}).catch(()=>{});socket?.close();
+      adversarialFixture=baseline.adversarialFixture;enableSettings=baseline.enableSettings;settings=baseline.settings;roomCapabilities.clear();contexts.clear();unread.clear();revision++;
+      await evaluate('scheduleRefresh()').catch(()=>{});
+      writeFileSync(resolve(folder,'synthetic-d2-rejected-selection.json'),JSON.stringify({passed:results.length>=8 && results.every(row=>row.passed),checks:results,transportTrace,transport:'real loopback HTTP parser with held body and actual 409',actualAccountUsed:false,externalNetworkUsed:false},null,2));
+    }
+    assert.ok(results.length>=8,'D2 must exercise waiting rejection explicit recovery and reconnect');
+    assert.deepEqual(results.filter(row=>!row.passed),[],'D2 rejected selection contracts failed');
+  }
+  async function checkManualHistoryDeferred(){
+    let completed=false;
+    await until("lastState?.reader?.phase==='connected' && currentPage?.history?.phase==='loaded' && !busy && !refreshing && !ackInFlight && !pendingSelection");
+    const before=historyRooms.length;
+    await evaluate("clearTimeout(pollTimer);pollTimer=null;globalThis.manualHistoryFetch=fetch;globalThis.manualHistoryRelease=null;globalThis.manualHistoryHold=true;globalThis.fetch=async(path,options)=>{if(String(path)==='/api/status' && manualHistoryHold){manualHistoryHold=false;await new Promise(resolve=>{globalThis.manualHistoryRelease=resolve;});}return manualHistoryFetch(path,options);};queueRefresh(true);");
+    try{
+      await until("freshness==='checking' && typeof manualHistoryRelease==='function'");
+      assert.equal(await evaluate("el('history-load').disabled"),false,'the enabled manual control must preserve its checking click');
+      await evaluate("el('history-load').click();el('history-load').click()");
+      assert.equal(historyRooms.length,before);
+      assert.equal(await evaluate("pendingSelection!==null && pendingSelection===selectionView && selectionView.phase==='waiting'"),true);
+      await evaluate('manualHistoryRelease();scheduleRefresh()');await until("freshness==='fresh' && !refreshing && !busy");
+      await refreshUi();await until("pendingSelection===null && !busy && !refreshing && !lastState.reader.historyBusy");
+      for(let n=0;n<3;n++)await refreshUi();
+      assert.equal(historyRooms.length,before+1,'recovery executes one manual history without a second click');
+      completed=true;lifecycleChecks.push('manual history clicked while status checking stays queued and executes once after recovery');
+    }finally{
+      await evaluate('globalThis.manualHistoryRelease?.();globalThis.fetch=manualHistoryFetch;scheduleRefresh();').catch(()=>{});
+      writeFileSync(resolve(folder,'synthetic-manual-history-deferred.json'),JSON.stringify({passed:completed,syntheticHistoryRequests:historyRooms.length-before,actualAccountUsed:false},null,2));
+    }
   }
   async function checkThemeBrowser(){
     assert.ok(['light','dark'].includes(await evaluate('document.documentElement.dataset.theme')),'the running app must apply a theme before interaction');
@@ -363,7 +491,9 @@ await check('closing the photo dialog disables download',async()=>{assert.equal(
         assert.equal(await evaluate("!el('image-format-note').hidden && el('image-format-note').textContent.includes('흰색')"),true);
         await cancelPhoto();assert.equal(sendCalls.length,before);check(type+' converts to an opaque JPEG with a white alpha background before explicit send');
       }
-      await evaluate("(async()=>{lastState.photoTransport='loco';await prepareImage(await qaPhotoFile());})()");
+      // Generate the asynchronous fixture before injecting its mode so a real
+      // background status poll cannot replace the intended synthetic LOCO mode.
+      await evaluate("(async()=>{const file=await qaPhotoFile();lastState.photoTransport='loco';await prepareImage(file);})()");
       await until("el('image-send-dialog').open && !imagePreparing");const legacy=await evaluate('qaPhotoPixels()');assert.equal(legacy.mime,'image/png');assert.equal(legacy.left[3],0);await cancelPhoto();
       check('explicit legacy LOCO preparation preserves PNG alpha without HTTPS conversion');
       for(const declared of ['','image/x-png']){
@@ -427,6 +557,52 @@ await check('closing the photo dialog disables download',async()=>{assert.equal(
     }finally{
       await evaluate("globalThis.qaFallbackRestore?.();if(globalThis.qaBlobOriginal)HTMLCanvasElement.prototype.toBlob=qaBlobOriginal;clearImageDraft();sendNotes.delete(selectedRoom);scheduleRefresh()").catch(()=>{});
       writeFileSync(resolve(folder,'synthetic-photo-conversion.json'),JSON.stringify({passed:results.length===15,checks:results,actualAccountUsed:false,actualMessagesSent:0,syntheticSends:sendCalls.length-before},null,2));
+    }
+  }
+  async function checkDiagnosisRecovery(){
+    const results=[];
+    const record=name=>{results.push({name,passed:true});lifecycleChecks.push(name);};
+    await until("!busy && !refreshing && !ackInFlight && !pendingSelection && !pendingSend && !uncertainPhoto");
+    await evaluate("clearTimeout(pollTimer);pollTimer=null;showAccount(false);clearImageDraft();globalThis.diagnosisOriginalFetch=fetch;");
+    try{
+      for(const phase of ['accepted','failed','unknown']){
+        unknownPhoto=true;const before=sendCalls.length,acks=ackCalls.length;
+        await evaluate(`prepareImage(new File([Uint8Array.from(atob('${syntheticPng.toString('base64')}'),c=>c.charCodeAt(0))],'synthetic-lost-response.png',{type:'image/png'}))`);
+        await until("el('image-send-dialog').open && !el('image-send').disabled");
+        await evaluate("globalThis.dropPhotoResponse=true;globalThis.fetch=async(input,options)=>{const response=await diagnosisOriginalFetch(input,options);if(dropPhotoResponse && String(input)==='/api/reader/photo'){dropPhotoResponse=false;await response.arrayBuffer();throw new TypeError('synthetic response loss after server processing');}return response;};el('image-send').click();");
+        await until("uncertainPhoto!==null && pendingSend===null && !refreshing");
+        assert.equal(sendCalls.length,before+1);const request=sendCalls.at(-1);
+        assert.equal(await evaluate('uncertainPhoto.clientId'),request.clientId);
+        outcomes.set(request.clientId,{...outcomes.get(request.clientId),phase});outboxVersion++;revision++;
+        await refreshUi();
+        if(phase==='unknown'){
+          assert.equal(await evaluate("uncertainPhoto!==null && el('attach-image').disabled"),true);
+          await refreshUi();assert.equal(sendCalls.length,before+1);
+          await evaluate("globalThis.confirm=()=>true;el('send-reset').click()");
+          await until('uncertainPhoto===null && !outboxAcknowledging');assert.equal(ackCalls.length,acks+1);
+        }else{
+          await until('uncertainPhoto===null && pendingSend===null');assert.equal(ackCalls.length,acks);
+          assert.equal(await evaluate('imageDraft===null'),phase==='accepted');
+        }
+        assert.equal(await evaluate("!el('attach-image').disabled && el('send-reset').hidden"),true);
+        assert.equal(sendCalls.length,before+1,'outcome recovery never repeats the photo POST');
+        record('lost photo HTTP response recovers '+phase+' with one synthetic send and correct attachment state');
+        await evaluate('clearImageDraft();globalThis.fetch=diagnosisOriginalFetch;');
+      }
+      unknownPhoto=false;
+      const before=viewCalls.length;
+      await evaluate(`globalThis.holdViewResponse=true;globalThis.releaseDiagnosisView=null;globalThis.fetch=async(input,options)=>{const response=await diagnosisOriginalFetch(input,options);if(holdViewResponse && String(input)==='/api/reader/view'){holdViewResponse=false;await new Promise(resolve=>{globalThis.releaseDiagnosisView=resolve;});}return response;};void selectRoom('${key}');`);
+      await until("typeof releaseDiagnosisView==='function'");
+      await evaluate(`void selectRoom('${second}')`);
+      await until(`selectedRoom==='${second}' && viewPin===JSON.stringify([readerGeneration,readerAttempt,selectedRoom]) && !pendingSelection && !busy && !refreshing`);
+      await evaluate('releaseDiagnosisView()');await refreshUi();
+      assert.deepEqual(viewCalls.slice(before),[key,second]);
+      assert.equal(await evaluate(`selectedRoom==='${second}' && viewPin===JSON.stringify([readerGeneration,readerAttempt,selectedRoom])`),true);
+      record('late A view response cannot overwrite accepted B selection or cached view in the browser');
+    }finally{
+      unknownPhoto=false;
+      await evaluate('globalThis.releaseDiagnosisView?.();globalThis.fetch=diagnosisOriginalFetch;clearImageDraft();scheduleRefresh();').catch(()=>{});
+      writeFileSync(resolve(folder,'synthetic-diagnosis-recovery.json'),JSON.stringify({passed:results.length===4,checks:results,actualAccountUsed:false,actualMessagesSent:0},null,2));
     }
   }
   async function checkDefaultHttpsLifecycle(){
@@ -646,7 +822,8 @@ await check('closing the photo dialog disables download',async()=>{assert.equal(
   await until("document.querySelectorAll('.room-item').length===2");
   assert.equal(await evaluate("document.getElementById('title').textContent"),'대화 서버 연결됨');
   assert.equal(await evaluate("getComputedStyle(document.querySelector('.app-shell')).display"),'grid');
-  if(process.env.WEB_KAKAO_QA_HTTPS_LIFECYCLE_ONLY==='1'){await checkDefaultHttpsLifecycle();console.log(JSON.stringify({passed:true,scope:'synthetic default HTTPS QR and clear lifecycle',checks:lifecycleChecks,actualAccountUsed:false,artifacts:folder}));}
+  if(process.env.WEB_KAKAO_QA_D2_ONLY==='1'){await checkRejectedSelection();console.log(JSON.stringify({passed:true,scope:'synthetic two-tab rejected view only',checks:lifecycleChecks,actualAccountUsed:false,artifacts:folder}));}
+  else if(process.env.WEB_KAKAO_QA_HTTPS_LIFECYCLE_ONLY==='1'){await checkDefaultHttpsLifecycle();console.log(JSON.stringify({passed:true,scope:'synthetic default HTTPS QR and clear lifecycle',checks:lifecycleChecks,actualAccountUsed:false,artifacts:folder}));}
   else if(process.env.WEB_KAKAO_QA_PHOTO_ONLY==='1'){await checkPhotoConversion();console.log(JSON.stringify({passed:true,scope:'synthetic photo conversion and submit only',checks:lifecycleChecks,actualAccountUsed:false,artifacts:folder}));}
   else if(process.env.WEB_KAKAO_QA_ADVERSARIAL_ONLY==='1'){await checkAdversarialBrowser();console.log(JSON.stringify({passed:true,scope:'synthetic adversarial browser only',checks:lifecycleChecks,actualAccountUsed:false,artifacts:folder}));}
   else if(process.env.WEB_KAKAO_QA_UI_ONLY==='1'){await checkMobileAndThemes();await checkThemeBrowser();await checkHeaderLayout();console.log(JSON.stringify({passed:true,scope:'synthetic A UI theme and mobile only',checks:lifecycleChecks,actualAccountUsed:false,artifacts:folder}));}
@@ -915,6 +1092,7 @@ await check('closing the photo dialog disables download',async()=>{assert.equal(
   assert.ok(sendCalls.at(-1).replyTo);assert.equal(sendCalls.filter(call=>call.kind==='photo').length,photosAfterUnknown);
   assert.equal(await evaluate("uncertainPhoto!==null && document.getElementById('attach-image').disabled"),true);
   await evaluate("globalThis.confirm=()=>true;document.getElementById('send-reset').click()");
+  await until('uncertainPhoto===null && !outboxAcknowledging');
   assert.equal(await evaluate("uncertainPhoto===null && imageDraft===null && document.getElementById('send-reset').hidden && !document.getElementById('attach-image').disabled"),true);
   unknownPhoto=false;
   // A failed local enqueue retains a draft. Reconnect must invalidate its scope.
@@ -1033,7 +1211,10 @@ await check('closing the photo dialog disables download',async()=>{assert.equal(
   await checkMobileAndThemes();
   await checkThemeBrowser();
   await checkAdversarialBrowser();
+  await checkRejectedSelection();
+  await checkManualHistoryDeferred();
   await checkPhotoConversion();
+  await checkDiagnosisRecovery();
   await checkDefaultHttpsLifecycle();
   await evaluate("if(document.getElementById('account-panel').hidden)document.getElementById('account-toggle').click()");assert.equal(await evaluate("document.getElementById('account-panel').hidden"),false);
   await evaluate("document.getElementById('cancel').click()");await until("document.getElementById('reader-panel').hidden && document.getElementById('message-list').childElementCount===0");
