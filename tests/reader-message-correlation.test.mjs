@@ -184,11 +184,16 @@ test('review: stale nonzero A entry/read replies leave B session connected until
     assert.equal(carriage.pending.has(1),true);assert.equal(events.some(event=>event.type==='reader-failed'),false);
     carriage.finishPacket({packetId:1,method:'CHATONROOM',status:0,body:{c:'456'}});await pending;
     carriage.emit('push',{method:'MSG',status:0,body:{chatId:'456',chatLog:{logId:'20',authorId:'111',msg:'Synthetic'}}});
+    // Incremental display-name lookup is independent of the read request.
+    // Settle that exact optional packet instead of assuming the next ID is read.
+    const names=carriage.sent.findLast(packet=>packet.method==='MEMBER');
+    assert.ok(names);carriage.finishPacket({packetId:names.packetId,method:'MEMBER',status:0,body:{chatId:'456',members:[]}});
     const message=events.findLast(event=>event.type==='reader-messages').messages[0].key;
     pending=session.action(key,2,'read',{message});await Promise.resolve();
+    const read=carriage.sent.findLast(packet=>packet.method==='NOTIREAD');assert.ok(read);
     carriage.finishPacket({packetId:900,method:'NOTIREAD',status:-203,body:{c:'123',status:-203}});
-    assert.equal(carriage.pending.has(2),true);assert.equal(events.some(event=>event.type==='reader-failed'),false);
-    carriage.finishPacket({packetId:2,method:'NOTIREAD',status:0,body:{}});await pending;
+    assert.equal(carriage.pending.has(read.packetId),true);assert.equal(events.some(event=>event.type==='reader-failed'),false);
+    carriage.finishPacket({packetId:read.packetId,method:'NOTIREAD',status:0,body:{}});await pending;
     assert.equal(events.findLast(event=>event.type==='reader-action').phase,'accepted');assert.equal(events.some(event=>event.type==='reader-failed'),false);
   }finally{for(const [packetId,item] of carriage.pending){carriage.pending.delete(packetId);item.resolve({packetId,method:item.method,status:0,body:{c:'456'}});}await pending;session.close();}
 });

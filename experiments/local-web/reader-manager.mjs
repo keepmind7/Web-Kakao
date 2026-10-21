@@ -201,10 +201,12 @@ export function createReadOnlyReader({spawn=fork,now=Date.now,onBlocked=()=>{},g
             for(const room of rooms)if(!nextRooms.some(next=>next.key===room.key && next.canContext)){entries.delete(room.key);contexts.delete(room.key);readMarks.delete(room.key);touch(room.key);}
             if(JSON.stringify(nextRooms)!==JSON.stringify(rooms))roomsRevision++;
             rooms=nextRooms;sourceRoomCount=integer(message.stats?.sourceRoomCount);truncated=message.stats?.truncated===true;duplicates=integer(message.stats?.duplicates);
-            if(phase==='connecting' && message.source==='loginlist'){roomState.bind(rooms,{reconnect:attempts>1});clearTimeout(deadline);deadline=null;phase='connected';stage='loginlist';status=0;consecutiveFailures=0;connectedAt=now();}
-            else roomState.bind(rooms);
+            if(phase==='connecting' && message.source==='loginlist'){roomState.bind(rooms,{reconnect:attempts>1,seedBounds:message.seedBounds,generation:attempts});clearTimeout(deadline);deadline=null;phase='connected';stage='loginlist';status=0;consecutiveFailures=0;connectedAt=now();}
+            else roomState.bind(rooms,{seedBounds:message.seedBounds,generation:attempts});
             applySettings(message.rooms);
             revision++;
+          }else if(message?.type==='reader-own-read'){
+            if(phase==='connected' && roomKeyValid(message.key) && rooms.some(row=>row.key===message.key) && roomState.ownRead(message.key,message.read,message.proof)){roomsRevision++;revision++;}
           }else if(message?.type==='reader-cache-evicted' && roomKeyValid(message.key)){evict(message.key,message.cacheEpoch);revision++;
           }else if(message?.type==='reader-messages' && roomKeyValid(message.key) && rooms.some(row=>row.key===message.key)){
             if(message.source==='history' && (!pending || pending.requestId!==message.requestId || pending.key!==message.key))return;
@@ -214,7 +216,7 @@ export function createReadOnlyReader({spawn=fork,now=Date.now,onBlocked=()=>{},g
               if(pending?.action==='context' && pending.key===message.key)pending.invalidated=true;
             }
             if(message.entryInvalidated===true){entries.delete(message.key);readMarks.delete(message.key);if(pending?.key===message.key)pending.invalidated=true;}
-            if(message.source==='push'){roomState.receive(message.key,message.arrivals);if(message.partial===true)roomState.markPartial(message.key);roomsRevision++;}
+            if(message.source==='push'){roomState.receive(message.key,message.arrivals,{arrivalProof:message.arrivalProof});if(message.partial===true)roomState.markPartial(message.key);roomsRevision++;}
             const validHistory=message.unavailable!==true && message.fieldPresent===true && (message.receivedCount===0 || integer(message.acceptedCount)>0);
             const previous=pages.get(message.key);if(message.source==='history')cacheLost.delete(message.key);const history=message.source==='history'?{phase:message.unavailable===true?'unavailable':validHistory?'loaded':'unrecognized',hasMore:message.hasMore===true,gap:message.gap===true,receivedCount:integer(message.receivedCount),acceptedCount:integer(message.acceptedCount),rejectedCount:integer(message.rejectedCount),at:now()}:previous?.history ?? {phase:'idle'};
             pages.delete(message.key);pages.set(message.key,{key:message.key,messages:safeMessages(message.messages),latestVisible:message.latestVisible===true,history,revision:++revision});

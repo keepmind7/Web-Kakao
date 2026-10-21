@@ -47,7 +47,7 @@ test('A2/A4 CHATONROOM m[] names update already cached messages and reply author
     assert.equal(store.entrySnapshot(k,{c:'2000',m:[{userId:'111',nickName:'가짜'}]},store.receiptVersion(k)),false);assert.equal(store.current(k).messages[0].sender,'참여자 1');
   }finally{f.session.close();}
 });
-test('A3 one bounded read-only MEMBER lookup per room per connection names only requested members',async()=>{
+test('A3 bounded event-driven MEMBER lookups name only requested members',async()=>{
   const ids=Array.from({length:620},(_,n)=>String(5000+n));let answered=0;
   const f=sessionFixture({reply:(method,body)=>{
     if(method==='CHATONROOM')return {status:0,body:{c:String(body.chatId),mi:['999',...ids],a:ids,w:ids.map(()=>'0')}};
@@ -55,13 +55,19 @@ test('A3 one bounded read-only MEMBER lookup per room per connection names only 
       :answered===2?{status:0,method:'MEMBER',body:{chatId:'2000',members:[{userId:body.memberIds[0],nickName:'다른 방'}]}}:{status:-500,body:{status:-500}};}
   }});
   try{const [key]=await f.start();f.carriage.emit('push',msg({chatId:'1000',chatLog:log(1000,101,{authorId:'5000'})}));f.carriage.emit('push',msg({chatId:'1000',chatLog:log(1000,102,{authorId:'5100'})}));
-    await f.session.action(key,1,'context');await until(()=>f.calls.filter(call=>call.method==='MEMBER').length===5);await sleep(10);
+    await f.session.action(key,1,'context');await until(()=>f.calls.filter(call=>call.method==='MEMBER').length===1);await sleep(10);
+    assert.equal(f.last(key).messages[0].sender,'합성 멤버');
+    f.carriage.emit('push',msg({chatId:'1000',chatLog:log(1000,103,{authorId:'5200'})}));
+    await until(()=>f.calls.filter(call=>call.method==='MEMBER').length===2);await sleep(10);
     const member=f.calls.filter(call=>call.method==='MEMBER');
     assert.ok(member.every(call=>call.policy?.optional===true && call.ms===2500 && call.body.chatId==='1000' && call.body.memberIds.length<=100),'bounded optional MEMBER requests');
     assert.equal(member.flatMap(call=>call.body.memberIds).includes('999'),false,'self is never looked up');
-    const page=f.last(key).messages;assert.equal(page[0].sender,'합성 멤버');assert.equal(page[1].sender,'참여자 2','foreign-room MEMBER reply is ignored');
+    const page=f.last(key).messages;assert.equal(page[0].sender,'합성 멤버');assert.equal(page[2].sender,'참여자 3','foreign-room MEMBER reply is ignored');
     assert.equal(JSON.stringify(f.events).includes('요청 안 됨'),false);
-    await f.session.action(key,2,'context');await sleep(10);assert.equal(f.calls.filter(call=>call.method==='MEMBER').length,5,'no second lookup on this connection');
+    await f.session.action(key,2,'context');await sleep(10);assert.equal(f.calls.filter(call=>call.method==='MEMBER').length,2,'repeated context does not walk the roster');
+    f.carriage.emit('push',msg({chatId:'1000',chatLog:log(1000,104,{authorId:'5300'})}));
+    await until(()=>f.calls.filter(call=>call.method==='MEMBER').length===3);await sleep(10);
+    assert.equal(f.calls.filter(call=>call.method==='MEMBER').length,3,'a later new author can be supplemented on the same connection');
     assert.equal(f.closed,0);
   }finally{f.session.close();}
   assert.equal(allowedReaderMethod('MEMBER',{messaging:true}),true);assert.equal(allowedReaderMethod('MEMBER'),false);

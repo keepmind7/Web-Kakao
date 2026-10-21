@@ -83,6 +83,17 @@ const kindOf=value=>value==='OD'?'OpenDirectChat':value==='OM'?'OpenMultiChat':n
 const int32=value=>Number.isInteger(value) && value>=-2147483648 && value<=2147483647;
 const signedLinkId=serverId;
 const fieldsOf=(row,fields)=>fields.filter(field=>object(row) && Object.hasOwn(row,field)).map(field=>row[field]);
+// MSG's top-level nickname belongs only to its one unambiguous original log.
+// Check aliases before discovery normalizes them, so a conflict cannot be lost.
+export function messageNickname(body,roomId){
+  if(!object(body) || !object(body.chatLog) || logArray(body)?.length!==1 || typeof body.authorNickname!=='string')return undefined;
+  if(['log','l','chatLogs','logs','msgs','messages'].some(field=>Object.hasOwn(body,field)))return undefined;
+  const log=body.chatLog,rooms=[...fieldsOf(body,['chatId','roomId','chatRoomId','c']),...fieldsOf(log,['chatId','roomId','chatRoomId','c'])];
+  const authors=[...fieldsOf(log,['authorId','senderId','userId','writerId']),...fieldsOf(log.sender,['userId'])];
+  if(!serverId(roomId) || !rooms.length || rooms.some(id=>serverId(id)!==roomId) || !authors.length || !serverId(authors[0]) || authors.some(id=>serverId(id)!==serverId(authors[0]))
+    || Object.hasOwn(log,'sender') && !object(log.sender))return undefined;
+  return clean(body.authorNickname,80);
+}
 function matchingRoom(body,id,{required=true}={}){
   const ids=[...fieldsOf(body,['chatId','roomId','chatRoomId','c']),...fieldsOf(body?.chatInfo,['chatId','id','roomId','chatRoomId','c'])];
   return (!required || ids.length>0) && ids.every(value=>serverId(value)===id);
@@ -136,9 +147,24 @@ export function createReaderStore(body, ownUserId, salt=randomBytes(32),settings
   if (!rows) throw new Error('room_list_missing');
   let sourceRoomCount=rows.length;
   const rooms=new Map(),byServerId=new Map(),cache=new Map(),aliases=new Map();
-  let duplicates=0,invalidMessages=0,aliasCount=0,pinned=null;
+  let duplicates=0,invalidMessages=0,aliasCount=0,pinned=null,unreadEntries=0;
   const opaque=(prefix,id)=>prefix+createHmac('sha256',salt).update(id).digest('hex').slice(0,24);
-  const learn=(room,id,value)=>{const name=clean(value,80).trim();if(id && id!==ownUserId && name && (room.names.has(id) || room.names.size<500))room.names.set(id,name);};
+  const inlineAuthors=key=>new Set([...(cache.get(key)?.values() ?? [])].filter(item=>item.name.trim()).map(item=>item.authorId));
+  const learn=(room,id,value)=>{
+    const name=clean(value,80).trim();if(!serverId(id) || id===ownUserId || !name)return;
+    if(!room.names.has(id) && room.names.size>=500){
+      const protectedIds=new Set([id,...[...(cache.get(room.key)?.values() ?? [])].map(item=>item.authorId)]);
+      const oldest=[...room.names.keys()].find(candidate=>!protectedIds.has(candidate));if(!oldest)return;
+      room.names.delete(oldest);
+    }
+    room.names.delete(id);room.names.set(id,name);
+  };
+  function metadataScope(room,node){
+    if(!object(node) || Object.hasOwn(node,'chatInfo') && !object(node.chatInfo))return false;
+    const containers=[node,...(object(node.chatInfo)?[node.chatInfo]:[])];
+    return containers.every(value=>fieldsOf(value,['chatId','roomId','chatRoomId','c',...(value===node.chatInfo?['id']:[])]).every(id=>serverId(id)===room.serverRoomId)
+      && fieldsOf(value,['li','linkId','openLinkId']).every(id=>serverId(id)===room.linkId));
+  }
   function addRoom(row,{discovered=false}={}) {
     const serverRoomId=idOfRoom(row);if(!serverRoomId || byServerId.has(serverRoomId) || rooms.size>=ROOM_LIMIT)return null;
     const ids=fieldsOf(row,['chatId','id','roomId','chatRoomId','c']);if(ids.some(id=>serverId(id)!==serverRoomId))return null;
@@ -157,7 +183,7 @@ export function createReaderStore(body, ownUserId, salt=randomBytes(32),settings
     const invalidCount=counts.some(value=>!Number.isSafeInteger(value) || value<0 || value>INITIAL_UNREAD_LIMIT || value!==counts[0])
       || row?.invalidNewMessageCount!==undefined && row.invalidNewMessageCount!==false;
     const initialUnreadCount=discovered || invalidCount?0:counts[0] ?? 0,initialUnreadCoverage=!discovered && invalidCount?'partial':'observed';
-    rooms.set(key,{key,serverRoomId,preferenceKey:settingsSecret?preferenceId(settingsSecret,'room',ownUserId,serverRoomId):null,historyEnd,baseline:discovered?'0':historyEnd,initialUnreadCount,initialUnreadCoverage,seed,names,kind,rawType,linkId,link:null,ownMember:null,contextVerified:false,token:'0',muteUntil:0,explicitTitle:Boolean(explicitTitle(row)),left:row.left===true,cacheEpoch:0,receiptVersion:0,membershipDirty:false,expectedMembers:Number.isSafeInteger(row.a ?? row.activeMembersCount)?(row.a ?? row.activeMembersCount):null,members:null,watermarks:new Map(),receiptReady:false,
+    rooms.set(key,{key,serverRoomId,preferenceKey:settingsSecret?preferenceId(settingsSecret,'room',ownUserId,serverRoomId):null,historyEnd,baseline:discovered?'0':historyEnd,initialUnreadCount,initialUnreadCoverage,ownReadMark:null,ownReadPending:false,unreadLogs:new Map(),unreadPartial:false,seed,names,kind,rawType,linkId,link:null,ownMember:null,contextVerified:false,token:'0',muteUntil:0,explicitTitle:Boolean(explicitTitle(row)),left:row.left===true,cacheEpoch:0,receiptVersion:0,membershipDirty:false,expectedMembers:Number.isSafeInteger(row.a ?? row.activeMembersCount)?(row.a ?? row.activeMembersCount):null,members:null,watermarks:new Map(),receiptReady:false,
       title:name || `이름 없는 대화방 ${rooms.size+1}`,titleKnown:Boolean(name),preview:text(last).slice(0,160),lastAt:timestamp(last?.sendAt ?? last?.createdAt ?? row?.updatedAt)});
     byServerId.set(serverRoomId,key);
     return key;
@@ -226,6 +252,17 @@ export function createReaderStore(body, ownUserId, salt=randomBytes(32),settings
   }
   function watermark(value){
     try{if(value===0 || value===0n || value==='0' || object(value) && value.toString?.()==='0')return '0';return serverId(value);}catch{return '';}
+  }
+  function ownReadUpdate(room,{release=true}={}){
+    const mark=room.ownReadMark;if(mark===null)return null;
+    const keys=[];
+    for(const [id,key] of room.unreadLogs)if(BigInt(id)<=BigInt(mark)){
+      keys.push(key);if(release){room.unreadLogs.delete(id);unreadEntries--;}
+    }
+    const clearInitial=room.baseline!==null && BigInt(mark)>=BigInt(room.baseline);
+    const clearEvents=Boolean(room.historyEnd && BigInt(mark)>=BigInt(room.historyEnd));
+    if(release)room.ownReadPending=false;
+    return {key:room.key,ownRead:{keys,clearInitial,clearEvents,partial:room.unreadPartial || !clearInitial && room.initialUnreadCount>0}};
   }
   function capabilities(room){
     const normal=Boolean(room && normalKinds.has(room.kind) && !room.left);
@@ -385,25 +422,28 @@ export function createReaderStore(body, ownUserId, salt=randomBytes(32),settings
       const row=response?.ol ?? response?.openLink ?? response;
       return applyLink(row,{deleted:['SYNCLINKDL','LNKDELETED'].includes(method)}).map(key=>({key,...view(key),receiptInvalidated:true,entryInvalidated:true}));
     },
-    unnamedMembers(key){
+    unnamedMembers(key,{visibleOnly=false}={}){
       const room=rooms.get(key);if(!room)return [];
-      const ids=new Set([...(room.memberIds ?? []),...[...(cache.get(key)?.values() ?? [])].map(item=>item.authorId)]);
-      return [...ids].filter(id=>id && id!==ownUserId && !room.names.has(id)).slice(0,500);
+      const inline=inlineAuthors(key),unknown=id=>serverId(id) && id!==ownUserId && !room.names.has(id) && !inline.has(id);
+      const visible=[...new Set([...(cache.get(key)?.values() ?? [])].map(item=>item.authorId))].filter(unknown);
+      return visible.length || visibleOnly?visible.slice(0,500):[...(room.memberIds ?? [])].filter(unknown).slice(0,500);
     },
+    memberNameKnown:(key,id)=>Boolean(rooms.get(key)?.names.has(id) || inlineAuthors(key).has(id)),
     // Pinned member.ts MemberRes {chatId,members}. Only requested IDs are named.
     applyMembers(key,body,requested){
-      const room=rooms.get(key);if(!room || !object(body) || serverId(body.chatId)!==room.serverRoomId || !Array.isArray(body.members) || !Array.isArray(requested) || body.members.length>requested.length)return false;
-      const wanted=new Set(requested);let changed=false;
-      for(const member of body.members){const id=serverId(member?.userId);if(!wanted.delete(id))continue;const before=room.names.get(id);learn(room,id,member?.nickName ?? member?.nickname);changed ||= room.names.get(id)!==before;}
+      const room=rooms.get(key);if(!room || !metadataScope(room,body) || serverId(body.chatId)!==room.serverRoomId || !Array.isArray(body.members) || !Array.isArray(requested) || requested.length>500 || body.members.length>requested.length || body.members.some(member=>!metadataScope(room,member)))return false;
+      const wanted=new Set(requested.map(serverId).filter(id=>id && id!==ownUserId)),inline=inlineAuthors(key);let changed=false;
+      for(const member of body.members){const id=serverId(member.userId);if(!wanted.delete(id) || room.names.has(id) || inline.has(id))continue;learn(room,id,member.nickName ?? member.nickname);changed ||= room.names.has(id);}
       return changed;
     },
+    titleMissing:key=>{const room=rooms.get(key);return Boolean(room && !room.left && !room.titleKnown && room.kind!=='MemoChat');},
     unnamedRooms(limit=8){
       return [...rooms.values()].filter(room=>!room.titleKnown && room.kind!=='MemoChat')
         .sort((a,b)=>(b.lastAt ?? 0)-(a.lastAt ?? 0)).slice(0,Math.min(8,Math.max(0,limit))).map(room=>room.key);
     },
     recoverTitle(key,response){
       const room=rooms.get(key),row=response?.chatInfo;
-      if(!room || room.titleKnown || room.kind==='MemoChat' || !object(row) || row.left!==undefined && row.left!==false)return false;
+      if(!room || room.titleKnown || room.kind==='MemoChat' || !metadataScope(room,response) || !object(row) || row.left!==undefined && row.left!==false)return false;
       // CHATINFO is only optional display metadata here. Require an actual,
       // unambiguous response identity; never copy the requested ID into it.
       const ids=['chatId','id','roomId','chatRoomId','c'].filter(field=>Object.hasOwn(row,field));
@@ -415,7 +455,7 @@ export function createReaderStore(body, ownUserId, salt=randomBytes(32),settings
     unknownRooms(body){
       if(rooms.size>=ROOM_LIMIT)return [];
       const ids=new Set();
-      for(const log of (logArray(body) ?? []).slice(0,200)){
+      for(const log of (logArray(body) ?? (object(body) && serverId(body.logId)?[body]:[])).slice(0,200)){
         const id=serverId(body?.chatId ?? body?.c ?? log?.chatId ?? log?.roomId),attached=serverId(log?.chatId ?? log?.roomId ?? log?.c);
         if(id && (!attached || attached===id) && serverId(log?.logId ?? log?.msgId ?? log?.id) && !byServerId.has(id))ids.add(id);
       }
@@ -466,13 +506,35 @@ export function createReaderStore(body, ownUserId, salt=randomBytes(32),settings
       if(body?.left===true || left && serverId(body?.userId)===ownUserId && body?.left!==false){room.left=true;room.link=null;}
       return {key,...view(key),receiptInvalidated:true,entryInvalidated:true};
     },
-    readUpdate(body){
+    readUpdate(body,{deferOwnRead=false}={}){
       const key=byServerId.get(serverId(body?.chatId ?? body?.c)),room=rooms.get(key);
       const user=serverId(body?.userId),mark=watermark(body?.watermark);
-      if(!room || !user || !mark)return null;
+      if(!room || !user || !mark || !metadataScope(room,body))return null;
+      if(user===ownUserId){
+        if(room.ownReadMark!==null && BigInt(mark)<=BigInt(room.ownReadMark))return null;
+        room.ownReadMark=mark;room.ownReadPending=deferOwnRead;
+        return ownReadUpdate(room,{release:!deferOwnRead});
+      }
       if(room.members && !room.members.has(user))room.receiptReady=false;
       const previous=room.watermarks.get(user);if(!previous || BigInt(mark)>BigInt(previous))room.watermarks.set(user,mark);
       return {key,...view(key)};
+    },
+    flushOwnRead(key){const room=rooms.get(key);return room?.ownReadPending?ownReadUpdate(room):null;},
+    // Narrow internal IPC proof: log positions only, never room/user IDs and
+    // never part of rooms(), message pages or readUpdate's opaque handoff.
+    seedBounds:()=>[...rooms.values()].map(room=>({key:room.key,bound:room.baseline})),
+    ownReadProof(key){const mark=rooms.get(key)?.ownReadMark;return mark===null || mark===undefined?null:{watermark:mark};},
+    arrivalProof(key,arrivals,body){
+      const room=rooms.get(key);if(!room || !Array.isArray(arrivals) || arrivals.length>200)return [];
+      const wanted=new Set(arrivals.map(item=>item.key)),proof=[];
+      for(const log of (logArray(body) ?? []).slice(0,200)){
+        const id=serverId(log?.logId ?? log?.msgId ?? log?.id),message=id?opaque('m_',room.serverRoomId+':'+id):'';
+        const roomIds=[...fieldsOf(body,['chatId','roomId','chatRoomId','c']),...fieldsOf(log,['chatId','roomId','chatRoomId','c'])];
+        if(!wanted.has(message) || !object(log) || roomIds.some(value=>serverId(value)!==room.serverRoomId)
+          || fieldsOf(log,['logId','msgId','id']).some(value=>serverId(value)!==id))continue;
+        wanted.delete(message);proof.push({key:message,position:id});
+      }
+      return proof;
     },
     writeAccepted(key,body,message,{type=1,attachment}={}){
       const room=rooms.get(key);if(!room)return null;
@@ -506,7 +568,7 @@ export function createReaderStore(body, ownUserId, salt=randomBytes(32),settings
     },
     push(body,{preserveAck=false}={}) {
       const logs=logArray(body) ?? (object(body) && serverId(body.logId) ? [body] : []);
-      const updates=new Map(),nickname=logs.length===1 && object(body?.chatLog)?body.authorNickname:undefined; // Pinned msg.ts: MSG top-level authorNickname.
+      const updates=new Map();
       for(const log of logs.slice(0,200)) {
         if(!object(log)){invalidMessages++;continue;}
         const serverRoomId=serverId(body?.chatId ?? body?.c ?? log?.chatId ?? log?.roomId);
@@ -516,20 +578,26 @@ export function createReaderStore(body, ownUserId, salt=randomBytes(32),settings
         if(!logId || (attached && attached!==serverRoomId)){invalidMessages++;continue;}
         const room=rooms.get(key);
         const sender=serverId(log.authorId ?? log.senderId ?? log.userId ?? log.writerId ?? log.sender?.userId);
-        if(nickname!==undefined)learn(room,sender,nickname);
+        const nickname=messageNickname(body,serverRoomId);if(nickname!==undefined)learn(room,sender,nickname);
         if(logId && (!room.historyEnd || BigInt(logId)>BigInt(room.historyEnd)))room.historyEnd=logId;
         const merged=merge(key,[log],false,{preserveAck});if(!merged?.acceptedCount)continue;
         const at=timestamp(log.sendAt ?? log.createdAt);
         if(at && (!room.lastAt || at>=room.lastAt)){room.lastAt=at;room.preview=text(log).slice(0,160);}
         const kind=Number(log.type ?? log.msgType ?? log.t ?? 1);
         const arrivals=updates.get(key)?.arrivals ?? [];
-        arrivals.push({key:opaque('m_',room.serverRoomId+':'+logId),incoming:sender?sender!==ownUserId:null,
-          afterBaseline:room.baseline?BigInt(logId)>BigInt(room.baseline):null,userMessage:[1,2,3,5,18,26,27].includes(kind)});
-        updates.set(key,{key,messages:merged.messages,latestVisible:merged.latestVisible,arrivals});
+        const baseline=room.baseline===null?room.ownReadMark:room.ownReadMark===null?room.baseline:BigInt(room.baseline)>BigInt(room.ownReadMark)?room.baseline:room.ownReadMark;
+        const arrival={key:opaque('m_',room.serverRoomId+':'+logId),incoming:sender?sender!==ownUserId:null,
+          afterBaseline:baseline!==null?BigInt(logId)>BigInt(baseline):null,userMessage:[1,2,3,5,18,26,27].includes(kind)};
+        if(arrival.incoming===true && arrival.afterBaseline===true && arrival.userMessage && !room.unreadLogs.has(logId)){
+          if(room.unreadLogs.size<2000 && unreadEntries<20000){room.unreadLogs.set(logId,arrival.key);unreadEntries++;}
+          else room.unreadPartial=true;
+        }
+        arrivals.push(arrival);
+        updates.set(key,{key,messages:merged.messages,latestVisible:merged.latestVisible,arrivals,...(room.unreadPartial?{partial:true}:{})});
       }
       return [...updates.values()];
     },
     stats:()=>({sourceRoomCount,roomCount:rooms.size,truncated:sourceRoomCount>ROOM_LIMIT,duplicates,invalidMessages}),
-    clear(){rooms.clear();byServerId.clear();cache.clear();aliases.clear();aliasCount=0;},
+    clear(){rooms.clear();byServerId.clear();cache.clear();aliases.clear();aliasCount=0;unreadEntries=0;},
   };
 }

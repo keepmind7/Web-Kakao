@@ -1,5 +1,5 @@
 import { probeRoomCount } from './room-probe.mjs';
-import { createReaderStore,logArray,serverId,compareReadPosition } from './reader-data.mjs';
+import { createReaderStore,logArray,serverId,compareReadPosition,messageNickname,CACHE_LIMIT } from './reader-data.mjs';
 import { responseStatus } from './reader-response.mjs';
 import { decodeImage,messageKeyValid } from './message-content.mjs';
 import { uploadPhoto } from './media-upload.mjs';
@@ -20,8 +20,11 @@ export function createReaderSession(credential,factory,emit) {
   const discoveryQueue=new Map(),discoveryAttempts=new Map();let discoveryPromise=null,discoveryInFlight=null,discoverTimer=null;
   const linkRepairs=new Map();let activeLinkRepair=null;
   const now=factory.now ?? (()=>performance.now());
-  let titleQueue=[],titlePromise=null,titleChanged=false,aliveAt=-Infinity;
-  const memberLookups=new Set();
+  let titleQueue=[],titlePromise=null,titleInFlight=null,titleChanged=false,aliveAt=-Infinity;
+  const titleAttempts=new Set(),memberLookups=new Map(),metadataWaits=new Set();
+  const visibleViews=new Map();
+  const pendingOwnReads=new Set();
+  let memberInFlight=null,pendingMembers=null;
   // Discovery replays are bounded in bytes, not only packet counts.
   const DISCOVERY_BYTES=2*1024*1024,ATTACHMENT_BYTES=8192;
   const queuedBytes=()=>[...discoveryQueue.values(),...(discoveryInFlight?[discoveryInFlight.packets]:[])].reduce((n,packets)=>n+(packets.bytes ?? 0),0);
@@ -32,19 +35,28 @@ export function createReaderSession(credential,factory,emit) {
   const uploadAbort=new AbortController();
   let activePhoto=null;
   const invalidatePhoto=key=>{if(activePhoto?.key===key)activePhoto.controller.abort();};
-  const publish=(update,source)=>{
-    if(update)emit({type:'reader-messages',...update,source});
-    emit({type:'reader-rooms',rooms:store.rooms(),stats:store.stats(),source:'push'});
+  const emitRooms=source=>emit({type:'reader-rooms',rooms:store.rooms(),stats:store.stats(),source,seedBounds:store.seedBounds()});
+  function emitMessages(update,source,{preserveLatest=false,arrivalProof}={}){
+    // Display metadata cannot promote an incomplete history page to latest.
+    const latestVisible=preserveLatest?visibleViews.get(update.key)===true:update.latestVisible===true;
+    visibleViews.delete(update.key);visibleViews.set(update.key,latestVisible);
+    while(visibleViews.size>CACHE_LIMIT)visibleViews.delete(visibleViews.keys().next().value);
+    emit({type:'reader-messages',...update,latestVisible,source,...(source==='push'?{arrivalProof:arrivalProof ?? []}:{})});
+  }
+  const publish=(update,source,body)=>{
+    if(update)emitMessages(update,source,{arrivalProof:source==='push'?store.arrivalProof(update.key,update.arrivals,body):undefined});
+    emitRooms('push');
   };
   const stopped=new Promise(resolve=>{resolveStop=resolve;});
   const close=()=>{
     if(closed)return;closed=true;uploadAbort.abort();activeLinkRepair?.controller.abort();linkRepairs.clear();
-    clearInterval(pingTimer);clearTimeout(discoverTimer);carriage?.stopPing();carriage?.disconnect();store?.clear();cursors.clear();memberLookups.clear();gapProbes.clear();readProbed.clear();entries.clear();activeRoom=null;discoveryQueue.clear();discoveryAttempts.clear();titleQueue=[];resolveStop();
+    for(const cancel of metadataWaits)cancel();metadataWaits.clear();pendingMembers=null;memberInFlight=null;visibleViews.clear();pendingOwnReads.clear();
+    clearInterval(pingTimer);clearTimeout(discoverTimer);carriage?.stopPing();carriage?.disconnect();store?.clear();cursors.clear();memberLookups.clear();gapProbes.clear();readProbed.clear();entries.clear();activeRoom=null;discoveryQueue.clear();discoveryAttempts.clear();titleQueue=[];titleAttempts.clear();resolveStop();
   };
   function activate(key){
     if(activeRoom===key)return;
     activeLinkRepair?.controller.abort();
-    const previous=activeRoom;activeRoom=key;selectionVersion++;entries.clear();store?.pin(key); // The active room is never display-LRU evicted.
+    const previous=activeRoom;activeRoom=key;selectionVersion++;entries.clear();pendingMembers=null;store?.pin(key); // The active room is never display-LRU evicted.
     if(previous)invalidatePhoto(previous);
     if(previous && store?.has(previous))publish({...store.current(previous),entryInvalidated:true},'receipt');
   }
@@ -71,21 +83,77 @@ export function createReaderSession(credential,factory,emit) {
     }
     const receiptReady=store.receiptSnapshot(key,response.body,version);
     entries.set(key,{version,selection,receiptReady});
-    store.recent(key);publish(store.current(key),'receipt');void lookupMembers(key);
+    store.recent(key);publish(store.current(key),'receipt');lookupMembers(key,{visibleOnly:false});
     return {ready:true,receiptReady};
   }
-  // Read-only MEMBER name lookup: once per opened room and connection, at most
-  // five exact-correlated optional requests of 100 IDs. Failure keeps aliases.
-  async function lookupMembers(key){
-    if(factory.messaging!==true || closed || memberLookups.has(key) || !store.has(key))return;memberLookups.add(key);
-    const ids=store.unnamedMembers(key);
-    for(let n=0;n<ids.length && n<500 && !closed && store.has(key);n+=100){
-      const batch=ids.slice(n,n+100);
-      try{
-        const response=await carriage.request('MEMBER',{chatId:factory.toLong(store.serverRoomId(key)),memberIds:batch.map(id=>factory.toLong(id))},2500,{optional:true});
-        if(!closed && responseStatus(response)===0 && (response.method===undefined || response.method==='MEMBER') && store.applyMembers(key,response.body,batch))emit({type:'reader-messages',...store.current(key),source:'receipt'});
-      }catch{/* Optional lookup expiry/refusal leaves the current labels. */}
+  const scope=key=>({key,id:store.serverRoomId(key),selection:selectionVersion,version:store.receiptVersion(key),linkId:store.linkId(key)});
+  const currentScope=work=>!closed && store?.has(work.key) && activeRoom===work.key && work.selection===selectionVersion
+    && work.id===store.serverRoomId(work.key) && work.version===store.receiptVersion(work.key) && work.linkId===store.linkId(work.key);
+  // Session deadlines also cover injected transports. Late SDK results are
+  // observed but never applied after expiry, selection changes or shutdown.
+  function optionalMetadata(operation,timeout){
+    return new Promise((resolve,reject)=>{
+      let done=false,timer;
+      const finish=(fn,value)=>{if(done)return;done=true;clearTimeout(timer);metadataWaits.delete(cancel);fn(value);};
+      const cancel=()=>finish(reject,new Error('metadata_cancelled'));
+      metadataWaits.add(cancel);timer=setTimeout(()=>finish(reject,new Error('metadata_expired')),timeout);timer.unref?.();
+      try{if(closed){cancel();return;}Promise.resolve(operation()).then(value=>finish(resolve,value),error=>finish(reject,error));}catch(error){finish(reject,error);}
+    });
+  }
+  const namesEligible=work=>factory.messaging===true && currentScope(work) && entryReady(work.key) && store.canAction(work.key,'read');
+  function nameState(key){
+    const at=now();
+    for(const [candidate,state] of memberLookups){
+      state.requests=state.requests.filter(time=>at-time<60000);
+      for(const [id,until] of state.negative)if(at>=until)state.negative.delete(id);
+      if(candidate!==key && candidate!==memberInFlight?.key && !state.requests.length && !state.negative.size)memberLookups.delete(candidate);
     }
+    let state=memberLookups.get(key);if(!state)state={requests:[],negative:new Map()};
+    // Do not evict an unexpired budget/cache and accidentally permit a retry.
+    if(!memberLookups.has(key) && memberLookups.size>=64)return null;
+    memberLookups.delete(key);memberLookups.set(key,state);
+    return state;
+  }
+  function lookupMembers(key,{visibleOnly=true}={}){
+    if(closed || !store?.has(key))return;
+    const work={...scope(key),visibleOnly};if(!namesEligible(work))return;
+    pendingMembers=work;drainMembers();
+  }
+  function drainMembers(){
+    if(closed || memberInFlight || !pendingMembers)return;
+    const work=pendingMembers;pendingMembers=null;if(!namesEligible(work))return;
+    const at=now(),state=nameState(work.key);if(!state)return;
+    state.requests=state.requests.filter(time=>at-time<60000);
+    for(const [id,until] of state.negative)if(at>=until)state.negative.delete(id);
+    const batch=store.unnamedMembers(work.key,{visibleOnly:work.visibleOnly}).filter(id=>!state.negative.has(id)).slice(0,Math.min(100,500-state.negative.size));
+    if(!batch.length || state.requests.length>=5)return;
+    state.requests.push(at);memberInFlight=work;
+    void (async()=>{
+      let finished=false,settled=false;
+      const release=()=>{if(!finished || !settled)return;if(memberInFlight===work)memberInFlight=null;drainMembers();};
+      try{
+        const response=await optionalMetadata(()=>{
+          try{return Promise.resolve(carriage.request('MEMBER',{chatId:factory.toLong(work.id),memberIds:batch.map(id=>factory.toLong(id))},2500,{optional:true})).finally(()=>{settled=true;release();});}
+          catch(error){settled=true;throw error;}
+        },2500);
+        if(namesEligible(work) && responseStatus(response)===0 && (response.method===undefined || response.method==='MEMBER') && store.applyMembers(work.key,response.body,batch))emitMessages(store.current(work.key),'receipt',{preserveLatest:true});
+      }catch{/* Optional expiry/refusal keeps aliases and never fails the carriage. */}
+      finally{
+        if(namesEligible(work)){
+          for(const id of batch)if(!store.memberNameKnown(work.key,id)){state.negative.delete(id);state.negative.set(id,now()+300000);}
+          while(state.negative.size>500)state.negative.delete(state.negative.keys().next().value);
+        }
+        // Only an independent event can have queued this next pass. A response
+        // never starts the next old roster batch or a timer-only retry.
+        // Even a transport that ignores its deadline cannot overlap two names
+        // requests. The real SDK settles its optional request at that deadline.
+        finished=true;release();
+      }
+    })();
+  }
+  function selectTitle(key){
+    if(closed || !store.titleMissing(key) || titleAttempts.has(key))return;
+    titleAttempts.add(key);titleQueue.push({...scope(key),selected:true});scheduleDiscovery();
   }
   const needsLinkRepair=key=>factory.messaging===true && store?.has(key) && store.isOpen(key) && store.missingOpenLinkIds(1,[key]).length>0;
   const eligibleLinkRepair=()=>[...linkRepairs].find(([key,attempt])=>attempt.ready && !attempt.terminal && attempt.count<3 && now()>=attempt.retryAt && needsLinkRepair(key));
@@ -122,7 +190,7 @@ export function createReaderSession(credential,factory,emit) {
       }
     }finally{
       clearTimeout(timer);if(activeLinkRepair?.controller===controller)activeLinkRepair=null;
-      if(!closed){attempt.ready=false;attempt.terminal=attempt.count>=3 || !needsLinkRepair(key);attempt.retryAt=now()+3000;emit({type:'reader-rooms',rooms:store.rooms(),stats:store.stats(),source:'push'});}
+      if(!closed){attempt.ready=false;attempt.terminal=attempt.count>=3 || !needsLinkRepair(key);attempt.retryAt=now()+3000;emitRooms('push');}
     }
   }
   function scheduleDiscovery(){
@@ -134,21 +202,22 @@ export function createReaderSession(credential,factory,emit) {
       if(!next){
         const link=eligibleLinkRepair();
         if(link){discoveryPromise=repairLink(link[0]).finally(()=>{discoveryPromise=null;scheduleDiscovery();});return;}
-        const key=titleQueue.shift();if(!key)return;
+        const work=titleQueue.shift();if(!work)return;const {key}=work;titleInFlight=work;
         titlePromise=Promise.resolve().then(async()=>{
-          if(closed)return;
+          if(closed || work.selected && (!currentScope(work) || !store.titleMissing(key)))return;
           try{
-            const response=await carriage.request('CHATINFO',{chatId:factory.toLong(store.serverRoomId(key))},3000,{optional:true});
-            if(closed || responseStatus(response)!==0 || response?.method!==undefined && response.method!=='CHATINFO')return;
+            const request=()=>carriage.request('CHATINFO',{chatId:factory.toLong(store.serverRoomId(key))},3000,{optional:true});
+            const response=work.selected?await optionalMetadata(request,3000):await request();
+            if(closed || work.selected && !currentScope(work) || responseStatus(response)!==0 || response?.method!==undefined && response.method!=='CHATINFO')return;
             if(store.recoverTitle(key,response.body))titleChanged=true;
           }catch{
             // Optional metadata rejection/decoding is nonfatal. A real socket
             // error/close still reaches the existing transport listeners.
           }
         }).finally(()=>{
-          titlePromise=null;
+          titlePromise=null;titleInFlight=null;
           // One room list after the repair batch rather than one per recovered title.
-          if(!closed && titleChanged && !titleQueue.length){titleChanged=false;emit({type:'reader-rooms',rooms:store.rooms(),stats:store.stats(),source:'push'});}
+          if(!closed && titleChanged && !titleQueue.length){titleChanged=false;emitRooms('push');}
           scheduleDiscovery();
         });
         return;
@@ -168,7 +237,10 @@ export function createReaderSession(credential,factory,emit) {
             linkRepairs.set(key,{count:0,retryAt:0,ready:true,terminal:false});
             await repairLink(key);if(closed)return;
           }
-          for(const packet of packets)for(const update of store.push(packet))publish(packets.partial?{...update,partial:true}:update,'push');
+          for(const packet of packets){
+            const body=packet.chatLog?{chatId:packet.chatId,chatLog:packet.chatLog,authorNickname:packet.authorNickname}:packet;
+            for(const update of store.push(body)){publish(packets.partial?{...update,partial:true}:update,'push',body);lookupMembers(update.key);}
+          }
           if(packets.partial && !packets.length)publish({...store.current(key),partial:true},'push');
         }catch(error){
           if(!closed && error?.code==='READER_REQUEST_TIMEOUT' && attempt.count<3){
@@ -188,8 +260,8 @@ export function createReaderSession(credential,factory,emit) {
         const fail=(stage,status)=>{if(closed)return;emit({type:'reader-failed',stage,status:Number.isInteger(status)?status:null});close();};
         void probeRoomCount(credential,factory,async(client,body,earlyPush=[])=>{
           if(closed)return;
-          carriage=client;store=createReaderStore(body,credential.userId,factory.sessionSalt,factory.settingsSecret,{onCacheEvicted:key=>{cursors.delete(key);gapProbes.delete(key);emit({type:'reader-cache-evicted',key,cacheEpoch:store.cacheEpoch(key)});}});
-          titleQueue=store.unnamedRooms(8);
+          carriage=client;store=createReaderStore(body,credential.userId,factory.sessionSalt,factory.settingsSecret,{onCacheEvicted:key=>{cursors.delete(key);gapProbes.delete(key);visibleViews.delete(key);emit({type:'reader-cache-evicted',key,cacheEpoch:store.cacheEpoch(key)});}});
+          titleQueue=store.unnamedRooms(8).map(key=>({key,selected:false}));for(const {key} of titleQueue)titleAttempts.add(key);
           carriage.on('disconnected',()=>fail('disconnected'));
           carriage.on('error',()=>fail('transport'));
           const onPush=packet=>{
@@ -198,7 +270,11 @@ export function createReaderSession(credential,factory,emit) {
             alive();
             try {
               if(factory.messaging===true && packet?.method==='DECUNREAD'){
-                const update=store.readUpdate(packet.body);if(update)publish(update,'receipt');return;
+                const update=store.readUpdate(packet.body,{deferOwnRead:!announced});
+                if(update?.ownRead){
+                  if(announced)emit({type:'reader-own-read',key:update.key,read:update.ownRead,proof:store.ownReadProof(update.key)});
+                  else pendingOwnReads.add(update.key); // Known rooms bound this set to ROOM_LIMIT.
+                }else if(update)publish(update,'receipt');return;
               }
               if(factory.messaging===true && ['NEWMEM','LEFT'].includes(packet?.method)){
                 const update=store.invalidateReceipts(packet.body,{left:packet.method==='LEFT'});if(update){if(activeLinkRepair?.key===update.key)activeLinkRepair.controller.abort();entries.delete(update.key);invalidatePhoto(update.key);publish(update,'receipt');}return;
@@ -229,23 +305,27 @@ export function createReaderSession(credential,factory,emit) {
                 const logs=validLogs.slice(0,remaining).map(log=>({logId:serverId(log.logId ?? log.msgId ?? log.id),authorId:serverId(log.authorId ?? log.senderId ?? log.userId ?? log.writerId ?? log.sender?.userId),
                   msg:[...(typeof (log.message ?? log.msg ?? log.text ?? log.content)==='string'?(log.message ?? log.msg ?? log.text ?? log.content):'')].slice(0,4000).join(''),
                   type:Number(log.type ?? log.msgType ?? log.t ?? 1),attachment:[2,26,27].includes(Number(log.type ?? log.msgType ?? log.t ?? 1)) && typeof log.attachment==='string' && log.attachment.length<=ATTACHMENT_BYTES?log.attachment:undefined,sendAt:Number(log.sendAt ?? log.createdAt),senderName:typeof (log.senderName ?? log.authorName)==='string'?(log.senderName ?? log.authorName).slice(0,80):''}));
-                const bytes=logs.reduce((n,log)=>n+256+2*(log.msg.length+(log.attachment?.length ?? 0)+log.senderName.length),0);
+                const nickname=logs.length===1?messageNickname(packet.body,id):undefined;
+                const bytes=logs.reduce((n,log)=>n+256+2*(log.msg.length+(log.attachment?.length ?? 0)+log.senderName.length),0)+2*(nickname?.length ?? 0);
                 // Over budget: drop this room's further replays and mark it partial.
                 if(logs.length && queuedBytes()+bytes>DISCOVERY_BYTES)packets.partial=true;
-                else if(logs.length){packets.push({chatId:id,chatLogs:logs});packets.bytes=(packets.bytes ?? 0)+bytes;}
+                else if(logs.length){packets.push({chatId:id,chatLogs:logs,...(nickname!==undefined?{chatLog:logs[0],authorNickname:nickname}:{})});packets.bytes=(packets.bytes ?? 0)+bytes;}
               }
               scheduleDiscovery();
               const updates=store.push(packet.body);
               for(const update of updates){const attempt=linkRepairs.get(update.key);if(attempt && !attempt.terminal && attempt.count<3 && now()>=attempt.retryAt && needsLinkRepair(update.key))attempt.ready=true;}
-              for(const update of updates)emit({type:'reader-messages',...update,source:'push'});
-              if(updates.length)emit({type:'reader-rooms',rooms:store.rooms(),stats:store.stats(),source:'push'});
+              // A push may arrive while initial link metadata is pending. Give
+              // the manager its vetted room before that room's first arrivals.
+              if(!announced && updates.length)emitRooms('push');
+              for(const update of updates){emitMessages(update,'push',{arrivalProof:store.arrivalProof(update.key,update.arrivals,packet.body)});lookupMembers(update.key);}
+              if(updates.length)emitRooms('push');
               scheduleDiscovery();
             } catch { fail('decode'); }
           };
           carriage.on('push',onPush);
           if(earlyPush.length){
             // Make opaque rooms available before replaying their initial logs.
-            emit({type:'reader-rooms',rooms:store.rooms(),stats:store.stats(),source:'push'});
+            emitRooms('push');
             for(const packet of earlyPush){if(closed)break;onPush(packet);}
           }
           if(closed)return;
@@ -271,7 +351,13 @@ export function createReaderSession(credential,factory,emit) {
             }
           }
           if(closed)return;
-          announced=true;emit({type:'reader-rooms',rooms:store.rooms(),stats:store.stats(),source:'loginlist'});resolve({ok:true});
+          announced=true;emitRooms('loginlist');
+          for(const key of pendingOwnReads){
+            // Recompute against the current latest bound. A marker captured
+            // before a later MSG must not clear that MSG at startup.
+            const update=store.flushOwnRead(key);if(update)emit({type:'reader-own-read',key,read:update.ownRead,proof:store.ownReadProof(key)});
+          }
+          pendingOwnReads.clear();resolve({ok:true});
           scheduleDiscovery();
           await stopped;
         }).then(result=>{
@@ -279,11 +365,11 @@ export function createReaderSession(credential,factory,emit) {
         }).catch(()=>{if(!closed)fail('worker');resolve({ok:false});});
       });
     },
-    view(key){if(closed || !store?.has(key))return false;activate(key);return true;},
+    view(key){if(closed || !store?.has(key))return false;activate(key);selectTitle(key);return true;},
     async history(key,requestId) {
       const started=now(),remaining=()=>18000-(now()-started);
       const selection=selectionVersion;
-      if(titlePromise)await titlePromise;
+      if(titlePromise && !titleInFlight?.selected)await titlePromise;
       if(discoveryPromise)await discoveryPromise;
       if(closed || !store || !carriage || busy || !store.has(key) || selectionVersion!==selection)return false;
       activate(key);
@@ -293,7 +379,7 @@ export function createReaderSession(credential,factory,emit) {
       store.recent(key);
       const cacheEpoch=store.cacheEpoch(key);let cacheInvalidated=false;
       if(!end){
-        emit({type:'reader-messages',...store.history(key,{}),requestId,source:'history',unavailable:true});
+        emitMessages({...store.history(key,{}),requestId,unavailable:true},'history');
         return true;
       }
       busy=true;
@@ -348,14 +434,15 @@ export function createReaderSession(credential,factory,emit) {
         }
         cacheInvalidated ||= store.cacheEpoch(key)!==cacheEpoch;
         if(cacheInvalidated){cursors.delete(key);gapProbes.delete(key);}
-        emit({type:'reader-messages',...result,...(cacheInvalidated || budgetStopped?{latestVisible:false}:{}),fieldPresent,receivedCount,acceptedCount,rejectedCount,hasMore:cacheInvalidated || budgetStopped || hasMore,gap:cacheInvalidated || gap,requestId,source:'history'});return true;
+        emitMessages({...result,...(cacheInvalidated || budgetStopped?{latestVisible:false}:{}),fieldPresent,receivedCount,acceptedCount,rejectedCount,hasMore:cacheInvalidated || budgetStopped || hasMore,gap:cacheInvalidated || gap,requestId},'history');
+        if(!cacheInvalidated && fieldPresent && selectionVersion===selection)lookupMembers(key);return true;
       } catch {if(!closed){emit({type:'reader-failed',stage:'history',status:null});close();}return false;}
       finally{busy=false;scheduleDiscovery();}
     },
     async action(key,requestId,action,payload={}){
       const started=Date.now(),bound=max=>{const remaining=22500-(Date.now()-started);if(remaining<=0)throw new Error('action_deadline');return Math.min(max,remaining);};
       const selection=selectionVersion;
-      if(titlePromise)await titlePromise;
+      if(titlePromise && !titleInFlight?.selected)await titlePromise;
       if(discoveryPromise)await discoveryPromise;
       // Context/read/photo belong to the selected view, including time spent
       // waiting for metadata. Explicit text sends retain their distinct intent.
