@@ -32,6 +32,7 @@ export function createReaderSession(credential,factory,emit) {
   const alive=()=>{const at=Date.now();if(at-aliveAt<30000)return;aliveAt=at;emit({type:'reader-alive',at});};
   let nextMessageId=Date.now()%0x3fffffff;
   const observeSend=details=>{try{factory.observeSend?.(details);}catch{/* Diagnostics cannot change a send outcome. */}};
+  const observeOwnRead=(stage,reason)=>{try{factory.observeOwnRead?.(stage,reason);}catch{/* Diagnostics cannot change inbound read handling. */}};
   const uploadAbort=new AbortController();
   let activePhoto=null;
   const invalidatePhoto=key=>{if(activePhoto?.key===key)activePhoto.controller.abort();};
@@ -260,22 +261,25 @@ export function createReaderSession(credential,factory,emit) {
         const fail=(stage,status)=>{if(closed)return;emit({type:'reader-failed',stage,status:Number.isInteger(status)?status:null});close();};
         void probeRoomCount(credential,factory,async(client,body,earlyPush=[])=>{
           if(closed)return;
-          carriage=client;store=createReaderStore(body,credential.userId,factory.sessionSalt,factory.settingsSecret,{onCacheEvicted:key=>{cursors.delete(key);gapProbes.delete(key);visibleViews.delete(key);emit({type:'reader-cache-evicted',key,cacheEpoch:store.cacheEpoch(key)});}});
+          carriage=client;store=createReaderStore(body,credential.userId,factory.sessionSalt,factory.settingsSecret,{observeOwnRead:reason=>observeOwnRead('classification',reason),onCacheEvicted:key=>{cursors.delete(key);gapProbes.delete(key);visibleViews.delete(key);emit({type:'reader-cache-evicted',key,cacheEpoch:store.cacheEpoch(key)});}});
           titleQueue=store.unnamedRooms(8).map(key=>({key,selected:false}));for(const {key} of titleQueue)titleAttempts.add(key);
           carriage.on('disconnected',()=>fail('disconnected'));
           carriage.on('error',()=>fail('transport'));
           const onPush=packet=>{
             if(closed)return;
-            if(responseStatus(packet)!==0){fail('push',responseStatus(packet));return;}
+            const ownReadMethod=['DECUNREAD','CHATINFO','UPDATECHAT','BLSYNC'].includes(packet?.method);
+            if(responseStatus(packet)!==0){if(ownReadMethod)observeOwnRead('session','status_rejected');fail('push',responseStatus(packet));return;}
             alive();
             try {
               if(factory.messaging===true && packet?.method==='DECUNREAD'){
+                observeOwnRead('session','supported');
                 const update=store.readUpdate(packet.body,{deferOwnRead:!announced});
                 if(update?.ownRead){
-                  if(announced)emit({type:'reader-own-read',key:update.key,read:update.ownRead,proof:store.ownReadProof(update.key)});
-                  else pendingOwnReads.add(update.key); // Known rooms bound this set to ROOM_LIMIT.
+                  if(announced){emit({type:'reader-own-read',key:update.key,read:update.ownRead,proof:store.ownReadProof(update.key)});observeOwnRead('handoff','emitted');}
+                  else{pendingOwnReads.add(update.key);observeOwnRead('handoff','deferred');} // Known rooms bound this set to ROOM_LIMIT.
                 }else if(update)publish(update,'receipt');return;
               }
+              if(ownReadMethod)observeOwnRead('session',packet.method==='DECUNREAD'?'disabled':'unsupported');
               if(factory.messaging===true && ['NEWMEM','LEFT'].includes(packet?.method)){
                 const update=store.invalidateReceipts(packet.body,{left:packet.method==='LEFT'});if(update){if(activeLinkRepair?.key===update.key)activeLinkRepair.controller.abort();entries.delete(update.key);invalidatePhoto(update.key);publish(update,'receipt');}return;
               }
@@ -355,7 +359,7 @@ export function createReaderSession(credential,factory,emit) {
           for(const key of pendingOwnReads){
             // Recompute against the current latest bound. A marker captured
             // before a later MSG must not clear that MSG at startup.
-            const update=store.flushOwnRead(key);if(update)emit({type:'reader-own-read',key,read:update.ownRead,proof:store.ownReadProof(key)});
+            const update=store.flushOwnRead(key);if(update){emit({type:'reader-own-read',key,read:update.ownRead,proof:store.ownReadProof(key)});observeOwnRead('handoff','flushed');}
           }
           pendingOwnReads.clear();resolve({ok:true});
           scheduleDiscovery();

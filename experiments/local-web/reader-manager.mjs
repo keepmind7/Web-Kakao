@@ -4,6 +4,7 @@ import { randomBytes,createHash } from 'node:crypto';
 import { checkPinnedSource } from './kakao-auth.mjs';
 import { roomKeyValid,ROOM_LIMIT,MESSAGE_LIMIT,CACHE_LIMIT,initialUnreadState } from './reader-data.mjs';
 import { createRoomState } from './reader-room-state.mjs';
+import { createOwnReadDiagnostics } from './reader-own-read-diagnostics.mjs';
 import { createPreferenceStore,validSettings,validRoomSettings } from './preferences.mjs';
 import { photoUrl } from './photos.mjs';
 import { messageKeyValid,clientIdValid,decodeImage } from './message-content.mjs';
@@ -31,6 +32,8 @@ export function safeMessages(rows){
 export function createReadOnlyReader({spawn=fork,now=Date.now,onBlocked=()=>{},gapProbe=false,messaging=false,photoTransport=DEFAULT_PHOTO_TRANSPORT,preferenceStore=createPreferenceStore()}={}){
   photoTransport=normalizePhotoTransport(photoTransport);
   const instanceId=randomBytes(12).toString('hex');
+  const ownReadDiagnostics=createOwnReadDiagnostics({component:'manager'});
+  const observeOwnRead=reason=>{try{ownReadDiagnostics.record('apply',reason);}catch{/* Observation cannot affect receipt application. */}};
   let child=null,signal=null,abortHandler=null,deadline=null,phase='idle',stage=null,status=null,attempts=0,consecutiveFailures=0,rooms=[],pages=new Map(),request=0,pending=null,revision=0,connectedAt=null;
   let historyRequests=0,historySuccesses=0,pushBatches=0,duplicates=0,sourceRoomCount=0,truncated=false;
   const sessionSalt=randomBytes(32).toString('hex'),roomState=createRoomState(),outbox=new Map(),contexts=new Map(),readMarks=new Map(),readStates=new Map(),viewTokens=new Map();
@@ -107,7 +110,7 @@ export function createReadOnlyReader({spawn=fork,now=Date.now,onBlocked=()=>{},g
     try{owner.send(message,error=>{if(error && child===owner)fail('ipc');});}catch{if(child===owner)fail('ipc');}
   }
   return {
-    snapshot(){return {instanceId,phase,stage,status,attempts,roomCount:rooms.length,sourceRoomCount,truncated,connectedAt,lastActivityAt,serverNow:now(),historyRequests,historySuccesses,historyBusy:pending?.action==='history',operationBusy:pending!==null,pushBatches,duplicates,sendRequests,sendAccepted,revision,roomsRevision,settingsRevision,outboxRevision,pageRevisions:Object.fromEntries(pageRevisions),canConnect:['idle','disconnected'].includes(phase)&&consecutiveFailures<3,readOnly:!messaging};},
+    snapshot(){return {instanceId,phase,stage,status,attempts,roomCount:rooms.length,sourceRoomCount,truncated,connectedAt,lastActivityAt,serverNow:now(),historyRequests,historySuccesses,historyBusy:pending?.action==='history',operationBusy:pending!==null,pushBatches,duplicates,sendRequests,sendAccepted,revision,roomsRevision,settingsRevision,outboxRevision,pageRevisions:Object.fromEntries(pageRevisions),canConnect:['idle','disconnected'].includes(phase)&&consecutiveFailures<3,readOnly:!messaging,ownReadDiagnostics:ownReadDiagnostics.snapshot()};},
     outbox(clientId){if(clientId===undefined)return [...outbox.values()].filter(entry=>['sending','unknown'].includes(entry.phase)&&!entry.acknowledged).map(publicEntry);if(!clientIdValid(clientId))return null;return publicEntry(outbox.get(clientId) ?? retired.get(clientId));},
     acknowledgeOutbox(clientId){const entry=outbox.get(clientId);if(!entry || entry.phase!=='unknown')return false;if(!entry.acknowledged){entry.acknowledged=true;outboxRevision++;touch(entry.key);revision++;}return true;},
     view(key){if(phase!=='connected' || !rooms.some(row=>row.key===key))return false;if(pinned===key)return true;pinned=key;send({type:'reader-view',key});return true;},
@@ -206,7 +209,17 @@ export function createReadOnlyReader({spawn=fork,now=Date.now,onBlocked=()=>{},g
             applySettings(message.rooms);
             revision++;
           }else if(message?.type==='reader-own-read'){
-            if(phase==='connected' && roomKeyValid(message.key) && rooms.some(row=>row.key===message.key) && roomState.ownRead(message.key,message.read,message.proof)){roomsRevision++;revision++;}
+            observeOwnRead('received');
+            if(phase!=='connected'){observeOwnRead('stale_connection');return;}
+            const room=roomKeyValid(message.key) && rooms.find(row=>row.key===message.key);
+            if(!room){observeOwnRead('invalid_room');return;}
+            const before=roomState.decorate(room).unreadLocalCount;
+            const changed=roomState.ownRead(message.key,message.read,message.proof,reason=>{if(reason!=='changed')observeOwnRead(reason);});
+            if(changed){
+              observeOwnRead('changed');
+              if(roomState.decorate(room).unreadLocalCount<before)observeOwnRead('decreased');
+              roomsRevision++;revision++;
+            }
           }else if(message?.type==='reader-cache-evicted' && roomKeyValid(message.key)){evict(message.key,message.cacheEpoch);revision++;
           }else if(message?.type==='reader-messages' && roomKeyValid(message.key) && rooms.some(row=>row.key===message.key)){
             if(message.source==='history' && (!pending || pending.requestId!==message.requestId || pending.key!==message.key))return;
@@ -266,6 +279,6 @@ export function createReadOnlyReader({spawn=fork,now=Date.now,onBlocked=()=>{},g
       deadline=setTimeout(()=>fail('history'),22000);deadline.unref?.();send({type:'reader-history',key,requestId});return true;
     },
     disconnect(){if(['blocked','closed'].includes(phase))return;terminate();phase='disconnected';stage='manual';revision++;},
-    close(){terminate();if(phase!=='blocked'){phase='closed';stage='cancelled';}rooms=[];pages.clear();roomState.clear();outbox.clear();retired.clear();pageRevisions.clear();cacheLost.clear();cacheEpochs.clear();pinned=null;outboxRevision++;roomsRevision++;settingsRevision++;contexts.clear();readMarks.clear();readStates.clear();viewTokens.clear();preferenceKeys.clear();profile?.close();profile=null;revision++;},
+    close(){terminate();if(phase!=='blocked'){phase='closed';stage='cancelled';}rooms=[];pages.clear();roomState.clear();ownReadDiagnostics.reset();outbox.clear();retired.clear();pageRevisions.clear();cacheLost.clear();cacheEpochs.clear();pinned=null;outboxRevision++;roomsRevision++;settingsRevision++;contexts.clear();readMarks.clear();readStates.clear();viewTokens.clear();preferenceKeys.clear();profile?.close();profile=null;revision++;},
   };
 }

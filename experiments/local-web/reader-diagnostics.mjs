@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { privateDataRoot,ensurePrivateDirectory } from './private-storage.mjs';
 import { randomUUID } from 'node:crypto';
 import { responseStatus } from './reader-response.mjs';
+import { createOwnReadDiagnostics } from './reader-own-read-diagnostics.mjs';
 
 const FIELDS=new Set(['chatDatas','chatInfos','chats','chatRooms','chatList','chatId','id','roomId','chatRoomId','c','t','a','n','s','l','i','k','ll','o','title','roomName','name','subject','meta','chatMetas','type','content','displayMembers','displayNickNames','displayNicknames','displayNames','nickName','nickname','profileName','displayName','lastChatLog','lastLog','chatLog','log','chatLogs','logs','msgs','messages','logId','msgId','message','msg','text','authorId','senderId','userId','writerId','sendAt','createdAt','updatedAt','lastChatLogId','lastLogId','isOK','minLogId','jsi','lastTokenId','lastChatId','status']);
 const METHODS=new Set(['GETCONF','CHECKIN','LOGINLIST','SYNCMSG','MCHATLOGS','PING','MSG','KICKOUT','CHANGESVR','BLSYNC','CHATINFO','WRITE','CHATONROOM','NOTIREAD','DECUNREAD','SHIP','POST','COMPLETE']);
@@ -61,16 +62,17 @@ const SEND_STAGES=new Set(['start','entry','member_lookup','member_verified','bl
 const SEND_PHASES=new Set(['sending','accepted','failed','unknown']);
 const SEND_REASONS=new Set(['entry_unavailable','open_member_unverified','member_missing','member_rejected','member_timeout','member_invalid','permission_changed','write_rejected','write_ack_unrecognized','write_correlation','write_timeout','transport','invalidated']);
 export function createReaderDiagnostic({writeSnapshot=null,writeSendSnapshot=null,debounceMs=1000}={}){
-
+  const ownRead=createOwnReadDiagnostics();
   const state={runId:randomUUID(),startedAt:Date.now(),rawValuesRecorded:false,lastOperation:'startup',readSync:{requests:0,responses:0,accepted:0,rejected:0,unknown:0},events:[],uploadStages:{}};let ended=false,timer=null,dirty=false,sendDirty=false,sendAttempted=false,streamBytes=0,outputFolder=null;
   const folder=()=>{if(!outputFolder){const path=join(privateDataRoot(),'web-auth');ensurePrivateDirectory(path);outputFolder=path;}return outputFolder;};
   const save=()=>{
     clearTimeout(timer);timer=null;
-    if(dirty){dirty=false;try{const data=JSON.stringify(state)+'\n';if(writeSnapshot)writeSnapshot(data);else writeFileSync(join(folder(),'reader-diagnostic.json'),data);}catch{/* Never fall back to raw stderr. */}}
+    if(dirty){dirty=false;try{const data=JSON.stringify({...state,ownRead:ownRead.snapshot()})+'\n';if(writeSnapshot)writeSnapshot(data);else writeFileSync(join(folder(),'reader-diagnostic.json'),data);}catch{/* Never fall back to raw stderr. */}}
     if(sendDirty){sendDirty=false;try{const data=JSON.stringify(state.lastSend)+'\n';if(writeSendSnapshot)writeSendSnapshot(data);else if(!writeSnapshot)writeFileSync(join(folder(),'reader-send-diagnostic.json'),data);}catch{/* An injected primary writer never falls back to disk. */}}
   };
   const schedule=()=>{dirty=true;if(!timer){timer=setTimeout(save,debounceMs);timer.unref?.();}};
   return {
+    ownRead(stage,reason,method){if(ended)return;try{ownRead.record(stage,reason,method);schedule();}catch{/* Diagnostics cannot change packet processing. */}},
     note(event,details={}){
       if(ended)return;
       // Photo producers are a privacy boundary: never retain arbitrary keys,

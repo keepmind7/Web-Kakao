@@ -137,22 +137,24 @@ export function createRoomState({perRoomLimit=2000,totalLimit=20000,bloomBytes=2
       if(!state.events.size)notices.delete(key);
       return {message:issued.message};
     },
-    ownRead(key,read,proof){
+    ownRead(key,read,proof,observe){
+      const report=reason=>{try{if(typeof observe==='function')observe(reason);}catch{/* Observation cannot affect receipt application. */}};
       const state=rooms.get(key);
-      if(!roomKeyValid(key) || !state || !read || typeof read!=='object' || Array.isArray(read)
+      if(!roomKeyValid(key) || !state){report('invalid_room');return false;}
+      if(!read || typeof read!=='object' || Array.isArray(read)
         || Object.keys(read).length!==4 || !['keys','clearInitial','clearEvents','partial'].every(field=>Object.hasOwn(read,field))
         || !Array.isArray(read.keys) || read.keys.length>2000 || read.keys.some(item=>!messageKey(item))
-        || new Set(read.keys).size!==read.keys.length || ['clearInitial','clearEvents','partial'].some(field=>typeof read[field]!=='boolean'))return false;
+        || new Set(read.keys).size!==read.keys.length || ['clearInitial','clearEvents','partial'].some(field=>typeof read[field]!=='boolean')){report('invalid_payload');return false;}
       const wanted=new Set(read.keys),knownHere=message=>state.events.has(message) || state.exact.has(key+':'+message);
       // Validate the entire payload before applying its flags. These linear,
       // bounded scans avoid payload-size times total-history work. Stale own
       // keys can have left dedupe memory; only a known foreign-only key rejects.
-      for(const other of rooms.values())if(other!==state)for(const message of other.events.keys())if(wanted.has(message) && !knownHere(message))return false;
-      for(const [fingerprint,owner] of exact)if(owner!==state){const message=fingerprint.slice(fingerprint.indexOf(':')+1);if(wanted.has(message) && !knownHere(message))return false;}
+      for(const other of rooms.values())if(other!==state)for(const message of other.events.keys())if(wanted.has(message) && !knownHere(message)){report('invalid_payload');return false;}
+      for(const [fingerprint,owner] of exact)if(owner!==state){const message=fingerprint.slice(fingerprint.indexOf(':')+1);if(wanted.has(message) && !knownHere(message)){report('invalid_payload');return false;}}
       const before=state.initialUnreadCount+state.events.size,partial=state.partial || globalPartial;
-      if(!shape(proof,['watermark']) || !position(proof.watermark)){state.partial=true;return partial!==(state.partial || globalPartial);}
+      if(!shape(proof,['watermark']) || !position(proof.watermark)){state.partial=true;report('invalid_payload');return partial!==(state.partial || globalPartial);}
       const mark=proof.watermark;
-      if(state.ownFloor!==null && BigInt(mark)<=BigInt(state.ownFloor))return false;
+      if(state.ownFloor!==null && BigInt(mark)<=BigInt(state.ownFloor)){report('stale_position');return false;}
       state.ownFloor=mark;
       const unknownPending=[...state.events.keys()].some(message=>!state.positions.has(message) && !wanted.has(message));
       const unknownRetained=[...state.events].some(([message,sequence])=>sequence<=state.recoverySequence && !state.positions.has(message) && !wanted.has(message));
@@ -168,7 +170,8 @@ export function createRoomState({perRoomLimit=2000,totalLimit=20000,bloomBytes=2
       if(!state.events.size)notices.delete(key);
       // Keep local seen tokens, sequence and Bloom/exact dedupe intact. The
       // next arrival receives a later sequence and cannot be cleared by this IPC.
-      return before!==state.initialUnreadCount+state.events.size || partial!==(state.partial || globalPartial);
+      const changed=before!==state.initialUnreadCount+state.events.size || partial!==(state.partial || globalPartial);
+      report(changed?'changed':'unchanged');return changed;
     },
     clear(){rooms.clear();tokens.clear();notices.clear();exact.clear();bloom.fill(0);notifications=false;entries=0;occupiedBits=0;globalPartial=false;},
   };

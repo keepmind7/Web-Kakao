@@ -35,6 +35,7 @@ function writeFingerprints(packet,request){
 // The pinned SDK matches a packet ID before checking the method. A server push
 // with the same numeric ID must not resolve a pending history request.
 export function guardReaderClient(Client,diagnostic,{messaging=false,media=false}={}){
+  const observeOwnRead=(reason,method)=>{try{diagnostic?.ownRead?.('transport',reason,method);}catch{/* Observation cannot affect response correlation. */}};
   return class extends Client{
     writeRequests=new WeakMap();
     roomRequests=new WeakMap();
@@ -105,11 +106,12 @@ export function guardReaderClient(Client,diagnostic,{messaging=false,media=false
       }finally{if(replacement)clearTimeout(replacement);if(onAbort)signal.removeEventListener('abort',onAbort);}
     }
     finishPacket(packet){
+      observeOwnRead('received',packet.method);
       // After cancellation a packet number alone cannot distinguish a late old
       // ACK from a new one. Require explicit message identity for this carriage
       // lifetime, but allow a strongly matched new ACK to reuse an old number.
       const cancelledWrite=packet.method==='WRITE' && this.writeCancellationObserved;
-      if(cancelledWrite && !values(packet.body,['msgId']).length || !cancelledWrite && this.expiredOptional.has(`${packet.method}:${String(packet.packetId)}`)){diagnostic?.packet('push',packet);return;}
+      if(cancelledWrite && !values(packet.body,['msgId']).length || !cancelledWrite && this.expiredOptional.has(`${packet.method}:${String(packet.packetId)}`)){observeOwnRead('quarantined',packet.method);diagnostic?.packet('push',packet);return;}
       const exact=this.pending.get(packet.packetId);
       let entry=exact?.method===packet.method?[packet.packetId,exact]:null;
       if(packet.method==='WRITE'){
@@ -133,16 +135,16 @@ export function guardReaderClient(Client,diagnostic,{messaging=false,media=false
         }
         if(packet.method==='WRITE'){
           const fingerprints=writeFingerprints(packet,this.writeRequests.get(entry[1]));
-          if(fingerprints.some(value=>this.completedWrites.has(value)))return;
+          if(fingerprints.some(value=>this.completedWrites.has(value))){observeOwnRead('duplicate_drop',packet.method);return;}
           for(const value of [...fingerprints,'packet:'+String(packet.packetId),'packet:'+String(entry[0])])this.completedWrites.add(value);
           while(this.completedWrites.size>WRITE_RESPONSE_LIMIT)this.completedWrites.delete(this.completedWrites.values().next().value);
         }
-        clearTimeout(entry[1].timer);this.pending.delete(entry[0]);entry[1].resolve(packet);return;
+        observeOwnRead('matched',packet.method);clearTimeout(entry[1].timer);this.pending.delete(entry[0]);entry[1].resolve(packet);return;
       }
       // An uncorrelated WRITE is neither another request's acknowledgement nor
       // an incoming message. Leave its pending request to time out as unknown.
-      if(packet.method==='WRITE' || ROOM_RESPONSES.has(packet.method) || EXACT_RESPONSES.has(packet.method)){diagnostic?.packet('push',packet);return;}
-      diagnostic?.packet('push',packet);this.emit('push',normalizedResponse(packet));
+      if(packet.method==='WRITE' || ROOM_RESPONSES.has(packet.method) || EXACT_RESPONSES.has(packet.method)){observeOwnRead('scoped_drop',packet.method);diagnostic?.packet('push',packet);return;}
+      observeOwnRead('forwarded',packet.method);diagnostic?.packet('push',packet);this.emit('push',normalizedResponse(packet));
     }
   };
 }

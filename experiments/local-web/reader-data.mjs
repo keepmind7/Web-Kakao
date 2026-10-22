@@ -142,7 +142,9 @@ function text(log) {
 
 // Raw account/server identifiers stay inside the worker. Browser keys are
 // session-scoped opaque handles; data is never serialized to disk or a log.
-export function createReaderStore(body, ownUserId, salt=randomBytes(32),settingsSecret=null,{onCacheEvicted=()=>{}}={}) {
+export function createReaderStore(body, ownUserId, salt=randomBytes(32),settingsSecret=null,options={}) {
+  const {onCacheEvicted=()=>{}}=options;
+  const observeOwnRead=reason=>{try{options.observeOwnRead?.(reason);}catch{/* Observation must not change the store result. */}};
   const rows=roomArray(body);
   if (!rows) throw new Error('room_list_missing');
   let sourceRoomCount=rows.length;
@@ -509,14 +511,19 @@ export function createReaderStore(body, ownUserId, salt=randomBytes(32),settings
     readUpdate(body,{deferOwnRead=false}={}){
       const key=byServerId.get(serverId(body?.chatId ?? body?.c)),room=rooms.get(key);
       const user=serverId(body?.userId),mark=watermark(body?.watermark);
-      if(!room || !user || !mark || !metadataScope(room,body))return null;
+      if(!room){observeOwnRead('unknown_room');return null;}
+      if(!user){observeOwnRead('invalid_user');return null;}
+      if(!mark){observeOwnRead('invalid_position');return null;}
+      if(!metadataScope(room,body)){observeOwnRead('scope_mismatch');return null;}
       if(user===ownUserId){
-        if(room.ownReadMark!==null && BigInt(mark)<=BigInt(room.ownReadMark))return null;
+        if(room.ownReadMark!==null && BigInt(mark)<=BigInt(room.ownReadMark)){observeOwnRead('stale_own');return null;}
         room.ownReadMark=mark;room.ownReadPending=deferOwnRead;
+        observeOwnRead('own_accepted');
         return ownReadUpdate(room,{release:!deferOwnRead});
       }
       if(room.members && !room.members.has(user))room.receiptReady=false;
       const previous=room.watermarks.get(user);if(!previous || BigInt(mark)>BigInt(previous))room.watermarks.set(user,mark);
+      observeOwnRead('peer_accepted');
       return {key,...view(key)};
     },
     flushOwnRead(key){const room=rooms.get(key);return room?.ownReadPending?ownReadUpdate(room):null;},

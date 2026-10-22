@@ -37,7 +37,7 @@ process.on('message',async message=>{
       const Media=guardReaderClient(sdk.CarriageClient,diagnostic,{messaging,media:true});
       const sessionSalt=typeof message.sessionSalt==='string' && /^[a-f0-9]{64}$/.test(message.sessionSalt)?Buffer.from(message.sessionSalt,'hex'):undefined;
       const settingsSecret=typeof message.settingsSecret==='string' && /^[a-f0-9]{64}$/.test(message.settingsSecret)?Buffer.from(message.settingsSecret,'hex'):null;
-      session=createReaderSession(credential,{booking:()=>new Booking(),ticket:()=>new Ticket(),carriage:()=>new Carriage(),media:()=>new Media(),toLong:sdk.toLong,messaging,photoTransport,sessionSalt,settingsSecret,gapProbe:message.gapProbe===true,readProbe:true,observeRead:details=>diagnostic.note('read-verification',details),observeHistory:details=>diagnostic.note('history-page',details),observeUpload:details=>diagnostic.note('photo-upload',details),observeSend:details=>diagnostic.note('send-stage',details)},event=>{
+      session=createReaderSession(credential,{booking:()=>new Booking(),ticket:()=>new Ticket(),carriage:()=>new Carriage(),media:()=>new Media(),toLong:sdk.toLong,messaging,photoTransport,sessionSalt,settingsSecret,gapProbe:message.gapProbe===true,readProbe:true,observeOwnRead:(stage,reason)=>diagnostic.ownRead(stage,reason),observeRead:details=>diagnostic.note('read-verification',details),observeHistory:details=>diagnostic.note('history-page',details),observeUpload:details=>diagnostic.note('photo-upload',details),observeSend:details=>diagnostic.note('send-stage',details)},event=>{
         send(event);
       });
       await session.start();clearTimeout(operationTimer);operationBusy=false;
