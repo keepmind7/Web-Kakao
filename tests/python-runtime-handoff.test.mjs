@@ -6,7 +6,7 @@ import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {ensurePrivateDirectoryAsync} from '../experiments/local-web/private-storage.mjs';
 const require=createRequire(import.meta.url),fs=require('node:fs'),cp=require('node:child_process');
-for(const hint of ['C:\\SyntheticPython313\\python.exe',null])test(hint?'uses the launcher Python when the bundle is absent':'standalone fallback accepts a compatible Python3 instead of pinning3.11',async()=>{
+for(const hint of ['C:\\SyntheticPython313\\python.exe',null])test(hint?'uses the launcher Python when the bundle is absent':'standalone fallback accepts a compatible Python3 instead of pinning3.11',{skip:process.platform!=='win32'},async()=>{
  const directory=fs.mkdtempSync(join(tmpdir(),'p-')),originalExists=fs.existsSync,originalExec=cp.execFile,previous=process.env.WEB_KAKAO_PYTHON,calls=[];
  if(hint)process.env.WEB_KAKAO_PYTHON=hint;else delete process.env.WEB_KAKAO_PYTHON;
  fs.existsSync=path=>String(path).includes('cpython-3.13.7-windows-x86_64-none')?false:String(path)===hint?true:originalExists(path);

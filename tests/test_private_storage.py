@@ -84,14 +84,15 @@ class LauncherSecurityRegressionTests(unittest.TestCase):
                                  "unreadable or mismatched runtime is not evidence of no server")
 
     def test_launcher_default_data_folder_is_outside_project_in_install_specific_local_app_data(self):
-        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"LOCALAPPDATA": tmp}):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"LOCALAPPDATA": tmp, "HOME": tmp, "XDG_DATA_HOME": tmp}):
             spec = importlib.util.spec_from_file_location("synthetic_local_web_location", ROOT / "tools/local_web.py")
             module = importlib.util.module_from_spec(spec)
             with patch.object(Path, "mkdir", side_effect=AssertionError("import created storage")), \
                  patch("subprocess.run", side_effect=AssertionError("import executed ACL")), \
                  patch("subprocess.Popen", side_effect=AssertionError("import started server")):
                 spec.loader.exec_module(module)
-            install = hashlib.sha256(str(ROOT.resolve()).replace("\\", "/").lower().encode()).hexdigest()[:16]
+            identity = str(ROOT.resolve()).replace("\\", "/")
+            install = hashlib.sha256((identity.lower() if os.name == 'nt' else identity).encode()).hexdigest()[:16]
             expected = Path(tmp) / "WebKakao" / install
             self.assertTrue(Path(module.FOLDER).is_relative_to(expected),
                             "runtime/control/log paths must use private installation storage")
@@ -156,6 +157,7 @@ class PrivateStorageContracts(unittest.TestCase):
             self.assertEqual(Path(json.loads(result.stdout)), module.data_root(project, appdata))
             self.assertFalse(appdata.exists())
 
+    @unittest.skipUnless(os.name == 'nt', 'Windows native ACL failure contract; POSIX has separate platform tests')
     def test_private_acl_command_failure_is_fail_closed(self):
         module = load_private()
         with tempfile.TemporaryDirectory() as tmp, \

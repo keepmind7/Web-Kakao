@@ -5,7 +5,7 @@ import hmac
 import http.cookiejar
 import json
 import os
-import re
+import platform
 import secrets
 import subprocess
 import sys
@@ -18,17 +18,25 @@ from urllib.error import HTTPError
 from urllib.parse import urlparse
 try:
     from tools.private_storage import data_root, ensure_private_directory, migrate_preferences, verify_private_file, is_junction
+    from tools.platforms import common as launch_platform
+    from tools.runtime_distribution import runtime_path
 except ModuleNotFoundError:
     from private_storage import data_root, ensure_private_directory, migrate_preferences, verify_private_file, is_junction
+    from platforms import common as launch_platform
+    from runtime_distribution import runtime_path
 
 ROOT = Path(os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir)))
-FOLDER = data_root(ROOT) / "web-auth" if os.environ.get("LOCALAPPDATA") else None
-RUNTIME = ROOT / "local-only/runtime/node-v24.21.0-win-x64/node.exe"
+try:
+    FOLDER = data_root(ROOT) / "web-auth"
+except ValueError:
+    FOLDER = None  # Import and --help must work without a private storage location.
+try:
+    RUNTIME = runtime_path(ROOT)
+except ValueError:
+    RUNTIME = None  # Unsupported OS/CPU is rejected before any runtime IO.
 APP = "web-kakao-auth-lab-v1"
 # Allowlist: NODE_OPTIONS, NODE_TLS_REJECT_UNAUTHORIZED, NODE_EXTRA_CA_CERTS, proxies and KAKAO_* never reach the server.
-SERVER_ENV = {"SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "PATH", "PATHEXT", "COMSPEC", "TEMP", "TMP", "USERPROFILE", "LOCALAPPDATA",
-              "APPDATA", "HOMEDRIVE", "HOMEPATH", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE", "LANG", "LC_ALL"}
-BROAD_PRINCIPALS = ("EVERYONE:", "BUILTIN\\USERS:", "NT AUTHORITY\\AUTHENTICATED USERS:", "CODEXSANDBOXUSERS:", "*S-1-1-0:", "*S-1-5-11:", "*S-1-5-32-545:")
+SERVER_ENV = launch_platform.SERVER_ENV
 
 
 class UntrustedServer(ValueError):
@@ -40,19 +48,11 @@ class StaleRuntime(UntrustedServer):
 
 
 def listener_owners(port):
-    try:
-        from tools.windows_security import listener_owners as query
-    except ModuleNotFoundError:
-        from windows_security import listener_owners as query
-    return query(port)
+    return launch_platform.backend().listener_owners(port)
 
 
 def process_image(pid):
-    try:
-        from tools.windows_security import process_image as query
-    except ModuleNotFoundError:
-        from windows_security import process_image as query
-    return query(pid)
+    return launch_platform.backend().process_image(pid)
 
 
 def assert_port_available(port):
@@ -77,51 +77,42 @@ def assert_port_available(port):
 
 
 def listener_matches(port, pid):
-    """Every listener on the port must be runtime.json's pid running the project node.exe."""
-    if os.name != "nt":
-        raise UntrustedServer("Windows에서만 로컬 서버 프로세스를 확인할 수 있습니다.")
+    """Verify listener PID evidence and this installation's fixed Node image.
+
+    Linux proves target possession of all LISTEN inodes, not exclusive ownership
+    against hostile processes sharing the same OS user or transferred FDs.
+    """
+    if RUNTIME is None:
+        raise UntrustedServer("이 OS·CPU에서는 로컬 서버 프로세스 확인을 지원하지 않습니다.")
+    target_check = platform.system() == "Linux"
     try:
-        owners = listener_owners(port)
-    except OSError:
-        raise UntrustedServer("로컬 포트 소유자를 확인할 수 없습니다. 같은 Windows 사용자와 권한으로 실행하세요.") from None
-    if not owners:
+        if target_check:
+            present = launch_platform.backend().assert_pid_listener(port, pid)
+        else:
+            owners = listener_owners(port)
+            present = bool(owners)
+    except (OSError, ValueError):
+        raise UntrustedServer("로컬 포트 소유자를 확인할 수 없습니다. 같은 OS 사용자와 권한으로 실행하세요.") from None
+    if not present:
         raise StaleRuntime("실행 정보의 포트에 서버가 없습니다. 비정상 종료 후 남은 실행 정보로 보고 신뢰하지 않습니다.")
-    if owners != {pid}:
+    if not target_check and owners != {pid}:
         raise UntrustedServer("경고: 포트를 점유한 프로세스가 기록된 프로젝트 Node 서버가 아닙니다. 권한 정보를 보내지 않았습니다.")
     try:
         path = process_image(pid)
-    except OSError:
-        raise UntrustedServer("서버 실행 경로를 확인할 수 없습니다. start와 open을 같은 Windows 사용자·권한으로 실행하세요.") from None
+    except (OSError, ValueError):
+        raise UntrustedServer("서버 실행 경로를 확인할 수 없습니다. start와 open을 같은 OS 사용자·권한으로 실행하세요.") from None
     if not path or os.path.normcase(os.path.realpath(path)) != os.path.normcase(os.path.realpath(RUNTIME)):
         raise UntrustedServer("경고: 포트를 점유한 프로세스가 기록된 프로젝트 Node 서버가 아닙니다. 다른 프로그램이 서버를 사칭할 수 있어 권한 정보를 보내지 않았습니다.")
 
 
 def broad_write_warnings():
-    """Read-only icacls audit. Never changes ACLs and never blocks start."""
-    found = []
-    for path in [ROOT, ROOT / "local-only/runtime", ROOT / "local-only/spikes", ROOT / "experiments/local-web"]:
-        if not path.exists():
-            continue
-        try:
-            output = subprocess.run(["icacls", str(path)], capture_output=True, timeout=10,
-                                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0).stdout.decode("oem" if os.name == "nt" else "utf-8", "replace")
-        except (OSError, subprocess.SubprocessError):
-            continue
-        for line in output.upper().splitlines():
-            for principal in BROAD_PRINCIPALS:
-                index = line.find(principal)
-                groups = re.findall(r"\(([^)]*)\)", line[index + len(principal):]) if index >= 0 else []
-                if groups and "DENY" not in groups and {"F", "M", "W", "WD", "AD"} & {right for group in groups for right in group.split(",")}:
-                    found.append(path)
-                    break
-            if found and found[-1] == path:
-                break
-    return found
+    """Read-only OS audit; do not repair the user's workspace permissions."""
+    return launch_platform.backend().broad_write_warnings(ROOT)
 
 
 def connect(*, legacy=False, expected_pid=None):
     if FOLDER is None and not legacy:
-        raise ValueError("LOCALAPPDATA 경로가 필요합니다.")
+        raise ValueError("개인 저장소 경로가 필요합니다.")
     folder = ROOT / "local-only/web-auth" if legacy else FOLDER
     if not legacy:
         verify_private_file(folder / "runtime.json", max_bytes=4096)
@@ -176,31 +167,20 @@ def public_status(url, state):
 
 
 def find_browser(name):
-    tails = {"chrome": Path("Google/Chrome/Application/chrome.exe"),
-             "edge": Path("Microsoft/Edge/Application/msedge.exe")}
-    if name not in tails:
-        return None
-    for variable in ("ProgramFiles", "ProgramW6432", "ProgramFiles(x86)", "LOCALAPPDATA"):
-        value = os.environ.get(variable)
-        if not value or not Path(value).is_absolute():
-            continue
-        executable = Path(value) / tails[name]
-        try:
-            if executable.is_file():
-                return executable
-        except OSError:
-            continue
-    return None
+    return launch_platform.backend().find_browser(name)
 
 
 def launch_browser(url, browser="default", executable=None):
-    if browser == "default":
+    if browser == "default" and platform.system() == "Windows":
         return bool(webbrowser.open(url))
     executable = executable or find_browser(browser)
     if executable is None:
         return False
+    options = {}
+    if platform.system() == "Linux":
+        options["env"] = launch_platform.backend().browser_environment(os.environ)
     subprocess.Popen([str(executable), "--new-window", url], shell=False,
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **options)
     return True
 
 
@@ -214,8 +194,8 @@ def main():
     parser.add_argument("action", choices=["start", "status", "stop", "attempt", "probe", "open", "migrate-preferences"])
     parser.add_argument("--legacy", action="store_true", help="이전 build7 서버를 명시적으로 정상 종료할 때만 사용")
     parser.add_argument("--source", type=Path, help="사용자가 확인한 이전 개인 설정 폴더")
-    parser.add_argument("--browser", choices=["default", "chrome", "edge"], default="default",
-                        help="open으로 열 브라우저 선택. chrome/edge는 설치된 실행 파일을 직접 사용")
+    parser.add_argument("--browser", choices=["default", "chrome", "chromium", "edge"], default="default",
+                        help="open으로 열 브라우저 선택. Linux는 고정 설치 위치의 Chrome/Chromium/Edge만 사용")
     parser.add_argument("--mock", action="store_true")
     parser.add_argument("--gap-probe", action="store_true", help="누락 구간에 MCHATLOGS를 한 번 확인하는 읽기 실험")
     parser.add_argument("--messaging", action="store_true", help="텍스트 전송과 읽음 상태 기능 활성화")
@@ -228,14 +208,17 @@ def main():
     if args.action != "open" and args.browser != "default":
         print("--browser는 open 명령에서만 사용할 수 있습니다.")
         return 2
-    if os.name != "nt":
-        print("이 실행 도구는 Windows 전용입니다.")
+    if RUNTIME is None:
+        print("이 OS·CPU는 지원하지 않습니다. Windows x64 또는 Linux x64(glibc)가 필요합니다. macOS는 아직 미지원입니다.")
         return 2
     if FOLDER is None:
-        print("Windows LOCALAPPDATA 경로를 확인할 수 없습니다.")
+        print("개인 저장소 경로를 확인할 수 없습니다. Windows LOCALAPPDATA 또는 Linux HOME·XDG_DATA_HOME을 확인하세요.")
         return 2
     if args.legacy and args.action != "stop":
         print("--legacy는 이전 서버 종료만 지원합니다.")
+        return 2
+    if args.legacy and platform.system() != "Windows":
+        print("--legacy는 이전 Windows build7 서버의 종료에만 사용할 수 있습니다.")
         return 2
     if not 1 <= args.port <= 65535:
         print("잘못된 로컬 포트입니다.")
@@ -296,7 +279,7 @@ def main():
             print(json.dumps(public_status(current[0], current[2]), ensure_ascii=False, indent=2))
             return 0
         if not RUNTIME.is_file():
-            print("고정 Node 런타임이 없습니다. 먼저 py -3.11 tools/prepare_node_spike.py 를 실행하세요 (네트워크 필요).")
+            print("고정 Node 런타임이 없습니다. 먼저 Python 3.11 이상으로 tools/prepare_node_spike.py 를 실행하세요 (네트워크 필요).")
             return 2
         # A missing runtime file is insufficient if another process owns the port.
         try:
@@ -316,11 +299,12 @@ def main():
             return 2
         broad = broad_write_warnings()
         if broad:
-            fix = "powershell -NoProfile -File tools\\workspace_acl.ps1 로 점검 후 소유자가 직접 -Apply" if (ROOT / "tools/workspace_acl.ps1").is_file() else "icacls로 Users/Everyone/Authenticated Users/CodexSandboxUsers 쓰기 권한 제거"
+            if platform.system() == "Windows":
+                fix = "powershell -NoProfile -File tools\\workspace_acl.ps1 로 점검 후 소유자가 직접 -Apply" if (ROOT / "tools/workspace_acl.ps1").is_file() else "icacls로 Users/Everyone/Authenticated Users/CodexSandboxUsers 쓰기 권한 제거"
+            else:
+                fix = "소유자가 프로젝트 경로의 그룹·전체 쓰기 권한과 링크를 직접 점검"
             print("경고: 넓은 쓰기 권한이 있는 폴더: " + ", ".join(str(path) for path in broad) + ". 다른 사용자·샌드박스가 서버 코드나 런타임을 바꿀 수 있습니다. " + fix + "를 권장합니다. 시작은 계속합니다.")
-        env = {key: value for key, value in os.environ.items() if key.upper() in SERVER_ENV}
-        # Overwrite rather than inherit a caller-controlled interpreter hint.
-        env['WEB_KAKAO_PYTHON'] = sys.executable
+        env = launch_platform.server_environment(os.environ, sys.executable)
         command = [str(RUNTIME), str(ROOT / "experiments/local-web/server.mjs"), "--port", str(args.port)]
         if not args.mock:
             command.append("--live")
@@ -330,10 +314,11 @@ def main():
             command.append("--messaging")
         command.extend(["--photo-transport", args.photo_transport])
         try:
-            with (FOLDER / "server.stdout.log").open("ab") as stdout, (FOLDER / "server.stderr.log").open("ab") as stderr:
+            adapter = launch_platform.backend()
+            with adapter.open_log(FOLDER / "server.stdout.log", verify_private_file) as stdout, adapter.open_log(FOLDER / "server.stderr.log", verify_private_file) as stderr:
                 process = subprocess.Popen(command, cwd=ROOT, env=env, stdout=stdout, stderr=stderr,
-                    creationflags=subprocess.CREATE_NO_WINDOW)
-        except OSError:
+                    **adapter.spawn_options())
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
             print("로컬 서버를 시작할 수 없습니다. 런타임 준비 상태와 저장 경로 권한을 확인하세요.")
             return 2
         for _ in range(40):
@@ -360,7 +345,7 @@ def main():
     url, client, state = current
     if args.action == "open":
         executable = None
-        if args.browser != "default":
+        if args.browser != "default" or platform.system() == "Linux":
             executable = find_browser(args.browser)
             if executable is None:
                 print(f"{args.browser} 브라우저를 기본 설치 위치에서 찾지 못했습니다. 다른 --browser 값을 선택하세요.")

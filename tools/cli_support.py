@@ -6,14 +6,16 @@ from urllib.error import URLError
 from zipfile import BadZipFile
 
 
-def parse_arguments(parser, argv=None):
+def parse_arguments(parser, argv=None, *, supported_platforms=('win32',)):
     # Python 3.9/3.10 can parse this module and receive useful upgrade guidance.
     if sys.version_info < (3, 11):
         parser.error('Python 3.11 이상이 필요합니다. py -3.11 로 다시 실행하세요.')
     args = parser.parse_args(argv)
     # Help and invalid arguments have already exited without inspecting runtime state.
-    if sys.platform != 'win32':
-        parser.error('이 준비 도구는 Windows에서 실행하세요. 도움말은 --help로 확인할 수 있습니다.')
+    if sys.platform not in supported_platforms:
+        names = {'win32': 'Windows', 'linux': 'Linux'}
+        supported = '·'.join(names.get(name, name) for name in supported_platforms)
+        parser.error(f'이 준비 도구는 {supported}에서 실행하세요. 도움말은 --help로 확인할 수 있습니다.')
     return args
 
 

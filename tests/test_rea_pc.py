@@ -337,6 +337,8 @@ class ArchiveTests(ToolCase):
         node = self.root / 'node.exe'
         node.write_bytes(b'synthetic node')
         with patch.object(self.prepare, 'ASSETS', assets), \
+                patch.object(self.prepare.platform, 'system', return_value='Windows'), \
+                patch.object(self.prepare.platform, 'machine', return_value='AMD64'), \
                 patch.object(self.prepare.shutil, 'which', return_value=str(node)), \
                 patch.object(self.prepare, 'urlopen', side_effect=AssertionError('network forbidden')):
             result = self.prepare.prepare(self.root, offline=True)
@@ -345,6 +347,21 @@ class ArchiveTests(ToolCase):
         self.assertEqual(stored['node'], str(node))
         self.assertEqual(stored['versions']['rea'], '6.5.0')
         self.assertEqual(stored['temp_root'], str(self.root / 'local-only/rea-temp'))
+
+    def test_prepare_rejects_unsupported_platform_before_io(self):
+        for system, machine in (('Linux', 'x86_64'), ('Darwin', 'arm64'), ('Windows', 'ARM64')):
+            with self.subTest(system=system, machine=machine), contextlib.ExitStack() as stack:
+                stack.enter_context(patch.object(self.prepare.platform, 'system', return_value=system))
+                stack.enter_context(patch.object(self.prepare.platform, 'machine', return_value=machine))
+                operations = [stack.enter_context(patch.object(self.prepare, name,
+                              side_effect=AssertionError('unsupported platform must not perform IO')))
+                              for name in ('checked_path', 'urlopen', 'ensure_archive', 'install_archive')]
+                operations.append(stack.enter_context(patch.object(self.prepare.shutil, 'which',
+                                  side_effect=AssertionError('unsupported platform must not find executables'))))
+                with self.assertRaisesRegex(ValueError, '^windows_x64_required$'):
+                    self.prepare.prepare(self.root, offline=True)
+                for operation in operations:
+                    operation.assert_not_called()
 
 
 class RunnerTests(ToolCase):
@@ -557,15 +574,18 @@ class RunnerTests(ToolCase):
 
     def test_timeout_tree_cleanup_failure_remains_visible(self):
         self.fixture()
-        code, receipt, calls, _ = self.invoke(
-            ['doctor', '--label', 'cleanup', '--timeout', '1'],
-            failure=subprocess.TimeoutExpired('synthetic', 1), cleanup_code=5)
+        system_root = self.root / 'synthetic-windows'
+        with patch.dict(self.runner.os.environ, {'SystemRoot': str(system_root)}):
+            code, receipt, calls, _ = self.invoke(
+                ['doctor', '--label', 'cleanup', '--timeout', '1'],
+                failure=subprocess.TimeoutExpired('synthetic', 1), cleanup_code=5)
         self.assertEqual(code, 124)
         self.assertFalse(receipt['success'])
         self.assertEqual(receipt['cleanup_status'], 'failed')
         self.assertTrue(receipt['cleanup_attempted'])
         self.assertEqual(calls[1][0][1:], ['/PID', '4242', '/T', '/F'])
-        self.assertTrue(calls[1][0][0].lower().endswith('system32\\taskkill.exe'))
+        self.assertEqual(Path(calls[1][0][0]), system_root / 'System32' / 'taskkill.exe')
+        self.assertTrue(Path(calls[1][0][0]).is_absolute())
 
     def test_timeout_already_exited_child_does_not_kill_reused_pid(self):
         calls = []

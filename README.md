@@ -1,23 +1,75 @@
 # Web-Kakao
 
-카카오톡 대화방을 이 PC의 브라우저에서 조회하고 메시지를 주고받는 **Windows용 로컬 웹 클라이언트**입니다. Node 서버가 카카오톡 서버와 통신하고, Chrome·Edge는 `http://127.0.0.1:8787`의 화면을 사용합니다.
+카카오톡 대화방을 이 PC의 브라우저에서 조회하고 메시지를 주고받는 **로컬 웹 클라이언트**입니다. Windows x64의 기존 기능을 보존하며 Linux x64·WSL2 지원을 개발하고 있습니다. Node 서버가 카카오톡 서버와 통신하고, 브라우저는 `http://127.0.0.1:8787`의 화면을 사용합니다. Linux의 실제 실행·계정 검증 상태는 아래 플랫폼 안내와 검증 기록을 확인하세요.
 
 QR 로그인, 일반 대화·답장·읽음, HTTPS 사진 발송의 사용자 확인 사례가 있습니다. 사진은 JPEG·PNG·WebP를 입력받아 JPEG로 변환합니다. 시험한 오픈채팅방의 텍스트 전송도 사용자 확인했습니다. 방 종류와 장시간 동작의 남은 확인 사항은 문서 하단의 **알려진 문제와 QA**에 정리했습니다.
+
+## 다음 작업: Mac에서 재개하기 (2026-10-24)
+
+**현재 macOS 실행은 미지원입니다. 다음 작업은 Mac 지원 구현부터 시작합니다.** Windows/common/Linux 분리와 WSL 검증 코드는 함께 인계하지만, Mac에서 clone/pull한 직후 기존 실행 명령이 동작하는 상태는 아닙니다. 이 차수에는 macOS 제품 구현이나 실제 계정 시험을 진행하지 않았습니다.
+
+현재 확인한 상태:
+
+- Windows의 기존 기능과 사용자 확인 사례를 보존했습니다. WSL은 계정 없는 전체 회귀·합성 화면 검사와 사용자가 시험한 실제 방·사람 이름·이력 조회가 성공했습니다.
+- WSL 채팅 입력 차단은 `messaging: false`로 실행한 것이 원인입니다. 마지막 관측은 인증 메모리 없음·대화 연결 종료 상태입니다. 전송 옵션을 켜서 재시작하고 새 QR을 받는 후속 절차는 아직 진행하지 않았으며, Linux 실전 송수신은 미검증입니다.
+- 읽기 전용인데 사진을 보낼 수 있다고 표시하던 안내를 수정했습니다. Windows 합성 화면 표적19조건과 독립 검수를 통과했지만, 이 수정의 WSL 적용·실전 발송을 확인한 것은 아닙니다.
+
+새 Mac에서는 먼저 소스와 환경 정보만 준비합니다. 아래 명령은 카카오톡 로그인이나 메시지 발송을 시작하지 않습니다.
+
+```bash
+git clone https://github.com/keepmind7/Web-Kakao.git web-kakao
+cd web-kakao
+uname -m
+sw_vers
+python3 --version
+git --version
+```
+
+이미 clone했다면 로컬 변경을 먼저 확인하고 `git pull --ff-only`로 갱신합니다. `uname -m`의 `arm64`/`x86_64`를 기록하고 Rosetta 사용 여부까지 확인해 Apple Silicon·Intel과 실제 실행 아키텍처를 구분합니다. Python3.11 이상도 확인합니다. Windows/Linux 런타임·node_modules·인증·개인 설정을 복사하지 않습니다.
+
+다음 구현 순서는 아래와 같습니다. 아직 없는 macOS adapter는 새로 구현할 대상입니다.
+
+| 순서 | 시작할 파일 | 해야 할 일과 통과 조건 |
+| --- | --- | --- |
+| 1. Mac 고정 런타임 | `tools/runtime_distribution.py`, `tools/prepare_node_spike.py` | Darwin arm64/x64의 공식 Node 배포 파일과 SHA-256을 확인해 고정. 압축 형식·링크/경로 제한·기존 설치 비덮어쓰기·경합/실패 처리를 Mac에서 검증. Linux 전용 renameat2를 그대로 사용하지 않음 |
+| 2. 실행·신원·브라우저 | `tools/platforms/common.py`, 새 `tools/platforms/macos.py`, `tools/local_web.py` | Mac의 포트/PID·실행 이미지·사용자 확인 방법을 설계하고 HMAC 검증 후에만 제어 권한 전달. 허용 환경·전용 Chrome 실행·정상 종료 정책 유지 |
+| 3. 개인 저장소 | `tools/private_storage.py`, `experiments/local-web/private-storage.mjs`, `experiments/local-web/platform/` | 기존 Darwin 경로 계산을 실제 파일 보호와 연결. 0700/0600·UID·Mac ACL·심볼릭 링크/하드링크·교체/경합·비동기 검사 검증. Windows ACL과 Linux 정책 보존 |
+| 4. 도구와 회귀 | `tools/cli_support.py`, `tools/fetch_source_spike.py`, `tools/prepare_spikes.py`, `tests/test_platform_*.py`, `tests/platform-*.test.mjs` | backend 준비 후 각 CLI의 Darwin 지원 범위를 명시. 기존 거절 단언을 무조건 제거하지 말고 지원/미지원 조합·오류·부작용 없음 시험 보완 |
+| 5. Mac 자체 검증 | `tools/verify_linux.py`의 공통화 또는 별도 Mac 검증 도구, `tests/browser-platform.mjs`, `tests/reader-browser-smoke.mjs` | 모의 단위 검사 → Mac 네이티브 격리 mock 시작/status/종료 → 합성 브라우저 순서. Linux /proc·Chrome 경로·임시 소켓 경로 전제를 분리. Windows/Linux 회귀 보존 |
+| 6. 실제 계정 | 위 계정 없는 검사를 통과한 뒤 별도 단계 | 사용자 확인 후 QR1회·읽음OFF·기존 방/이력 조회부터 시작. 자연 수신·재접속·설정 복원과 승인된 실제 송수신을 따로 기록 |
+
+Mac 지원은 현재 OS 거절을 제거하거나 Linux로 가장하는 방식으로 시작하지 않습니다. 현재 `prepare_node_spike.py`·`local_web.py` 실행은 지원되지 않으며, 순수 경로 계산과 시험용 Chrome 경로 후보가 있다는 사실도 실행 지원을 뜻하지 않습니다.
+
+Mac의 다음 Codex 세션에는 다음과 같이 요청하면 됩니다.
+
+> README의 ‘Mac에서 재개하기’와 AGENTS.md, .harness/OPERATING.md, .harness/FOLLOWUP.md를 먼저 읽어라. 실제 Mac의 아키텍처·Python·도구를 확인하고, 위 순서대로 macOS 지원을 구현·계정 없는 검증하라. 기존 Windows/Linux 동작과 제외 규칙을 보존하고 실제 로그인·읽음·발송은 별도 확인 전 실행하지 마라. 과거 테스트 성공을 이번 Mac 실행 성공으로 보고하지 마라.
+
+공유할 역할·스킬은 `.agents/skills/`, `.codex/config.toml`, `.codex/agents/`에 있습니다. 새 환경은 README·공유 운영 문서로 새 작업 기록을 시작합니다. 비공개 `.harness/` 실행 원본·`local-only/`·계정 정보·과거 승인은 Git 인계 대상이 아닙니다. 자세한 플랫폼 경계와 과거 실패/검증 이력은 [플랫폼 지원 안내](reports/PLATFORM_SUPPORT.ko.md)를 따릅니다.
 
 ## 실행 환경
 
 | 구성 | 필요 조건 |
 | --- | --- |
-| OS | Windows x64 |
-| Python | 3.11 이상. `py -3 --version`으로 확인 |
-| Node.js | 준비 도구가 고정 버전 24.21.0을 프로젝트 안에 설치 |
-| 브라우저 | Chrome 또는 Edge. 실행 도구는 외부 브라우저를 엽니다. |
+| OS | Windows x64. Ubuntu WSL2 x64는 계정 없는 회귀·화면 검사 및 사용자가 시험한 실제 방·이름·이력 조회 성공. Linux 실전 송수신은 미검증. 다른 Linux 환경은 미검증, macOS 실행은 미지원 |
+| Python | 3.11 이상. Windows `py -3 --version`, Linux `python3 --version` |
+| Node.js | 준비 도구가 OS별 고정 버전 24.21.0을 프로젝트 안에 설치 |
+| 브라우저 | Windows Chrome/Edge, Linux Chrome/Chromium/Edge 탐색 구현. 외부 브라우저 사용. Linux 한글 표시에는 CJK 글꼴 준비 필요 |
 | 휴대폰 | 카카오톡 QR 로그인과 연결 기기 승인에 사용 |
 | 네트워크 | 최초 도구 준비와 실제 카카오톡 통신에 필요 |
 
 Python 실행·준비 도구와 테스트는 표준 라이브러리를 사용합니다. [requirements.txt](requirements.txt)는 이 조건을 설명하며 추가 pip 패키지는 없습니다. Node 패키지는 저장소의 잠금 파일을 사용해 따로 준비합니다. Android APK·에뮬레이터·REA/JADX/Ghidra/ADB는 선택적 분석 도구이며 일반 웹 실행에는 필요하지 않습니다.
 
+Windows/common/Linux 모듈 구성, 소스 패키징과 WSL의 계정 없는 시험 절차는 [플랫폼 지원 안내](reports/PLATFORM_SUPPORT.ko.md)를 따릅니다. Windows에서 만든 런타임·node_modules·개인 저장소를 Linux에 복사하지 않습니다. 다음 설치·평소 실행 예시는 기존 Windows 명령이며, Linux 명령은 플랫폼 안내에 별도로 적었습니다.
+
+2026-10-23 사용자 WSL2 x64·Python3.14.4에서 고정 Linux Node 설치와 fix1 junction 회귀5/5를 확인했습니다. 이후 다른 같은 UID 프로세스의 FD 접근 거절(EACCES)로 막히던 검사를 보완한 fix2에서 **mock 시작·상태 확인·정상 종료가 모두 exit0**으로 성공했습니다. 대상 Node의 모든 수신 소켓 보유·파일 권한·사용자·Node 경로·HMAC을 확인하며, 다른 프로세스와의 소켓 공유까지 배제하는 검사는 아닙니다.
+
+fix3는 실제 WSL 플랫폼 검사에서 Python 114개·Node 45개를 모두 통과했습니다. REA 시험 전제와 공개 시험 누락을 보완한 **fix5도 사용자 WSL 전체 회귀에서 Python exit0·Node 1,039개 통과/2개 건너뜀·실패 0**을 확인했습니다. mock을 포함한 5단계가 모두 exit0이며 해당 mock은 정상 종료했습니다. 실제 Node 시험 진입점 49개 전체가 전달본에 포함됐습니다. Linux Chrome 156.0.8078.47 설치 후 발견된 긴 TMPDIR의 SingletonSocket 경로 오류는 fix6에서 브라우저 전용 임시 경로를 짧게 만들어 보완했습니다. **이후 사용자 WSL의 mock 시작·상태·격리 브라우저·종료 4단계가 모두 exit0으로 통과**했고 browserExecuted=true·mockStopped=true를 확인했습니다. 여기까지는 계정 없는 headless 합성 화면 검사입니다. 실제 계정의 후속 조회 결과는 다음 문단에 구분하며, 일반 데스크톱 알림·클립보드·절전 검증은 남아 있습니다.
+
+후속 WSL 일반 Chrome 화면에서 앱 본문의 한글 표시를 확인했고, 사용자는 실제 대화방·사람 이름·대화 이력 조회가 정상이라고 보고했습니다. 이는 시험한 조회 기능의 사용자 관찰이며 Linux 발송·실시간 수신·읽음·설정 복원 성공을 뜻하지 않습니다. 최초 조회 시험에는 `start --gap-probe`를 안내했으므로 **전송 옵션 `--messaging`의 사용 여부를 `status`로 확인**해야 합니다. 옵션을 빠뜨리면 글·답장·사진 전송이 모두 잠깁니다. 실행 중 서버에 옵션만 추가해도 교체되지 않으며, 모드 변경은 초안 보관·로컬 세션 정리·정상 종료/재시작·새 QR 승인이 필요합니다. 읽기 전용 모드에서도 사진을 보낼 수 있다고 잘못 안내하던 문구는 fix7에서 수정했습니다. Windows 합성 Chrome 표적 19조건을 통과했으며 사용자 WSL 적용·실전 전송 검사는 아직 하지 않았습니다.
+
 이미 추출한 APK를 다른 개발 환경으로 옮겨 분석하려면 [APK ZIP 인계 안내](reports/APK_HANDOFF.ko.md)를 참고하세요. ZIP 구성·보관 위치·무결성 확인·로컬 분석 준비와 명령을 정리했습니다. APK 원본은 Git clone/pull에 포함되지 않습니다.
+
+2026-10-24 후속 사용자 status에서 **messaging=false**를 확인해 WSL 입력 차단이 읽기 전용 실행 모드 때문임을 확정했습니다. 같은 시점에 phase=cancelled·credentialInMemory=false·chatConnectionActive=false였습니다. actualChatConnected=true는 과거 연결 성공 기록으로 현재 연결을 뜻하지 않습니다. 이 상태에서는 로컬 세션 삭제를 반복할 필요 없이 사용자 확인 후 정상 stop → start --gap-probe --messaging → open → QR1회·목록 확인으로 재개할 계획입니다. 전송 옵션은 기존 전달본에도 있어 모드 전환에 새 ZIP은 필요하지 않습니다. 아직 재시작·새 로그인·실전 발송은 진행하지 않았으며 실제 송수신 성공은 별도로 확인해야 합니다.
 
 ## 처음 설치하기
 
@@ -119,7 +171,7 @@ Node 런타임과 `local-only/sources/`, `local-only/spikes/`는 현재 실행�
 
 인증·대화·사진은 서버 메모리 중심으로 처리합니다. 서버 재시작 후 새 QR 인증이 필요하며, 새로고침 전 작성 중인 글은 보관하세요.
 
-실행 정보·로그·정제된 진단은 `%LOCALAPPDATA%\WebKakao\<설치별 해시>\web-auth`, 개인 설정은 같은 설치의 `preferences`에 보관합니다. 설치별 해시는 프로젝트 절대 경로로 계산하므로 프로젝트를 옮기면 저장 위치도 달라집니다.
+Windows 실행 정보·로그·정제된 진단은 `%LOCALAPPDATA%\WebKakao\<설치별 해시>\web-auth`, 개인 설정은 같은 설치의 `preferences`에 보관합니다. Linux는 절대 `XDG_DATA_HOME` 또는 `~/.local/share` 아래의 설치별 저장소를 사용하도록 구현했습니다. 설치별 해시는 프로젝트 절대 경로로 계산하므로 프로젝트를 옮기면 저장 위치도 달라집니다. Windows의 기존 식별은 보존하고 Linux의 대소문자는 구분합니다.
 
 **이 노트북에 개인 설정 저장**을 켜면 방 별칭·고정·알림·필터·읽음 옵션을 계정별로 저장합니다. 끄면 저장 파일을 지우고 현재 실행의 설정을 유지합니다. Windows 접근 권한을 검사하지만 파일 자체를 암호화하지는 않습니다. `identity.key`는 계정 식별용 HMAC 키입니다.
 
@@ -139,6 +191,8 @@ build7에서 처음 전환할 때만 `stop --legacy`를 사용합니다. 예전 
 ## 개발·검증
 
 다음 검사는 실제 계정과 분리된 모의 서버·임시 Chrome 프로필·임시 포트를 사용합니다. Node·고정 소스·패키지는 설치 단계처럼 준비되어 있어야 합니다.
+
+2026-10-23 플랫폼 분리의 **Windows 계정 없는 회귀**는 Node **1,040통과·1skip**(총1,041·49파일, 표준 프로세스 격리·직렬), Python 전체 **204통과·2skip**(총206), 격리 Chrome **115/115**입니다. 마지막 Python 시험2파일의 Windows 모의 계약·브라우저 실행 차단 보완 후에는 해당 파일 **19/19**를 재검사했고, 제품·Node·Chrome 소스가 같은 것을 대조해 이전 전체 결과를 재사용했습니다.19개를206개에 합산하거나 최종 트리에서 전체를 다시 실행했다고 보고하지 않습니다. 최초 Python 전체의 ZIP 게시 후 stage 정리 `WinError145`1건은 원문을 보존했으며 동일 패키지9개와 이후 전체206개에서는 재현되지 않았습니다. 원인은 미확정입니다. 후속 Linux/WSL의 단계별 결과와 전체 회귀·브라우저·실제 계정·macOS의 남은 범위는 [플랫폼 지원 안내](reports/PLATFORM_SUPPORT.ko.md)를 따릅니다.
 
 ```powershell
 py -3 -m unittest discover -s tests -v
@@ -208,7 +262,7 @@ worker의 기존 비공개 `web-auth/reader-diagnostic.json`에 `ownRead`, 기�
 ### 지원 범위·환경 제약
 
 - VS Code 내부 브라우저의 입장권 전달은 미지원이며 외부 Chrome/Edge를 사용.
-- 현재 실행 지원은 Windows x64. macOS/Linux·Windows32비트·EXE/MSI 배포와 모든 회사망에서의 동작은 미검증.
+- Windows x64의 기존 실행을 보존하며 Linux x64 glibc·WSL2 구현을 추가했습니다. 시험한 WSL의 회귀·합성 화면과 실제 조회는 성공했지만 실전 송수신은 미검증입니다. macOS 실행과 Windows32비트는 미지원이며 EXE/MSI 배포는 제공하지 않습니다. 모든 회사망에서의 동작은 보장하지 않습니다.
 - 동영상·일반 파일·사진 묶음 전송은 현재 기능에 포함하지 않음.
 - 넓은 작업 폴더 권한의 실제 ACL 교정·개인자료 이전은 미실행. 선택적 Ghidra helper는 점이 없는 분석 작업 경로가 필요.
 
@@ -233,7 +287,7 @@ worker의 기존 비공개 `web-auth/reader-diagnostic.json`에 `ownRead`, 기�
 | Chrome 실행 | 샌드박스 실행 중0x80000003 사례는 일반 Windows 사용자 권한으로 재실행해 정상 표시 확인. 저수준 원인은 미확정 |
 | VS Code 내부 브라우저 | 외부 Chrome/Edge 사용. 통합 브라우저 입장권 전달은 미지원이며 Simple Browser iframe 차단도 있음 |
 | 설치·보안 | 넓은 작업 폴더 쓰기 권한은 `tools/workspace_acl.ps1`로 감사. 실제 ACL 변경·개인자료 이전은 자동 수행하지 않음 |
-| 다른 환경 | macOS/Linux·Windows32비트·EXE/MSI 배포·모든 회사망은 미검증. 선택적 Ghidra helper는 점이 없는 분석 작업 경로 필요 |
+| 다른 환경 | Windows/common/Linux 실행·저장소 모듈 분리. 시험한 WSL 회귀·합성 화면·실제 조회 성공, 실전 송수신과 다른 Linux는 미검증. macOS 실행·Windows32비트는 미지원, EXE/MSI는 미제공. 회사망별 조건은 별도 확인. 선택적 Ghidra helper는 점이 없는 분석 작업 경로 필요 |
 
 실제 QA는 동의한 상대나 본인 시험방에서 대상·내용·횟수·영향을 정한 뒤 진행합니다. 이전 승인을 재사용하지 않습니다. 상대방 읽음은 **상대방 화면의 같은 메시지1 해제**, 본인 미읽음 동기화는 **같은 방의 왼쪽 배지 감소와 이후 새 도착 보존**, 사진은 **실제 수신 기기의 도착·열기**로 판정합니다. HTTP202·status0·업로드 완료만으로 통과시키거나 결과 불명 전송을 반복하지 않습니다.
 

@@ -35,11 +35,11 @@ class RepairToolContracts(unittest.TestCase):
             zipped.writestr(top + '/node_modules/npm/bin/npm-cli.js', b'// pinned synthetic')
         digest = hashlib.sha256(archive.read_bytes()).hexdigest()
         with patch.object(prepare_node_spike, 'EXPECTED', digest), patch.object(prepare_node_spike, 'urlopen', side_effect=AssertionError('no network')), patch.object(subprocess, 'run', side_effect=AssertionError('no executable run')):
-            prepared = prepare_node_spike.main(self.root)
+            prepared = prepare_node_spike.main(self.root, system='Windows', machine='AMD64')
             self.assertFalse(prepared['account_used'])
             (self.root / top / 'node.exe').write_bytes(b'TAMPERED NEVER EXECUTE')
             with self.assertRaises((ValueError, SystemExit), msg='existing runtime tamper must fail closed'):
-                prepare_node_spike.main(self.root)
+                prepare_node_spike.main(self.root, system='Windows', machine='AMD64')
 
     def test_T2_adb_preplanted_partial_is_never_overwritten(self):
         folder = self.root / 'adb'; folder.mkdir()
@@ -111,6 +111,7 @@ class RepairToolContracts(unittest.TestCase):
         self.assertFalse((self.root / 'local-only/spikes').exists(), 'preflight before preparation side effects')
 
 
+@unittest.skipUnless(os.name == 'nt', 'Windows exclusive-bind fallback; Linux has separate platform tests')
 class PortAvailabilityContracts(unittest.TestCase):
     def helper(self):
         value = getattr(local_web, 'assert_port_available', None)

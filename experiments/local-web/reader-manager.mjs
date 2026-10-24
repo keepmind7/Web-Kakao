@@ -184,7 +184,7 @@ export function createReadOnlyReader({spawn=fork,now=Date.now,onBlocked=()=>{},g
       clearTimeout(deadline);deadline=null;
       try{
         checkPinnedSource({workingCopy:true});
-        const allowedEnv=new Set(['PATH','SYSTEMROOT','WINDIR','TEMP','TMP','USERPROFILE','LOCALAPPDATA','APPDATA','COMSPEC','LANG','LC_ALL','WEB_KAKAO_PYTHON']);
+        const allowedEnv=new Set(['PATH','SYSTEMROOT','WINDIR','TEMP','TMP','USERPROFILE','LOCALAPPDATA','APPDATA','COMSPEC','LANG','LC_ALL','WEB_KAKAO_PYTHON','HOME','XDG_DATA_HOME','XDG_STATE_HOME','XDG_RUNTIME_DIR','TMPDIR']);
         const worker=spawn(fileURLToPath(new URL('./reader-worker.mjs',import.meta.url)),[],{
           execArgv:['--max-old-space-size=128','--import',new URL('../../local-only/spikes/modern/node_modules/tsx/dist/loader.mjs',import.meta.url).href],
           stdio:['ignore','ignore','ignore','ipc'],windowsHide:true,

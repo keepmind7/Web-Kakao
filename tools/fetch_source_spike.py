@@ -79,7 +79,7 @@ def prepare(candidate):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('candidate', choices=CANDIDATES)
-    args = parse_arguments(parser, argv)
+    args = parse_arguments(parser, argv, supported_platforms=('win32', 'linux'))
     run_preparation(parser, lambda: prepare(args.candidate))
     return 0
 

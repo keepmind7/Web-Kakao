@@ -45,8 +45,9 @@ def invoke(name,args=(),*,import_only=False,local_app_data=True,version=None,non
             stack.enter_context(patch.object(sys,'version_info',version))
         if non_windows:
             stack.enter_context(patch.dict(sys.modules,{'os':proxy}))
-            stack.enter_context(patch.object(sys,'platform','linux'))
-            stack.enter_context(patch.object(platform,'system',return_value='Linux'))
+            target=non_windows if isinstance(non_windows,str) else 'linux'
+            stack.enter_context(patch.object(sys,'platform',target))
+            stack.enter_context(patch.object(platform,'system',return_value='Darwin' if target=='darwin' else 'Linux'))
         stack.enter_context(contextlib.redirect_stdout(stdout));stack.enter_context(contextlib.redirect_stderr(stderr))
         for attribute in ['mkdir','write_text','write_bytes','read_text','open']:
             stack.enter_context(patch.object(Path,attribute,side_effect=forbidden(attribute)))
@@ -109,8 +110,8 @@ class CliPortabilityContracts(unittest.TestCase):
         self.assertEqual(result['code'],0)
         self.assertEqual(result['calls'],[])
 
-    def test_launcher_actual_non_windows_action_stops_before_runtime_read(self):
-        result=invoke('local_web.py',['status'],non_windows=True)
+    def test_launcher_unsupported_mac_action_stops_before_runtime_read(self):
+        result=invoke('local_web.py',['status'],non_windows='darwin')
         self.assertEqual(result['calls'],[],'unsupported platform must stop before reading runtime information')
         text=result['stdout']+result['stderr']+str(result['exception'])
         self.assertIn('Windows',text)

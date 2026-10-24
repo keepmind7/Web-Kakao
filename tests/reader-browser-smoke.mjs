@@ -8,8 +8,9 @@ import { decodeImage } from '../experiments/local-web/message-content.mjs';
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import http from 'node:http';
+import {testBrowser} from './browser-platform.mjs';
 
-const chrome=['C:/Program Files/Google/Chrome/Application/chrome.exe','C:/Program Files (x86)/Google/Chrome/Application/chrome.exe'].find(existsSync);
+const chrome=testBrowser();
 if(!chrome)throw new Error('Chrome unavailable; browser test not executed');
 const folder=resolve(process.env.WEB_KAKAO_QA_OUTPUT_ROOT || 'local-only/phase2-browser',String(Date.now()));mkdirSync(folder,{recursive:true});
 const key='r_'+'a'.repeat(24),second='r_'+'b'.repeat(24),payload='<img src=x onerror="globalThis.injected=true">';
@@ -667,6 +668,55 @@ await check('closing the photo dialog disables download',async()=>{assert.equal(
     lifecycleChecks.push('open text permission does not enable photo reply or remote read');
     roomCapabilities.set(key,{kind:'OpenMultiChat',canSend:false,canText:false,canPhoto:true,canReply:false,canRead:false,canContext:false});revision++;
     await refreshUi();assert.equal(await evaluate("el('compose-text').disabled && !el('attach-image').disabled"),true,'photo permission is independent of text');
+    // UI-only state injection. The offline server keeps messaging=true; this
+    // checks real DOM guidance/guards without claiming server-mode coverage.
+    const beforeGuidance={sends:sendCalls.length,reads:seenCalls.length,posts:fixtureRequests.filter(row=>row.method==='POST' && ['/api/reader/send','/api/reader/photo'].includes(row.path)).length};
+    const guidance=await evaluate(`(()=>{
+      const room=roomNow(),originalRoom={...room},saved={messaging:lastState.messaging,hasMessaging:Object.hasOwn(lastState,'messaging'),pendingSend,uncertainPhoto,restoredOutbox,freshness,phase:lastState.reader.phase,text:el('compose-text').value,hasDraft:drafts.has(selectedRoom),draft:drafts.get(selectedRoom),hasNote:sendNotes.has(selectedRoom),note:sendNotes.get(selectedRoom),hasReply:replyDrafts.has(selectedRoom),reply:replyDrafts.get(selectedRoom)};
+      const rows=[],draft='전송 모드 안내 합성 초안';
+      const reset=()=>{pendingSend=null;uncertainPhoto=null;restoredOutbox=[];freshness='fresh';lastState.reader.phase='connected';lastState.messaging=false;sendNotes.delete(selectedRoom);replyDrafts.delete(selectedRoom);};
+      const capture=name=>{renderComposer();rows.push({name,status:el('send-status').textContent,textDisabled:el('compose-text').disabled,photoDisabled:el('attach-image').disabled,sendDisabled:el('send-message').disabled,imageSendDisabled:el('image-send').disabled,text:el('compose-text').value,draft:drafts.get(selectedRoom)});};
+      try{
+        el('compose-text').value=draft;drafts.set(selectedRoom,draft);
+        for(const kind of ['DirectChat','OpenMultiChat'])for(const mode of ['off','missing']){
+          reset();Object.assign(room,{kind,canSend:true,canText:true,canPhoto:true,canReply:false,canRead:false,canContext:false});
+          if(mode==='missing')delete lastState.messaging;
+          capture(kind+'-'+mode);el('send-message').click();el('attach-image').click();el('compose-text').dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));
+        }
+        reset();Object.assign(room,{kind:'OpenMultiChat',canSend:false,canText:false,canPhoto:true});lastState.messaging=true;capture('photo-only-on');
+        reset();pendingSend={kind:'text',phase:'sending',clientId:'guidance-text'};capture('pending-text');
+        reset();pendingSend={kind:'photo',phase:'sending',clientId:'guidance-photo'};capture('pending-photo');
+        reset();pendingSend={kind:'text',phase:'unknown',clientId:'guidance-unknown'};capture('pending-unknown');
+        reset();restoredOutbox=[{kind:'text',phase:'sending',clientId:'guidance-restored'}];capture('recovered-sending');
+        reset();restoredOutbox=[{kind:'photo',phase:'unknown',clientId:'guidance-restored-unknown'}];capture('recovered-unknown');
+        reset();uncertainPhoto={kind:'photo',phase:'unknown',clientId:'guidance-uncertain'};capture('uncertain-photo');
+        reset();freshness='checking';capture('checking');
+        reset();freshness='unavailable';capture('unavailable');
+        reset();sendNotes.set(selectedRoom,'합성 전송 안내 우선');capture('send-note');
+        reset();lastState.reader.phase='disconnected';capture('disconnected');
+        return rows;
+      }finally{
+        for(const field of Object.keys(room))delete room[field];Object.assign(room,originalRoom);
+        if(saved.hasMessaging)lastState.messaging=saved.messaging;else delete lastState.messaging;
+        pendingSend=saved.pendingSend;uncertainPhoto=saved.uncertainPhoto;restoredOutbox=saved.restoredOutbox;freshness=saved.freshness;lastState.reader.phase=saved.phase;el('compose-text').value=saved.text;
+        if(saved.hasDraft)drafts.set(selectedRoom,saved.draft);else drafts.delete(selectedRoom);
+        if(saved.hasNote)sendNotes.set(selectedRoom,saved.note);else sendNotes.delete(selectedRoom);
+        if(saved.hasReply)replyDrafts.set(selectedRoom,saved.reply);else replyDrafts.delete(selectedRoom);
+        renderComposer();
+      }
+    })()`);
+    const guidanceNotes={'photo-only-on':'이 방에서는 사진을 보낼 수 있습니다.','pending-text':'메시지를 보내고 있습니다…','pending-photo':'사진을 보내고 있습니다…','recovered-sending':'이전 전송의 결과를 확인하고 있습니다. 다시 보내지 마세요.','checking':'연결 상태를 확인하고 있습니다…','unavailable':'로컬 서버 연결을 확인해 주세요. 입력한 내용은 유지됩니다.','send-note':'합성 전송 안내 우선','disconnected':'계정을 연결하고 대화방을 선택해 주세요.'};
+    assert.equal(guidance.length,15);
+    for(const row of guidance){
+      assert.equal(row.text,'전송 모드 안내 합성 초안',row.name);assert.equal(row.draft,row.text,row.name);
+      assert.equal(row.textDisabled,true,row.name);assert.equal(row.sendDisabled,true,row.name);assert.equal(row.imageSendDisabled,true,row.name);
+      assert.equal(row.photoDisabled,row.name!=='photo-only-on',row.name);
+      if(['pending-unknown','recovered-unknown','uncertain-photo'].includes(row.name))assert.match(row.status,/전송 결과를 확인할 수 없습니다.*자동으로 다시 보내지 않습니다/,row.name);
+      else assert.equal(row.status,guidanceNotes[row.name] || '현재 읽기 전용으로 연결되어 있습니다.',row.name);
+      lifecycleChecks.push('composer guidance '+row.name+' preserves draft and action restrictions');
+    }
+    await sleep(100);assert.equal(sendCalls.length,beforeGuidance.sends);assert.equal(seenCalls.length,beforeGuidance.reads);assert.equal(fixtureRequests.filter(row=>row.method==='POST' && ['/api/reader/send','/api/reader/photo'].includes(row.path)).length,beforeGuidance.posts);
+    lifecycleChecks.push('composer guidance state simulation sends zero text photo or seen requests');
     await evaluate(`prepareImage(new File([Uint8Array.from(atob('${syntheticPng.toString('base64')}'),c=>c.charCodeAt(0))],'synthetic-capability.png',{type:'image/png'}))`);
     assert.equal(await evaluate("el('image-send-dialog').open && !el('image-send').disabled"),true);
     await evaluate("el('image-cancel').click();el('read-sync').checked=false");assert.equal(sendCalls.length,sends);

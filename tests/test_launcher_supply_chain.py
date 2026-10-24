@@ -15,6 +15,7 @@ import urllib.request
 from zipfile import ZipFile
 
 from tools import prepare_android_adb, prepare_node_spike, prepare_rea_android
+from tools.runtime_distribution import runtime_spec
 
 ROOT = Path(__file__).resolve().parents[1]
 UNSAFE = ["CON", "aux.txt", "COM1.log", "lpt9", "nul.tar.gz", "a:b", "trailing.", "trailing "]
@@ -41,14 +42,16 @@ class SupplyChainTests(unittest.TestCase):
     def test_node_zip_hash_is_pinned_and_download_is_partial_then_renamed(self):
         (self.root / prepare_node_spike.FILENAME).write_bytes(b"tampered")
         with self.assertRaises(SystemExit):
-            prepare_node_spike.main(self.root)
+            prepare_node_spike.main(self.root, system='Windows', machine='AMD64')
         (self.root / prepare_node_spike.FILENAME).unlink()
         with patch.object(prepare_node_spike, "urlopen", return_value=io.BytesIO(b"wrong bytes")):
             with self.assertRaises(SystemExit):
-                prepare_node_spike.main(self.root)
+                prepare_node_spike.main(self.root, system='Windows', machine='AMD64')
         self.assertEqual(list(self.root.iterdir()), [], "no archive or .partial remains after a mismatch")
-        self.assertEqual(prepare_node_spike.EXPECTED, json.loads((ROOT / "evidence/alternatives/node-runtime.json").read_text())["sha256"]
-                         if (ROOT / "evidence/alternatives/node-runtime.json").exists() else prepare_node_spike.EXPECTED)
+        self.assertEqual(prepare_node_spike.EXPECTED, runtime_spec('Windows', 'AMD64')['sha256'])
+        runtime_record = ROOT / 'evidence/alternatives/node-runtime.json'
+        if runtime_record.exists():
+            self.assertEqual(runtime_spec()['sha256'], json.loads(runtime_record.read_text())['sha256'])
 
     def test_node_zip_rejects_reserved_ads_trailing_and_case_duplicates(self):
         top = prepare_node_spike.FILENAME.removesuffix(".zip")
@@ -57,7 +60,7 @@ class SupplyChainTests(unittest.TestCase):
                 archive = self.root / prepare_node_spike.FILENAME
                 digest = self.make_zip(archive, top, ["ok.txt", *names])
                 with patch.object(prepare_node_spike, "EXPECTED", digest), self.assertRaises(SystemExit):
-                    prepare_node_spike.main(self.root)
+                    prepare_node_spike.main(self.root, system='Windows', machine='AMD64')
                 self.assertFalse((self.root / top).exists())
                 archive.unlink()
 

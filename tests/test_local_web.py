@@ -62,7 +62,10 @@ class ExistingServerModeTests(unittest.TestCase):
         client = Mock()
         client.open.return_value = io.BytesIO(json.dumps({"ticket": ticket}).encode())
         with patch.object(local_web, "connect", return_value=(url, client, {"build": 8})), \
+             patch.object(local_web.platform, 'system', return_value='Windows'), \
              patch.object(sys, "argv", ["local_web.py", "open"]), \
+             patch.object(local_web.subprocess, 'Popen', side_effect=AssertionError('no real browser process')), \
+             patch.object(local_web, 'find_browser', side_effect=AssertionError('no installed browser discovery')), \
              patch.object(local_web.webbrowser, "open") as browser, \
              contextlib.redirect_stdout(io.StringIO()) as output:
             self.assertEqual(local_web.main(), 0)
@@ -143,7 +146,12 @@ class PhotoTransportLauncherTests(unittest.TestCase):
                 environment = spawn.call_args.kwargs["env"]
                 for key in ["KAKAO_PHOTO_TRANSPORT", "NODE_OPTIONS", "HTTPS_PROXY"]:
                     self.assertNotIn(key, environment)
-                self.assertEqual(spawn.call_args.kwargs["creationflags"], local_web.subprocess.CREATE_NO_WINDOW)
+                if local_web.platform.system() == 'Windows':
+                    self.assertEqual(spawn.call_args.kwargs["creationflags"], local_web.subprocess.CREATE_NO_WINDOW)
+                else:
+                    self.assertTrue(spawn.call_args.kwargs['start_new_session'])
+                    self.assertEqual(spawn.call_args.kwargs['umask'], 0o077)
+                    self.assertNotIn('creationflags', spawn.call_args.kwargs)
 
     def test_status_includes_mode_without_authentication_values(self):
         state = {"build": 8, "mode": "live", "photoTransport": "https-experimental",

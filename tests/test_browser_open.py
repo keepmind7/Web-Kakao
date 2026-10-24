@@ -26,7 +26,10 @@ class BrowserOpenTests(unittest.TestCase):
                             "LOCALAPPDATA": str(self.folder / "Local App Data"),
                             "BROWSER": "cmd /c SYNTHETIC_MUST_NOT_EXECUTE",
                             "PATH": str(self.folder / "hostile-path")}
-        for patcher in [patch.dict(os.environ, self.environment),
+        # This class validates the Windows browser contract on every host.
+        # Linux discovery and launch rules have separate platform tests.
+        for patcher in [patch.object(local_web.platform, 'system', return_value='Windows'),
+                        patch.dict(os.environ, self.environment),
                         patch.object(local_web, "FOLDER", self.folder / "launcher"),
                         patch.object(local_web.subprocess, "run", side_effect=AssertionError("no external commands")),
                         patch.object(local_web.socket, "create_connection", side_effect=AssertionError("no sockets")),

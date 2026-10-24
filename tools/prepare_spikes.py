@@ -10,9 +10,11 @@ from urllib.parse import urlsplit
 try:
     from tools.cli_support import parse_arguments, run_preparation
     from tools.safe_download import checked_path
+    from tools.runtime_distribution import runtime_spec
 except ModuleNotFoundError:
     from cli_support import parse_arguments, run_preparation
     from safe_download import checked_path
+    from runtime_distribution import runtime_spec
 
 ROOT = Path(__file__).absolute().parent.parent
 CANDIDATES = [
@@ -75,7 +77,7 @@ def preflight():
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--install-dependencies', action='store_true')
-    args = parse_arguments(parser, argv)
+    args = parse_arguments(parser, argv, supported_platforms=('win32', 'linux'))
     run_preparation(parser, lambda: prepare_all(args.install_dependencies),
                     missing='필수 준비 파일이 없습니다. py -3.11 tools/fetch_source_spike.py 또는 py -3.11 tools/prepare_node_spike.py로 먼저 준비하세요.',
                     invalid_errors=(KeyError,))
@@ -98,6 +100,7 @@ def prepare_all(install_dependencies=False):
 
 
 def prepare(candidate, manifest, experiments, source, target, lock_bytes, node_root):
+    spec = runtime_spec() if node_root is not None else None
     target.mkdir(parents=True, exist_ok=True)
     if not (target / "src").exists():
         shutil.copytree(source / "src", target / "src")
@@ -122,7 +125,7 @@ def prepare(candidate, manifest, experiments, source, target, lock_bytes, node_r
         (target / 'package-lock.json').write_bytes(lock_bytes)
         env = {key:value for key,value in os.environ.items()
                if not key.startswith("KAKAO_") and key not in {"NODE_OPTIONS","NPM_TOKEN","NODE_AUTH_TOKEN"}}
-        subprocess.run([str(node_root/"node.exe"),str(node_root/"node_modules/npm/bin/npm-cli.js"),
+        subprocess.run([str(node_root/spec['executable']),str(node_root/spec['npm_cli']),
                         "ci","--ignore-scripts","--no-audit","--no-fund","--registry=https://registry.npmjs.org",
                         "--userconfig=./npm-user-empty.ini","--globalconfig=./npm-global-empty.ini","--cache=./npm-cache"],
                        cwd=target,env=env,check=True)

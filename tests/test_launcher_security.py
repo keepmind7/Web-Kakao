@@ -103,19 +103,20 @@ class LauncherSecurityTests(unittest.TestCase):
         self.assertIn("비정상 종료", output)
         self.assertTrue((self.folder / "runtime.json").exists())
 
-    def test_listener_pid_and_executable_must_match(self):
+    def test_windows_listener_pid_and_executable_must_match(self):
         node = os.path.realpath(local_web.RUNTIME)
         cases = [({4242}, node, None), ({999}, node, local_web.UntrustedServer), ({4242}, "C:\\evil\\node.exe", local_web.UntrustedServer),
                  (set(), "", local_web.StaleRuntime), ({4242, 999}, node, local_web.UntrustedServer)]
         for owners, path, error in cases:
-            with self.subTest(owners=owners, path=path), patch.object(local_web.os, "name", "nt"), \
+            with self.subTest(owners=owners, path=path), patch.object(local_web.platform, "system", return_value="Windows"), \
                     patch.object(local_web, "listener_owners", return_value=owners), patch.object(local_web, "process_image", return_value=path):
                 if error:
                     with self.assertRaises(error):
                         local_web.listener_matches(1234, 4242)
                 else:
                     local_web.listener_matches(1234, 4242)
-        with patch.object(local_web, "listener_owners", return_value={4242}), \
+        with patch.object(local_web.platform, "system", return_value="Windows"), \
+                patch.object(local_web, "listener_owners", return_value={4242}), \
                 patch.object(local_web, "process_image", side_effect=PermissionError("synthetic access denied")):
             with self.assertRaisesRegex(local_web.UntrustedServer, "권한"):
                 local_web.listener_matches(1234, 4242)
@@ -124,7 +125,9 @@ class LauncherSecurityTests(unittest.TestCase):
         process = Mock()
         process.poll.return_value = 1
         hostile = {"NODE_OPTIONS": "--require x", "NODE_TLS_REJECT_UNAUTHORIZED": "0", "NODE_EXTRA_CA_CERTS": "x.pem", "HTTPS_PROXY": "http://x", "KAKAO_X": "1"}
-        with patch.dict(os.environ, hostile), patch.object(local_web, "ensure_private_directory"), \
+        with patch.object(local_web.platform, 'system', return_value='Windows'), \
+                patch.object(local_web.subprocess, 'CREATE_NO_WINDOW', 0x08000000, create=True), \
+                patch.dict(os.environ, hostile), patch.object(local_web, "ensure_private_directory"), \
                 patch.object(local_web.socket, "create_connection", side_effect=ConnectionRefusedError), \
                 patch.object(local_web, "broad_write_warnings", return_value=[local_web.ROOT]), \
                 patch.object(local_web.subprocess, "Popen", return_value=process) as popen:
@@ -137,6 +140,7 @@ class LauncherSecurityTests(unittest.TestCase):
         self.assertIn("넓은 쓰기 권한", output)
         self.assertIn("workspace_acl.ps1", output)
 
+    @unittest.skipUnless(os.name == 'nt', 'Windows OEM/ACL parser; Linux permission warning has a separate backend')
     def test_broad_write_parser_ignores_read_only_and_deny(self):
         sample = ("X BUILTIN\\Users:(I)(OI)(CI)(RX)\n  Everyone:(DENY)(W)\n  NT AUTHORITY\\Authenticated Users:(I)(M)\n").encode()
         with patch.object(local_web.subprocess, "run", return_value=Mock(stdout=sample)):

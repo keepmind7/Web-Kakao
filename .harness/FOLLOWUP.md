@@ -1,6 +1,54 @@
 # Web-Kakao 후속 작업
 
-2026-10-22 기준. 현재 실행·구조·기능 제한은 [README](../README.md), 협업·역할·자원 사용권은 [OPERATING.md](OPERATING.md)를 따릅니다. 이 문서는 최신 상태와 다음 작업을 위한 공유 인수인계입니다. 세부 실행/실패 기록은 비공개 자료와 Git 이력에 보존합니다.
+2026-10-24 기준. 현재 실행·구조·기능 제한은 [README](../README.md), 협업·역할·자원 사용권은 [OPERATING.md](OPERATING.md)를 따릅니다. 이 문서는 최신 상태와 다음 작업을 위한 공유 인수인계입니다. 세부 실행/실패 기록은 비공개 자료와 Git 이력에 보존합니다.
+
+## Mac에서 이어서 개발
+
+사용자는 현재 공유 가능한 Windows/common/Linux 변경과 다음 재개 위치를 README에 남겨 GitHub push할 것을 요청했습니다. macOS 실행은 현재 미지원이며 이번 인계 차수에서 구현하지 않습니다. 최신 시작점은 README의 ‘Mac에서 재개하기 (2026-10-24)’입니다. 새 Mac에서 소스 clone/pull과 아키텍처·OS·Python·Git을 확인한 뒤 Darwin 고정 런타임/안전 설치→Mac launcher/신원/브라우저→POSIX 개인 저장소→CLI/회귀→Mac 자체 mock/합성 화면→별도 승인 실계정 순으로 진행합니다. 현재 OS 차단을 제거하거나 Linux backend를 그대로 선택하는 방식으로 우회하지 않습니다. 기존 역할/스킬 정의는 공유하되 비공개 실행 장부와 과거 승인을 재사용하지 않습니다. 아래 WSL 전송 모드 재개는 별도 미실행 범위로 남습니다.
+
+## 최신 WSL 실행 모드 확인
+
+10/24 사용자 status의 messaging=false로 일반/오픈 방 글 입력 차단이 읽기 전용 실행 모드 때문임을 확인했습니다. 같은 관측은 build8·gapProbe=true·photoTransport=https·mode=live·phase=cancelled·credentialInMemory=false·chatConnectionActive=false·actualMessageSent=false입니다. actualChatConnected=true는 과거 연결 성공으로 현재 활성 연결과 구분합니다. 세션이 이미 비어 있어 추가 로컬 세션 삭제를 반복 요청하지 않습니다. 승인 후 정상 stop→start --gap-probe --messaging→open --browser chrome→본인 계정 QR1회·목록 확인까지만 진행할 계획이며, 읽음OFF·방 선택/발송0을 유지합니다. stop이409면 상태가 바뀐 것이므로 강제 종료나 자동 재시도 없이 상태를 확인합니다. 새 ZIP 설치는 모드 전환의 선행 조건이 아닙니다. 현재 재개는 승인 대기이고 실행하지 않았습니다. 제품·기존fix7 ZIP·사용자 서버·기기·계정을 변경하지 않았고 실전 송수신은 미검증입니다. 아래10/23 응답 대기 기록과 이전 ZIP은 당시 상태로 보존합니다.
+
+## Windows/common/Linux 분리
+
+사용자 요청으로 Windows 기준본58a73a7의 공개 소스 ZIP을 local-only/dist에 보존하고 Python의 tools/platforms/common·windows·linux·paths 및 Node의 platform/common·windows·linux 모듈로 OS 경계를 분리했습니다. 기존 실행 진입점과 Windows 저장소 ID·ACL backend·PID/실행 경로→HMAC→제어 토큰 순서 및 대화 정책을 보존합니다. Linux x64 glibc·WSL2를 대상으로 /proc 소유 확인·POSIX 파일 보호·고정 Node tar 준비·소스 패키징·격리 mock runner를 추가했습니다. macOS는 순수 경로 계산만 준비했고 실행은 차단합니다.
+
+수정본 전달과 실행 절차는 [플랫폼 지원 안내](../reports/PLATFORM_SUPPORT.ko.md)를 따릅니다. 아직 커밋/push하지 않았다면 원격 clone에는 이번 변경이 없으므로 현재 source ZIP을 WSL의 Linux 홈에 풀어 준비합니다. Windows의 실행파일·node_modules·개인 저장소를 복사하거나 /mnt/c 작업 폴더에서 권한 검증 성공을 주장하지 않습니다.
+
+현재 에이전트 PC에는 wsl.exe가 없지만, 다른 PC의 사용자 Ubuntu WSL2·x86_64·Python3.14.4·Git2.53.0과 고정 Linux Node24.21.0 tar 설치 완료를 확인했습니다. 최초 mock의 Windows 전용 stat 참조 AttributeError와 fix1 후 junction5/5 성공·mock 후속exit2 실패를 보존합니다. 후속 읽기전용 관측에서 다른 sameUID 프로세스의 FD readlink EACCES·fdinfo unavailable·대상 Node FD/이미지 접근 가능을 확인해 Linux 대상 PID 보유 검증과 고정 진단을 보완했습니다. **사용자의 fix2 실제 WSL mock 재실행에서 start/status/stop 각각exit0·mockStopped=true·actualAccountUsed=false로 성공**했습니다. 이것은 사용자 제공 출력이며 이 PC의 직접 Linux 실행이나 브라우저·카카오 계정 성공으로 확대하지 않습니다. 다음은 platform/full·선택적 격리 브라우저 순이며 계정/QR/읽음/발송은 별도 승인 범위입니다.
+
+Linux 보완 계약은 호출자 UID/eUID 일치·대상 proc 소유UID·모든 해당 포트 socketUID·대상PID의 모든inode 보유·전후table·이미지·HMAC-before-token입니다. 기대PID 자체 접근 거절은 계속 실패합니다. 기존 strict listener_owners와 Windows 경로는 유지하고, 대상 보유 증명을 단독 소유 증명으로 표현하지 않습니다. 일반 OS 사용자 신뢰모델이며 악성 같은UID·sandbox/LSM 사이 격리나 PID/FD/별도HTTP경쟁의 원자적 방어를 보장하지 않습니다. 상세 설계와 제한은 플랫폼 지원 안내를 따릅니다. Linux tar 최초설치는 성공했고 재설치·경합·다른환경은 별도확인합니다. 기존 실패 격리 폴더/runtime은 보존하며 다른Node 전체종료로 정리하지 않습니다. 기존 서버·로그인·.gitignore는 유지하고 커밋·push·실제계정 시험을 수행하지 않습니다.
+
+WSL junction 수정의 로컬 표적 검사:5/5·저장소15/15·verifier17/17·launcher29/29, 최종 독립 정적 검수는5/5지문·추가지적0입니다. 후속 전체Python2차는224건 중221통과/임시Git fixture 정리WinError145 1ERROR/2skip으로 **부분 성공**입니다. 첫 전체도proc fixture 정리1ERROR였고 해당 정리만최대4회Windows145재시도로보완했지만Git fixture에서도정리오류가발생했습니다. 제품실패를숨기거나전체통과로기록하지않습니다. 더 넓은 QA반복은 중단하고 새ZIP으로사용자WSLmock을재확인합니다.
+
+fix2 대상PID 검증 보완의 부모 표적 회귀는8개파일·128건중127pass/1skip(Python3.9부재)/실패·오류0·exit0, source6개 전후일치입니다. worker의launcher44와verifier20은128의부분집합입니다. 이 회귀는 Windows 결과이며 Node·UI·브라우저 파일에 fix2 변경이 없어 전체Node/Chrome은 재실행하지 않았습니다. 이후 사용자 WSL mock은 성공했고, 후속platform은 Python111통과·Node3실패로 실패했습니다. 전체검사·브라우저·계정은 아직 미실행입니다. 공통소스ZIP web-kakao-source-20261023-fix2.zip은 배포 당시 문서와 코드를 보존하며 후속기록만을위해교체하지않습니다.
+
+다음 `--suite platform`에는 reader-manager의 고정 소스 확인에 필요한 modern 원본/작업 복사본이 있어야 합니다. 지원 도구 순서는 `fetch_source_spike.py modern` → `fetch_source_spike.py legacy` → `prepare_spikes.py` → `verify_linux.py --suite platform`입니다. 이 단계는 npm 설치가 필수는 아니며, 실제 worker/SDK를 실행하는 full·브라우저 단계 전에 `prepare_spikes.py --install-dependencies`를 준비합니다. 소스 다운로드·복사본 생성은 계정 없이 수행합니다.
+
+사용자가 modern25·legacy213파일과 작업복사본 준비를 완료했습니다. fix2 실제platform은 Python111전부OK, Node39pass/3fail/1skip/exit1로실패했습니다. 공개reader-diagnostics.mjs누락2실패, XDG환경을상속한HOME거절fixture1실패, nativeLinux권한시험skip을fix3에서보완했습니다. 패키지12/12와부모Windows XDG조건Node44pass/1Linux전용skip을통과했고제품경로계산·권한정책·읽음/통신코드는바꾸지않았습니다. **이후사용자fix3 실제WSL platform은Python82+12+20=114전부OK, Node45pass/실패0/skip0으로성공**했습니다. nativeLinux권한·하드링크시험이실행됐고최종7개check모두exit0·actualAccountUsed=false·browserExecuted=false·mockStopped=true입니다. 현재인스턴스종료성공을과거실패인스턴스모두의정리로확대하지않습니다.
+
+fix3의후속WSL full은Python245총228pass/1fail/1error/15skip으로실패했습니다. Windows REA 준비positive시험의OS모의부재와taskkill경로역슬래시전제를확인했습니다. fix4는tests/test_rea_pc.py만수정해Windows/AMD64모의·지원불가OS/CPU IO전거절·모의SystemRoot의전체절대taskkill경로와기존실패단언을검증합니다. 실제제품REA/웹코드는바꾸지않았습니다. 로컬Windows REA/CLI36개와Linux플랫폼값모의2개가통과했고2개는36의부분집합입니다. 실제REA/Java/taskkill/계정실행은없습니다.
+
+사용자fix4 WSL full의최종결과는Python전체exit0(정확한건수미제공), Node1033총1031pass/실패0/취소0/2skip, mock시작/status/Python/Node/stop5개check모두exit0·mockStopped=true입니다. actualAccountUsed=false·browserExecuted=false이며Node skip개별사유는미제공입니다. 이성공은전달된시험범위이고브라우저/카카오계정/타Linux/macOS로확대하지않습니다.
+
+검사 수를 저장소와 대조해 공개 `tests/reader-diagnostics.test.mjs`(8개 합성 시험)가 접두사 제외 정책에 남아 누락된 것을 확인했습니다. Git 대상 코드 154개 중 누락 1개이며 Node 진입점은 저장소 49개/ZIP 48개였습니다. fix5는 제품 모듈과 공개 시험의 정확한 두 경로만 허용하고 개인 진단·Git 제외를 유지합니다. 전달 회귀는 실제 Node 진입점 집합·단일 개수·바이트·SHA를 대조하며, 실제 ROOT의 Git 없이 추출 ZIP에서도 검사합니다. Windows 표적 14건 중 13통과·임시 Git 정리 WinError145 1오류와 동일 소스 신규 회귀 1건 재확인 통과를 구분합니다. 기존 fix4 성공·이전 실패·ZIP을 보존하며 새 WSL full은 결과 대기입니다.
+
+후속 사용자 fix5 실제 WSL full은 Node 총1,041개 중1,039통과·2skip·실패/취소0, Python 전체exit0, mock-start/status/Python/Node/stop 최종5check 전부exit0·mockStopped=true로 성공했습니다. actualAccountUsed=false·browserExecuted=false이며 Python 정확한 건수와 skip 개별 사유는 미제공입니다. 전달 명령에 따른 사용자 출력이며 사용자 PC의 ZIP 해시는 별도로 측정하지 않았습니다.
+
+Linux Chrome 156.0.8078.47 설치·버전 확인 후 `verify_linux.py --suite mock --browser`는 reader-browser-smoke.mjs:69에서15초 browser startup timeout·exit1로 실패했습니다. 화면 단언은 미진입이며 초기에는 stderr가 버려져 원인을 몰랐습니다. 이 실패 실행의 mock 종료 성공 JSON도 제공되지 않았습니다. 후속 사용자 격리 빈 페이지 진단에서 exit-6·DevTools 파일 false·`Socket path too long`을 확인했습니다. 긴 QA TMPDIR 아래의 SingletonSocket 경로 초과가 확인된 원인이며, CPU cpufreq 파일 부재는 별도 원인으로 단정하지 않습니다.
+
+fix6는 브라우저 검사에만 기존 env를 복사해 TMPDIR을 `/tmp/wk-<random>`의 새로운 private0700 디렉터리로 바꿉니다. HOME/XDG/프로필/QA 출력 및 다른 검사·mock의 env는 유지합니다. 기존 QA와 같이 짧은 임시 폴더도 보존하고 자동 재귀 삭제를 추가하지 않습니다. Windows 표적 verifier25개와 실제 ZIP 추출본의 동일25개가 각각 통과했으며 합산하지 않습니다.
+
+**후속 사용자 WSL fix6 화면 재검사도 성공**했습니다. 제공 JSON의 mock-start/status/isolated-browser/stop4단계가 모두exit0, browserExecuted=true·mockStopped=true·actualAccountUsed=false입니다. 긴 TMPDIR로 인한 시작 오류는 이 WSL에서 해결됐습니다. 정확한 화면 조건 수·이번 동반 Python 표적 건수·Chrome 자식 종료 기록·사용자 ZIP 해시는 미제공이며 추정하지 않습니다. 이번 성공은 해당 mock 인스턴스의 종료와 계정 없는 합성 화면이며 과거 모든 실패 자료 정리·일반 GUI·실제 카카오 계정 성공으로 확대하지 않습니다. 이미 통과한 전체 Node 회귀와 설치를 반복할 필요는 없습니다.
+
+다음은 별도 승인 후 WSL 일반 Chrome 창·QR 로그인1회·읽음 OFF 상태의 기존 방/이력/사진 조회와 자연 수신 확인입니다. 기존 Windows 세션이나 연결 기기를 자동 로그아웃하지 않습니다. 메시지·사진 발송과 읽음 통보는 다음 단계에도 별도 승인 범위로 남깁니다. 이 차수는 관측·문서만 갱신하며 제품 코드·기존 ZIP·커밋·push는 변경하지 않습니다.
+
+후속 사용자 입력에서 WSL 일반 Chrome 빈 창과 Web-Kakao 화면 열림을 확인했습니다. 사용자의 직접 연결 진행 요청에 따라 읽기 전용 start/open과 QR1회·읽음OFF·발송0 범위를 안내했습니다. 앱 한글이 네모였으나 CJK/emoji 글꼴 안내 뒤 사용자 이미지에서 본문·탭 제목 한글 표시가 정상으로 바뀌었습니다. 창 장식 일부 네모와 전체 글꼴 설치 상태는 미확인입니다. HTML meta·HTTP 응답과 소스 UTF-8은 정상이며 인코딩 변경은 없습니다.
+
+사용자는 이어 실제 방·사람 이름·대화 이력 조회 정상과 일반/오픈 방의 글 입력 불가를 보고했습니다. 조회는 시험한 기능의 사용자 관찰 성공으로 기록하고 전체 이력·사진·실시간 수신·발송 성공으로 확대하지 않습니다. 부모가 조회 QA용으로 안내한 start --gap-probe에는 --messaging이 없었습니다. 실제 실행 messaging 값은 status 응답 대기이며 추정으로 확정하지 않습니다. 조사에서 global OFF는 글/사진/답장/읽음 모두 차단하지만 하단 사진 가능 문구만 global gate를 누락한 UI 결함을 확인해 fix7에서 해당 안내만 최소 수정했습니다. Windows 합성 Chrome 표적19조건이 exit0으로 통과했고 UI 상태를 CDP로 주입한 검사이며 실제 서버 global OFF 연결 시험과 구분합니다. 최초 sandbox Chrome 시작 timeout과 종료 기록은 보존하고 실행 권한을 확인한 새 프로필에서 통과했습니다. 전체 Python/Node/Chrome을 재실행하지 않았습니다. 사용자 WSL에 새 소스 적용·실전 전송은 미실행입니다. 현재 다른 PC의 서버·로그인을 유지하며 새 QR·기기 변경·읽음·전송 승인으로 확대하지 않습니다. 모드 전환에는 초안 보관·로컬 세션 정리·정상 재시작·새 QR1회 확인이 필요합니다.
+
+Windows 계정 없는 기존 결과: Node1040pass/1skip(총1041·표준격리·직렬), Python전체204pass/2skip(총206), Chrome115/115. 마지막 시험2파일의 모의범위 보완은19/19 표적 재검사이며 제품·Node·Chrome 불변을 대조해 전체 결과를 재사용했습니다.19개는206개에 추가 합산하지 않습니다. 최초 Python전체의 ZIP 게시 후 stage WinError1451건과 최초 독립 검수의Linux시험3건·후속open시험1건은 각각 실패/수정 이력으로 보존합니다. 정리오류는 동일9개와 이후전체에서미재현·원인미확정입니다. 이후 사용자 WSL 최초 실행에서 발견된 junction 결함과 수정 후 재실행 대기는 별도 기록이며 전체 Linux 검증 성공을 주장하지 않습니다.
 
 ## 현재 상태
 
