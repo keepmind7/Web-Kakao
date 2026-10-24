@@ -4,9 +4,10 @@ import {existsSync,mkdirSync,readFileSync,writeFileSync} from 'node:fs';
 import {resolve} from 'node:path';
 import assert from 'node:assert/strict';
 import {createLocalServer} from '../experiments/local-web/server.mjs';
+import {testBrowser} from './browser-platform.mjs';
 const output=resolve(process.env.WEB_KAKAO_QA_OUTPUT_ROOT || 'local-only/qa-feedback-20261018/qa/browser',String(Date.now()));mkdirSync(output,{recursive:true});
 const profile=resolve(output,'p'),sleep=ms=>new Promise(r=>setTimeout(r,ms));
-const chrome=['C:/Program Files/Google/Chrome/Application/chrome.exe','C:/Program Files (x86)/Google/Chrome/Application/chrome.exe'].find(existsSync);assert.ok(chrome,'Chrome required');
+const chrome=testBrowser();assert.ok(chrome,'Chrome required');
 const key='r_'+'a'.repeat(24),second='r_'+'b'.repeat(24),clientId='aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const checks=[],closed=[],pending=new Map();let app,browser,socket,sequence=0,revision=1,rows=[],outbox=[],acks=0,sends=0,seens=0,photos=0,sendOutcome=null;
 function command(method,params={}){return new Promise((resolve,reject)=>{const id=++sequence,timer=setTimeout(()=>{pending.delete(id);reject(new Error('CDP deadline '+method));},8000);pending.set(id,{resolve,reject,timer});socket.send(JSON.stringify({id,method,params}));});}

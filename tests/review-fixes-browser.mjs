@@ -4,10 +4,11 @@ import {existsSync,mkdirSync,readFileSync,writeFileSync} from 'node:fs';
 import {resolve} from 'node:path';
 import assert from 'node:assert/strict';
 import {createLocalServer} from '../experiments/local-web/server.mjs';
+import {testBrowser} from './browser-platform.mjs';
 
 const output=resolve(process.env.WEB_KAKAO_QA_OUTPUT_ROOT || 'local-only/repair-review-20261018/qa/contracts/browser',String(Date.now()));mkdirSync(output,{recursive:true});
 const profile=resolve(output,'profile'),sleep=ms=>new Promise(r=>setTimeout(r,ms));
-const chrome=['C:/Program Files/Google/Chrome/Application/chrome.exe','C:/Program Files (x86)/Google/Chrome/Application/chrome.exe'].find(existsSync);
+const chrome=testBrowser();
 assert.ok(chrome,'Chrome required');
 const key='r_'+'a'.repeat(24),message=n=>'m_'+String(n).repeat(24);
 const gif=Buffer.from('R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==','base64');

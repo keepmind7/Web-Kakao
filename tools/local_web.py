@@ -171,13 +171,14 @@ def find_browser(name):
 
 
 def launch_browser(url, browser="default", executable=None):
-    if browser == "default" and platform.system() == "Windows":
+    # macOS webbrowser passes the URL to osascript on stdin, not argv.
+    if browser == "default" and platform.system() in {"Windows", "Darwin"}:
         return bool(webbrowser.open(url))
     executable = executable or find_browser(browser)
     if executable is None:
         return False
     options = {}
-    if platform.system() == "Linux":
+    if platform.system() in {"Linux", "Darwin"}:
         options["env"] = launch_platform.backend().browser_environment(os.environ)
     subprocess.Popen([str(executable), "--new-window", url], shell=False,
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **options)
@@ -195,7 +196,7 @@ def main():
     parser.add_argument("--legacy", action="store_true", help="이전 build7 서버를 명시적으로 정상 종료할 때만 사용")
     parser.add_argument("--source", type=Path, help="사용자가 확인한 이전 개인 설정 폴더")
     parser.add_argument("--browser", choices=["default", "chrome", "chromium", "edge"], default="default",
-                        help="open으로 열 브라우저 선택. Linux는 고정 설치 위치의 Chrome/Chromium/Edge만 사용")
+                        help="open으로 열 브라우저 선택. Linux/macOS는 고정 설치 위치의 Chrome/Chromium/Edge만 사용")
     parser.add_argument("--mock", action="store_true")
     parser.add_argument("--gap-probe", action="store_true", help="누락 구간에 MCHATLOGS를 한 번 확인하는 읽기 실험")
     parser.add_argument("--messaging", action="store_true", help="텍스트 전송과 읽음 상태 기능 활성화")
@@ -209,10 +210,10 @@ def main():
         print("--browser는 open 명령에서만 사용할 수 있습니다.")
         return 2
     if RUNTIME is None:
-        print("이 OS·CPU는 지원하지 않습니다. Windows x64 또는 Linux x64(glibc)가 필요합니다. macOS는 아직 미지원입니다.")
+        print("이 OS·CPU는 지원하지 않습니다. Windows x64, Linux x64(glibc) 또는 macOS(Intel·Apple Silicon)가 필요합니다.")
         return 2
     if FOLDER is None:
-        print("개인 저장소 경로를 확인할 수 없습니다. Windows LOCALAPPDATA 또는 Linux HOME·XDG_DATA_HOME을 확인하세요.")
+        print("개인 저장소 경로를 확인할 수 없습니다. Windows LOCALAPPDATA 또는 Linux/macOS HOME·XDG_DATA_HOME을 확인하세요.")
         return 2
     if args.legacy and args.action != "stop":
         print("--legacy는 이전 서버 종료만 지원합니다.")

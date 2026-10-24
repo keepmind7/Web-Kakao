@@ -110,8 +110,9 @@ class CliPortabilityContracts(unittest.TestCase):
         self.assertEqual(result['code'],0)
         self.assertEqual(result['calls'],[])
 
-    def test_launcher_unsupported_mac_action_stops_before_runtime_read(self):
-        result=invoke('local_web.py',['status'],non_windows='darwin')
+    def test_launcher_unsupported_mac_cpu_stops_before_runtime_read(self):
+        with patch.object(platform,'machine',return_value='ppc'):
+            result=invoke('local_web.py',['status'],non_windows='darwin')
         self.assertEqual(result['calls'],[],'unsupported platform must stop before reading runtime information')
         text=result['stdout']+result['stderr']+str(result['exception'])
         self.assertIn('Windows',text)

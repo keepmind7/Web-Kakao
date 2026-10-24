@@ -17,7 +17,8 @@ export function privateDataRoot(options={}){
   }
   return privateDataPath({projectRoot,...rest});
 }
-function supported(){if(!['win32','linux'].includes(process.platform))throw new Error('private_data_platform');}
+// linux.mjs holds the POSIX checks shared by Linux and macOS.
+function supported(){if(!['win32','linux','darwin'].includes(process.platform))throw new Error('private_data_platform');}
 export function ensurePrivateDirectory(folder){
   supported();const target=resolve(folder);ancestors(target);
   if(process.platform==='win32')nativeSync(project,'directory',target);
@@ -32,11 +33,11 @@ export async function ensurePrivateDirectoryAsync(folder){
 }
 // No successful permission result is cached, including for files we wrote.
 export function verifyPrivateFile(path,{maxBytes=1024*1024}={}){
-  supported();path=resolve(path);const info=fileInfo(path,maxBytes);if(!info)return process.platform==='linux'?verifyMissingParent(path):false;
+  supported();path=resolve(path);const info=fileInfo(path,maxBytes);if(!info)return process.platform!=='win32'?verifyMissingParent(path):false;
   return process.platform==='win32'?nativeSync(project,'file',path,maxBytes):verifyFile(path,info,maxBytes);
 }
 export async function verifyPrivateFileAsync(path,{maxBytes=1024*1024}={}){
-  supported();path=resolve(path);const before=fileInfo(path,maxBytes);if(!before)return process.platform==='linux'?verifyMissingParent(path):false;
+  supported();path=resolve(path);const before=fileInfo(path,maxBytes);if(!before)return process.platform!=='win32'?verifyMissingParent(path):false;
   if(process.platform==='win32'){
     if(!await nativeAsync(project,'file',path,maxBytes))throw new Error('private_file_changed');
     const after=fileInfo(path,maxBytes);

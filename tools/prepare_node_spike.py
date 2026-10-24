@@ -1,10 +1,11 @@
-"""고정된 공식 Node 24 Windows/Linux 배포를 프로젝트 내부에 준비한다."""
+"""고정된 공식 Node 24 Windows/Linux/macOS 배포를 프로젝트 내부에 준비한다."""
 import argparse
 import ctypes
 import errno
 import json
 import hashlib
 import os
+import platform
 import posixpath
 import shutil
 import stat
@@ -108,7 +109,7 @@ def install_tar_archive(path, destination, top, required):
     """Manually extract vetted regular files, preserving executable semantics."""
     destination = checked_path(destination)
     home = checked_path(destination / top)
-    with tarfile.open(path, mode='r:xz') as archive:
+    with tarfile.open(path, mode='r:gz' if str(path).endswith('.tar.gz') else 'r:xz') as archive:
         entries = _tar_entries(archive, destination, top, required)
         expected_files = {name for name, source, _ in entries if source is not None}
         expected_dirs = {top}
@@ -171,6 +172,19 @@ def _publish_directory(source, destination):
     if os.name == 'nt':
         source.rename(destination)  # Windows rename rejects an existing target.
         return
+    if platform.system() == 'Darwin':
+        try:
+            rename = ctypes.CDLL(None, use_errno=True).renamex_np
+        except AttributeError:
+            raise ValueError('atomic_noreplace_publication_unavailable') from None
+        rename.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        rename.restype = ctypes.c_int
+        if rename(os.fsencode(source), os.fsencode(destination), 0x4) != 0:  # RENAME_EXCL
+            code = ctypes.get_errno()
+            if code == errno.EEXIST:
+                raise FileExistsError('runtime_destination_collision')
+            raise OSError(code, 'atomic_noreplace_publication_failed')
+        return
     try:
         rename = ctypes.CDLL(None, use_errno=True).renameat2
     except AttributeError:
@@ -211,7 +225,7 @@ def main(target_root=ROOT / "local-only/runtime", *, system=None, machine=None):
 
 def cli(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parse_arguments(parser, argv, supported_platforms=('win32', 'linux'))
+    parse_arguments(parser, argv, supported_platforms=('win32', 'linux', 'darwin'))
     return run_preparation(parser, prepare_cli)
 
 

@@ -4,9 +4,32 @@
 
 QR 로그인, 일반 대화·답장·읽음, HTTPS 사진 발송의 사용자 확인 사례가 있습니다. 사진은 JPEG·PNG·WebP를 입력받아 JPEG로 변환합니다. 시험한 오픈채팅방의 텍스트 전송도 사용자 확인했습니다. 방 종류와 장시간 동작의 남은 확인 사항은 문서 하단의 **알려진 문제와 QA**에 정리했습니다.
 
-## 다음 작업: Mac에서 재개하기 (2026-10-24)
+## macOS 실행 (2026-10-25, 계정 없는 검증까지)
 
-**현재 macOS 실행은 미지원입니다. 다음 작업은 Mac 지원 구현부터 시작합니다.** Windows/common/Linux 분리와 WSL 검증 코드는 함께 인계하지만, Mac에서 clone/pull한 직후 기존 실행 명령이 동작하는 상태는 아닙니다. 이 차수에는 macOS 제품 구현이나 실제 계정 시험을 진행하지 않았습니다.
+Intel Mac(macOS, x86_64)에서 준비·mock 실행·격리 브라우저 검사를 통과했습니다. Apple Silicon(arm64)용 고정 Node도 추가했지만 실기기 실행은 미검증입니다. **Mac에서의 실제 QR 로그인·조회·발송은 아직 미실행**이며 사용자 확인 후 별도로 진행합니다.
+
+```bash
+python3 tools/prepare_node_spike.py          # 공식 darwin tar.gz + SHA-256 고정
+python3 tools/fetch_source_spike.py modern
+python3 tools/fetch_source_spike.py legacy
+python3 tools/prepare_spikes.py --install-dependencies
+
+python3 tools/local_web.py start --gap-probe --messaging
+python3 tools/local_web.py open --browser chrome   # 기본값(default)은 macOS 기본 브라우저
+python3 tools/local_web.py status
+python3 tools/local_web.py stop
+```
+
+- 실행 어댑터 `tools/platforms/macos.py`: 포트 소유 PID는 `/usr/sbin/lsof`, 실행 이미지는 libproc `proc_pidpath`로 확인한 뒤 HMAC 챌린지를 거칩니다. 브라우저는 `/Applications`·`~/Applications`의 Chrome/Chromium/Edge만 사용합니다.
+- 개인 저장소: `~/Library/Application Support/WebKakao/<설치별 해시>` (0700/0600, Linux와 같은 POSIX 검사). 확장 ACL은 검사하지 않습니다.
+- Darwin 런타임은 `.tar.gz`라서 lzma 없는 Python(pyenv 기본 빌드 등)에서도 준비됩니다. 설치는 `renamex_np(RENAME_EXCL)`로 덮어쓰지 않고 게시합니다.
+- 2026-10-25 이 Mac의 결과: Python **257 통과·15 skip**, Node **1,038 통과·3 skip·실패 0**(1,041), 격리 브라우저 하네스 8종 모두 exit0, mock start→status→open(Chrome)→stop 모두 exit0. `tests/reader-browser-smoke.mjs`는 두 탭 동시 구간에서 메인 탭이 재로드되며 CDP 시간 초과로 중단되어 **부분 성공**입니다(서버 응답은 모두 0.5초 미만, 원인 미확정).
+- 2026-10-25 사용자 확인 후 이 Mac에서 `start --gap-probe --messaging` 실서버로 QR 로그인 1회 성공. `status`는 authenticated·credentialInMemory·chatConnectionActive=true, attempts=1. 같은 연결에서 사용자가 확인한 결과(**검증 성공**): 방 목록·방 이름 정상, ‘메시지 불러오기’로 기존 대화 조회, 오픈단톡방 텍스트 발송의 모바일 도착, 나와의 채팅 텍스트 발송의 모바일 도착(이후 status actualMessageSent=true). Mac에서 새 메시지 실시간 수신·읽음·사진·답장·재접속은 미확인입니다.
+- macOS 임시 폴더(`/var`→`/private/var` 링크)는 개인 저장소 검사가 거절하므로 관련 테스트는 실제 경로를 사용합니다.
+
+## 이전 인계: Mac에서 재개하기 (2026-10-24)
+
+**(10/24 기준 기록. 10/25 macOS 구현 결과는 바로 위 절을 따릅니다.)** Windows/common/Linux 분리와 WSL 검증 코드는 함께 인계하지만, Mac에서 clone/pull한 직후 기존 실행 명령이 동작하는 상태는 아닙니다. 이 차수에는 macOS 제품 구현이나 실제 계정 시험을 진행하지 않았습니다.
 
 현재 확인한 상태:
 
@@ -50,7 +73,7 @@ Mac의 다음 Codex 세션에는 다음과 같이 요청하면 됩니다.
 
 | 구성 | 필요 조건 |
 | --- | --- |
-| OS | Windows x64. Ubuntu WSL2 x64는 계정 없는 회귀·화면 검사 및 사용자가 시험한 실제 방·이름·이력 조회 성공. Linux 실전 송수신은 미검증. 다른 Linux 환경은 미검증, macOS 실행은 미지원 |
+| OS | Windows x64. Ubuntu WSL2 x64는 계정 없는 회귀·화면 검사 및 사용자가 시험한 실제 방·이름·이력 조회 성공. Linux 실전 송수신은 미검증. 다른 Linux 환경은 미검증. macOS(Intel)는 준비·mock·격리 브라우저 검증 성공, 실계정 미실행 |
 | Python | 3.11 이상. Windows `py -3 --version`, Linux `python3 --version` |
 | Node.js | 준비 도구가 OS별 고정 버전 24.21.0을 프로젝트 안에 설치 |
 | 브라우저 | Windows Chrome/Edge, Linux Chrome/Chromium/Edge 탐색 구현. 외부 브라우저 사용. Linux 한글 표시에는 CJK 글꼴 준비 필요 |
@@ -262,7 +285,7 @@ worker의 기존 비공개 `web-auth/reader-diagnostic.json`에 `ownRead`, 기�
 ### 지원 범위·환경 제약
 
 - VS Code 내부 브라우저의 입장권 전달은 미지원이며 외부 Chrome/Edge를 사용.
-- Windows x64의 기존 실행을 보존하며 Linux x64 glibc·WSL2 구현을 추가했습니다. 시험한 WSL의 회귀·합성 화면과 실제 조회는 성공했지만 실전 송수신은 미검증입니다. macOS 실행과 Windows32비트는 미지원이며 EXE/MSI 배포는 제공하지 않습니다. 모든 회사망에서의 동작은 보장하지 않습니다.
+- Windows x64의 기존 실행을 보존하며 Linux x64 glibc·WSL2 구현을 추가했습니다. 시험한 WSL의 회귀·합성 화면과 실제 조회는 성공했지만 실전 송수신은 미검증입니다. macOS는 계정 없는 검증까지 완료(실계정 미실행)했고 Windows32비트는 미지원이며 EXE/MSI 배포는 제공하지 않습니다. 모든 회사망에서의 동작은 보장하지 않습니다.
 - 동영상·일반 파일·사진 묶음 전송은 현재 기능에 포함하지 않음.
 - 넓은 작업 폴더 권한의 실제 ACL 교정·개인자료 이전은 미실행. 선택적 Ghidra helper는 점이 없는 분석 작업 경로가 필요.
 
@@ -287,7 +310,7 @@ worker의 기존 비공개 `web-auth/reader-diagnostic.json`에 `ownRead`, 기�
 | Chrome 실행 | 샌드박스 실행 중0x80000003 사례는 일반 Windows 사용자 권한으로 재실행해 정상 표시 확인. 저수준 원인은 미확정 |
 | VS Code 내부 브라우저 | 외부 Chrome/Edge 사용. 통합 브라우저 입장권 전달은 미지원이며 Simple Browser iframe 차단도 있음 |
 | 설치·보안 | 넓은 작업 폴더 쓰기 권한은 `tools/workspace_acl.ps1`로 감사. 실제 ACL 변경·개인자료 이전은 자동 수행하지 않음 |
-| 다른 환경 | Windows/common/Linux 실행·저장소 모듈 분리. 시험한 WSL 회귀·합성 화면·실제 조회 성공, 실전 송수신과 다른 Linux는 미검증. macOS 실행·Windows32비트는 미지원, EXE/MSI는 미제공. 회사망별 조건은 별도 확인. 선택적 Ghidra helper는 점이 없는 분석 작업 경로 필요 |
+| 다른 환경 | Windows/common/Linux 실행·저장소 모듈 분리. 시험한 WSL 회귀·합성 화면·실제 조회 성공, 실전 송수신과 다른 Linux는 미검증. macOS는 계정 없는 검증까지(실계정 미실행), Windows32비트는 미지원, EXE/MSI는 미제공. 회사망별 조건은 별도 확인. 선택적 Ghidra helper는 점이 없는 분석 작업 경로 필요 |
 
 실제 QA는 동의한 상대나 본인 시험방에서 대상·내용·횟수·영향을 정한 뒤 진행합니다. 이전 승인을 재사용하지 않습니다. 상대방 읽음은 **상대방 화면의 같은 메시지1 해제**, 본인 미읽음 동기화는 **같은 방의 왼쪽 배지 감소와 이후 새 도착 보존**, 사진은 **실제 수신 기기의 도착·열기**로 판정합니다. HTTP202·status0·업로드 완료만으로 통과시키거나 결과 불명 전송을 반복하지 않습니다.
 

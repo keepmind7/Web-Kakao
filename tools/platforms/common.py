@@ -11,7 +11,7 @@ SERVER_ENV = frozenset({
 
 
 def backend(system=None):
-    """Do not guess a backend for unsupported platforms such as macOS."""
+    """Do not guess a backend for unsupported platforms."""
     system = platform.system() if system is None else system
     if system == "Windows":
         from . import windows
@@ -19,6 +19,9 @@ def backend(system=None):
     if system == "Linux":
         from . import linux
         return linux
+    if system == "Darwin":
+        from . import macos
+        return macos
     raise ValueError("unsupported_launcher_platform")
 
 

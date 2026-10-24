@@ -6,6 +6,7 @@ import {resolve,sep} from 'node:path';
 import {tmpdir} from 'node:os';
 import {EventEmitter} from 'node:events';
 import assert from 'node:assert/strict';
+import {testBrowser} from './browser-platform.mjs';
 const output=resolve(process.env.WEB_KAKAO_QA_OUTPUT_ROOT||'local-only/metadata-repair-20261021/qa/browser',String(Date.now()));mkdirSync(output,{recursive:true});
 const browserEnvironment={...process.env};for(const key of ['USERPROFILE','APPDATA','LOCALAPPDATA']){const original=process.env['WEB_KAKAO_QA_BROWSER_ORIGINAL_'+key];if(original)browserEnvironment[key]=original;}
 const tempBase=resolve(tmpdir()),temporaryRoot=mkdtempSync(resolve(tempBase,'wk-meta-'));
@@ -13,7 +14,7 @@ const profile=resolve(temporaryRoot,'p'),environment=resolve(temporaryRoot,'env'
 for(const key of ['LOCALAPPDATA','APPDATA','USERPROFILE','TEMP','TMP']){process.env[key]=resolve(environment,key);mkdirSync(process.env[key],{recursive:true});}
 const [{createLocalServer},{createReaderSession},{createReadOnlyReader}]=await Promise.all([import('../experiments/local-web/server.mjs'),import('../experiments/local-web/reader-session.mjs'),import('../experiments/local-web/reader-manager.mjs')]);
 const browserEngine=process.env.WEB_KAKAO_QA_BROWSER==='edge'?'Edge':'Chrome';
-const chrome=(browserEngine==='Edge'?['C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe','C:/Program Files/Microsoft/Edge/Application/msedge.exe']:['C:/Program Files/Google/Chrome/Application/chrome.exe','C:/Program Files (x86)/Google/Chrome/Application/chrome.exe']).find(existsSync);assert.ok(chrome,browserEngine+' installation required');
+const chrome=browserEngine==='Edge'?['C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe','C:/Program Files/Microsoft/Edge/Application/msedge.exe'].find(existsSync):testBrowser();assert.ok(chrome,browserEngine+' installation required');
 const sleep=ms=>new Promise(r=>setTimeout(r,ms)),defer=()=>{let resolve;return {promise:new Promise(r=>{resolve=r;}),resolve};};
 const own='999',id='9007199254740993',link='700',credential={userId:own,deviceUUID:'SYNTHETIC_DEVICE',accessToken:'SYNTHETIC_NO_ACCOUNT'};
 const malicious='<img src=x onerror="globalThis.metadataInjected=true">';

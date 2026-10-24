@@ -1,12 +1,13 @@
 import test,{after} from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync,mkdirSync,readdirSync,readFileSync,writeFileSync,rmSync,chmodSync } from 'node:fs';
+import { mkdtempSync,mkdirSync,readdirSync,readFileSync,writeFileSync,rmSync,chmodSync,realpathSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { createPreferenceStore } from '../experiments/local-web/preferences.mjs';
 
-const directories=[],folder=()=>{const path=mkdtempSync(join(tmpdir(),'webkakao-prefs-'));directories.push(path);return path;};
+// macOS tmpdir() sits under the /var -> /private/var symlink that private storage rejects by design.
+const directories=[],folder=()=>{const path=mkdtempSync(join(realpathSync(tmpdir()),'webkakao-prefs-'));directories.push(path);return path;};
 after(()=>{for(const path of directories)rmSync(path,{recursive:true,force:true});});
 const synthetic=path=>path,open=directory=>createPreferenceStore({folder:directory,secureFolder:synthetic}).account('111');
 const jsonFile=directory=>join(directory,readdirSync(directory).find(name=>name.endsWith('.json')));

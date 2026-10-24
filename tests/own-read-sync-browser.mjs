@@ -6,6 +6,7 @@ import {pathToFileURL} from 'node:url';
 import {tmpdir} from 'node:os';
 import {EventEmitter} from 'node:events';
 import assert from 'node:assert/strict';
+import {testBrowser} from './browser-platform.mjs';
 const output=resolve(process.env.WEB_KAKAO_QA_OUTPUT_ROOT||'local-only/own-read-sync-20261021/qa/browser',String(Date.now()));mkdirSync(output,{recursive:true});
 // Windows browser known-folder discovery needs the inherited Windows locations;
 // its actual browser data stays in the explicit generated profile below.
@@ -17,7 +18,7 @@ for(const key of ['LOCALAPPDATA','APPDATA','USERPROFILE','TEMP','TMP']){process.
 const load=name=>import(pathToFileURL(resolve('experiments/local-web',name)).href);
 const [{createLocalServer},{createReaderSession},{createReadOnlyReader}]=await Promise.all([load('server.mjs'),load('reader-session.mjs'),load('reader-manager.mjs')]);
 const browserEngine=process.env.WEB_KAKAO_QA_BROWSER==='edge'?'Edge':'Chrome';
-const chrome=(browserEngine==='Edge'?['C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe','C:/Program Files/Microsoft/Edge/Application/msedge.exe']:['C:/Program Files/Google/Chrome/Application/chrome.exe','C:/Program Files (x86)/Google/Chrome/Application/chrome.exe']).find(existsSync);assert.ok(chrome,browserEngine+' installation required');
+const chrome=browserEngine==='Edge'?['C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe','C:/Program Files/Microsoft/Edge/Application/msedge.exe'].find(existsSync):testBrowser();assert.ok(chrome,browserEngine+' installation required');
 const own='999',credential={userId:own,deviceUUID:'SYNTHETIC_DEVICE',accessToken:'SYNTHETIC_NO_ACCOUNT'},calls=[],checks=[],pending=new Map();
 const rows=[{c:'2000',t:'DirectChat',title:'Synthetic control',ll:'100',n:0},...['123','456','789','1000'].map(c=>({c,t:'DirectChat',title:'Synthetic '+c,ll:'100',n:3}))];
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
@@ -73,7 +74,9 @@ finally{
   if(browser&&process.platform==='win32'){
    const query="$qaProfile=$env:WEB_KAKAO_QA_OWN_PROFILE; $qaRows=@(Get-CimInstance Win32_Process -Filter \"Name='msedge.exe' OR Name='chrome.exe'\" | Where-Object { $_.CommandLine -and $_.CommandLine.Contains('--user-data-dir='+$qaProfile) }); Write-Output $qaRows.Count";
    for(let attempt=0;attempt<3;attempt++){profileProcessCount=Number(execFileSync('powershell.exe',['-NoProfile','-NonInteractive','-Command',query],{windowsHide:true,encoding:'utf8',timeout:12000,env:{...process.env,WEB_KAKAO_QA_OWN_PROFILE:profile},stdio:['ignore','pipe','pipe']}).trim());if(profileProcessCount===0)break;await sleep(400);}
-  }else if(!browser)profileProcessCount=0;
+  }else if(browser){
+   for(let attempt=0;attempt<3;attempt++){profileProcessCount=execFileSync('/bin/ps',['-axo','command'],{encoding:'utf8',timeout:12000}).split('\n').filter(line=>line.includes('--user-data-dir='+profile)).length;if(profileProcessCount===0)break;await sleep(400);}
+  }else profileProcessCount=0;
   if(chromeExitObserved&&profileProcessCount===0)rmSync(temporaryRoot,{recursive:true,force:true,maxRetries:8,retryDelay:200});else rmSync(environment,{recursive:true,force:true,maxRetries:4,retryDelay:80});
  }catch(error){cleanupError={code:error.code??'cleanup_failed'};}
  const result={checks,fatal,actualAccount:false,actual8787:false,classification:'account-free local browser integration',browserEngine,chrome:{exitCode:browser?.exitCode??null,signalCode:browser?.signalCode??null,stderr:chromeStderr},cleanup:{chromeExitObserved,profileProcessCount,serverClosed,pending:pending.size,profileRemoved:!existsSync(profile),environmentRemoved:!existsSync(environment),temporaryRootRemoved:!existsSync(temporaryRoot),temporaryRoot,error:cleanupError}};writeFileSync(resolve(output,'result.json'),JSON.stringify(result,null,2));console.log(JSON.stringify({checks:checks.length,passed:checks.filter(c=>c.status==='passed').length,failed:checks.filter(c=>c.status==='failed').length,fixtureErrors:checks.filter(c=>c.status==='fixture_error').length,fatal,browserEngine,cleanup:result.cleanup,output}));if(fatal||cleanupError||profileProcessCount!==0||checks.some(c=>c.status!=='passed'))process.exitCode=1;

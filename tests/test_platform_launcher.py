@@ -16,7 +16,7 @@ import uuid
 from unittest.mock import MagicMock, Mock, patch
 
 from tools import local_web
-from tools.platforms import common, linux, windows
+from tools.platforms import common, linux, macos, windows
 
 
 HEADER = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode"
@@ -31,7 +31,8 @@ class PlatformContracts(unittest.TestCase):
     def test_backend_is_explicit_and_macos_is_not_silently_linux(self):
         self.assertIs(common.backend("Windows"), windows)
         self.assertIs(common.backend("Linux"), linux)
-        for name in ("Darwin", "FreeBSD", "", "linux"):
+        self.assertIs(common.backend("Darwin"), macos)
+        for name in ("FreeBSD", "", "linux", "darwin"):
             with self.subTest(system=name), self.assertRaises(ValueError):
                 common.backend(name)
 

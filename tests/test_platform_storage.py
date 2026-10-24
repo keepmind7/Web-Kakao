@@ -162,7 +162,8 @@ class PosixPolicyTests(unittest.TestCase):
 
     @unittest.skipUnless(os.name == "posix", "실제 POSIX 파일 권한 시험은 Linux/WSL에서 실행")
     def test_native_posix_temp_directory_and_file_permissions(self):
-        with tempfile.TemporaryDirectory(prefix="webkakao-platform-") as temporary:
+        # Real path: macOS temp dirs sit under the /var -> /private/var symlink, refused by design.
+        with tempfile.TemporaryDirectory(prefix="webkakao-platform-", dir=os.path.realpath(tempfile.gettempdir())) as temporary:
             target = Path(temporary) / "private"
             storage.ensure_private_directory(target)
             self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o700)

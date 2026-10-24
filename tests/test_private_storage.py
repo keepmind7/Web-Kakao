@@ -93,7 +93,8 @@ class LauncherSecurityRegressionTests(unittest.TestCase):
                 spec.loader.exec_module(module)
             identity = str(ROOT.resolve()).replace("\\", "/")
             install = hashlib.sha256((identity.lower() if os.name == 'nt' else identity).encode()).hexdigest()[:16]
-            expected = Path(tmp) / "WebKakao" / install
+            base = Path(tmp) / "Library/Application Support" if sys.platform == "darwin" else Path(tmp)
+            expected = base / "WebKakao" / install
             self.assertTrue(Path(module.FOLDER).is_relative_to(expected),
                             "runtime/control/log paths must use private installation storage")
 
@@ -170,7 +171,8 @@ class PrivateStorageContracts(unittest.TestCase):
 
     def test_migration_transfers_key_and_settings_together_with_sanitized_summary(self):
         module = load_private()
-        with tempfile.TemporaryDirectory() as tmp:
+        # Real path: macOS temp dirs sit under the /var -> /private/var symlink, refused by design.
+        with tempfile.TemporaryDirectory(dir=os.path.realpath(tempfile.gettempdir())) as tmp:
             source, destination = Path(tmp) / "source", Path(tmp) / "destination"
             expected = fake_preferences(source)
             def fake_acl(path):

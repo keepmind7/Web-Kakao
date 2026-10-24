@@ -77,7 +77,7 @@ def preflight():
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--install-dependencies', action='store_true')
-    args = parse_arguments(parser, argv, supported_platforms=('win32', 'linux'))
+    args = parse_arguments(parser, argv, supported_platforms=('win32', 'linux', 'darwin'))
     run_preparation(parser, lambda: prepare_all(args.install_dependencies),
                     missing='필수 준비 파일이 없습니다. py -3.11 tools/fetch_source_spike.py 또는 py -3.11 tools/prepare_node_spike.py로 먼저 준비하세요.',
                     invalid_errors=(KeyError,))

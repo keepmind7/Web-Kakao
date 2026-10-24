@@ -13,7 +13,7 @@ def parse_arguments(parser, argv=None, *, supported_platforms=('win32',)):
     args = parser.parse_args(argv)
     # Help and invalid arguments have already exited without inspecting runtime state.
     if sys.platform not in supported_platforms:
-        names = {'win32': 'Windows', 'linux': 'Linux'}
+        names = {'win32': 'Windows', 'linux': 'Linux', 'darwin': 'macOS'}
         supported = '·'.join(names.get(name, name) for name in supported_platforms)
         parser.error(f'이 준비 도구는 {supported}에서 실행하세요. 도움말은 --help로 확인할 수 있습니다.')
     return args

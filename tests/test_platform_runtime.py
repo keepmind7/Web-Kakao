@@ -3,6 +3,7 @@ import argparse
 import contextlib
 import errno
 import hashlib
+import importlib.util
 import io
 import os
 from pathlib import Path
@@ -37,7 +38,7 @@ class RuntimeDistributionTests(unittest.TestCase):
         self.assertIsInstance(runtime_distribution.runtime_path(ROOT, 'Linux', 'AMD64'), Path)
 
     def test_unsupported_os_and_cpu_fail_closed(self):
-        for system, machine in [('Darwin', 'arm64'), ('Darwin', 'x86_64'), ('Linux', 'arm64'),
+        for system, machine in [('Darwin', 'ppc'), ('Darwin', 'AMD64'), ('Linux', 'arm64'),
                                 ('Windows', 'ARM64'), ('linux', 'x86_64'), ('Linux', '')]:
             with self.subTest(system=system, machine=machine), self.assertRaises(ValueError):
                 runtime_distribution.runtime_spec(system, machine)
@@ -80,8 +81,10 @@ class RuntimeArchiveTests(unittest.TestCase):
         self.required = ['bin/node', 'lib/node_modules/npm/bin/npm-cli.js']
 
     def make_tar(self, extra=(), *, base=True):
-        path = self.root / 'runtime.tar.xz'
-        with tarfile.open(path, 'w:xz') as archive:
+        # Some macOS Python builds (pyenv without xz) lack lzma; the installer reads .tar.gz too.
+        kind = 'xz' if importlib.util.find_spec('_lzma') else 'gz'
+        path = self.root / f'runtime.tar.{kind}'
+        with tarfile.open(path, f'w:{kind}') as archive:
             values = ([('bin/node', b'SYNTHETIC NEVER EXECUTE', 0o755, 'file', ''),
                        ('lib/node_modules/npm/bin/npm-cli.js', b'// synthetic', 0o755, 'file', '')] if base else [])
             for name, content, mode, kind, link in [*values, *extra]:
@@ -174,6 +177,7 @@ class RuntimeArchiveTests(unittest.TestCase):
         library.renameat2.return_value = -1
         source, destination = self.root / 'staged', self.root / 'target'
         with patch.object(prepare_node_spike.os, 'name', 'posix'), \
+                patch.object(prepare_node_spike.platform, 'system', return_value='Linux'), \
                 patch.object(prepare_node_spike.ctypes, 'CDLL', return_value=library), \
                 patch.object(prepare_node_spike.ctypes, 'get_errno', return_value=errno.EEXIST), self.assertRaises(FileExistsError):
             prepare_node_spike._publish_directory(source, destination)
@@ -182,6 +186,7 @@ class RuntimeArchiveTests(unittest.TestCase):
     def test_linux_publish_without_atomic_primitive_fails_closed(self):
         source, destination = self.root / 'staged', self.root / 'target'
         with patch.object(prepare_node_spike.os, 'name', 'posix'), \
+                patch.object(prepare_node_spike.platform, 'system', return_value='Linux'), \
                 patch.object(prepare_node_spike.ctypes, 'CDLL', return_value=object()), self.assertRaises(ValueError):
             prepare_node_spike._publish_directory(source, destination)
 
@@ -211,6 +216,8 @@ class RuntimeArchiveTests(unittest.TestCase):
         archive = self.make_tar()
         value = runtime_distribution.runtime_spec('Linux', 'x86_64')
         value['sha256'] = hashlib.sha256(archive.read_bytes()).hexdigest()
+        if archive.suffix == '.gz':  # make_tar fell back to gzip (no lzma on this host)
+            value['archive'] = value['archive'].replace('.tar.xz', '.tar.gz')
         archive.rename(self.root / value['archive'])
         with patch.object(prepare_node_spike, 'runtime_spec', return_value=value), \
                 patch.object(prepare_node_spike, 'urlopen', side_effect=AssertionError('no network')):
