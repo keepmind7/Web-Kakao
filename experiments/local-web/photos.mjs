@@ -12,13 +12,27 @@ export function photoUrl(value){
     url.protocol='https:';return url.href;
   }catch{return null;}
 }
+// Metadata is remote data, never an object to execute or coerce into a number.
+function photoField(value,key){
+  try{const field=Object.getOwnPropertyDescriptor(value,key);return field && Object.hasOwn(field,'value')?field.value:undefined;}catch{return undefined;}
+}
+function photoDimension(value){
+  if(typeof value!=='number' && !(typeof value==='string' && value.length<=64))return null;
+  const number=Number(value);return Number.isInteger(number) && number>0 && number<=20000?number:null;
+}
 export function photoAttachments(log){
-  const kind=Number(log?.type ?? log?.msgType ?? log?.t);if(![2,27].includes(kind))return [];
-  let data=log?.attachment;if(typeof data==='string'){if(data.length>65536)return [];try{data=JSON.parse(data);}catch{return [];}}
+  const kind=photoDimension(photoField(log,'type') ?? photoField(log,'msgType') ?? photoField(log,'t'));if(![2,27].includes(kind))return [];
+  let data=photoField(log,'attachment');if(typeof data==='string'){if(data.length>65536)return [];try{data=JSON.parse(data);}catch{return [];}}
   if(!data || typeof data!=='object' || Array.isArray(data))return [];
-  const urls=kind===27?(Array.isArray(data.imageUrls)?data.imageUrls:data.thumbnailUrls):[data.url ?? data.thumbnailUrl];
+  const images=photoField(data,'imageUrls');
+  const urls=kind===27?(Array.isArray(images)?images:photoField(data,'thumbnailUrls')):[photoField(data,'url') ?? photoField(data,'thumbnailUrl')];
   if(!Array.isArray(urls))return [];
-  return urls.slice(0,30).map((url,index)=>({url:photoUrl(url),width:Number(kind===27?data.wl?.[index]:data.w),height:Number(kind===27?data.hl?.[index]:data.h)})).filter(photo=>photo.url).map(photo=>({...photo,width:Number.isInteger(photo.width)&&photo.width>0&&photo.width<=20000?photo.width:null,height:Number.isInteger(photo.height)&&photo.height>0&&photo.height<=20000?photo.height:null}));
+  const widths=photoField(data,'wl'),heights=photoField(data,'hl'),photos=[];
+  for(let index=0;index<Math.min(urls.length,30);index++){
+    const url=photoUrl(photoField(urls,String(index)));if(!url)continue;
+    photos.push({url,width:photoDimension(kind===27?photoField(widths,String(index)):photoField(data,'w')),height:photoDimension(kind===27?photoField(heights,String(index)):photoField(data,'h'))});
+  }
+  return photos;
 }
 export function imageType(data){
   if(data.length<12)return null;
@@ -102,13 +116,18 @@ export function createPhotoCache({fetcher=fetchPhoto}={}){
       if(pending.has(url))return pending.get(url);
       if(pending.size>=40)throw new Error('photo_busy');
       const current=epoch,controller=new AbortController();controllers.add(controller);
-      const promise=(async()=>{try{
+      const promise=(async()=>{
         if(active>=4)await new Promise(resolve=>waiting.push(resolve));else active++;
         if(current!==epoch)throw new Error('photo_unavailable');
         const item=await fetcher(url,{signal:controller.signal});if(!Buffer.isBuffer(item?.data) || item.data.length>10*1024*1024)throw new Error('photo_unavailable');if(current!==epoch)throw new Error('photo_unavailable');
-        while(entries.size && bytes+item.data.length>30*1024*1024){const [key,value]=entries.entries().next().value;bytes-=value.data.length;entries.delete(key);}
+        // Tiny images can otherwise retain unbounded URL strings and objects.
+        while(entries.size && (entries.size>=512 || bytes+item.data.length>30*1024*1024)){const [key,value]=entries.entries().next().value;bytes-=value.data.length;entries.delete(key);}
         entries.set(url,item);bytes+=item.data.length;return item;
-      }finally{controllers.delete(controller);if(current===epoch){pending.delete(url);const next=waiting.shift();if(next)next();else active--;}}})();pending.set(url,promise);return promise;
+      })().finally(()=>{
+        // Run after pending.set even when an injected fetcher throws synchronously.
+        controllers.delete(controller);
+        if(current===epoch){pending.delete(url);const next=waiting.shift();if(next)next();else active--;}
+      });pending.set(url,promise);return promise;
     },
     clear(){epoch++;for(const controller of controllers)controller.abort();controllers.clear();entries.clear();pending.clear();bytes=0;active=0;for(const resume of waiting.splice(0))resume();},
   };

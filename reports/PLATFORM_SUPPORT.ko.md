@@ -1,6 +1,8 @@
-# Windows 보존과 Linux/WSL2 지원
+# 플랫폼 지원과 Windows/Linux 이식 기록
 
-2026-10-23 작업입니다. 기존 Windows 명령·저장소 식별자·QR 및 통신 정책을 보존하고 OS별 실행 코드를 분리합니다. Ubuntu WSL2의 계정 없는 회귀·합성 화면 검사를 통과했고 사용자가 시험한 실제 방·이름·이력 조회도 성공했습니다. Linux 실전 송수신은 아직 미검증입니다. macOS의 경로 계산만 준비했으며 현재 실행은 지원하지 않습니다.
+현재 기준은 **2026-10-25**입니다. macOS Intel의 고정 런타임·실행 어댑터·POSIX 저장소·mock 실행·격리 브라우저가 구현됐고, 사용자는 QR 로그인·방/이력 조회·오픈채팅/나와의 채팅 텍스트 도착을 확인했습니다. Apple Silicon은 런타임 정의만 있고 실기기 검증은 미실행입니다. 최신 실행 방법은 [README](../README.md), 날짜별 결과와 제한은 [검증 기록](VALIDATION_HISTORY.ko.md), 이번 메모리·운영 개선은 [최적화 보고서](OPTIMIZATION_20261025.ko.md)를 따릅니다.
+
+이하 본문은 **2026-10-23 Windows/Linux 분리 작업의 이력**입니다. 기존 Windows 명령·저장소 식별자·QR 및 통신 정책을 보존했습니다. Ubuntu WSL2의 계정 없는 회귀·합성 화면 검사와 사용자가 시험한 실제 방·이름·이력 조회는 성공했고 Linux 실전 송수신은 미검증입니다. 당시에는 macOS 경로 계산만 준비돼 있었으며, 이후 추가된 Mac 지원과 구분합니다.
 
 ## 코드 구성
 
@@ -10,6 +12,7 @@
 | Python common | `tools/platforms/common.py`, `paths.py` | OS 선택·허용 환경·순수 저장 경로 계산 |
 | Windows | `tools/platforms/windows.py`, 기존 `tools/windows_security.py` | 기존 ACL·프로세스 검증·브라우저 검색 |
 | Linux | `tools/platforms/linux.py` | /proc 대상 PID의 모든 listener 보유와 실행 이미지 확인·브라우저 검색·POSIX 실행 |
+| macOS (10/25 추가) | `tools/platforms/macos.py` | lsof·libproc 실행 신원 확인·전용 브라우저 실행. Node 저장소는 공통 POSIX 검사 사용 |
 | Node 플랫폼 | `experiments/local-web/platform/common.mjs`, `windows.mjs`, `linux.mjs` | 순수 경로 계약·Windows helper·POSIX 파일 보호 |
 | 실행 진입점 | `tools/local_web.py` | 공통 인증 순서·명령·종료 정책. 기존 경로 유지 |
 | 고정 런타임 | `tools/runtime_distribution.py`, `prepare_node_spike.py` | OS/CPU별 공식 파일·SHA-256·설치 경로 |
@@ -22,7 +25,7 @@
 
 Windows PowerShell에서 `wsl -l -v`로 배포판 VERSION이2인지 확인합니다. Ubuntu 안에서는 `wsl.exe -l -v`를 사용합니다. 현재 에이전트 실행 PC에는 wsl.exe가 없으며, 별도 PC에서 사용자가 실행한 결과를 구분해 기록합니다.
 
-GitHub에 반영된 변경은 최신 main을 clone/pull해 받습니다. 아직 push하지 않은 로컬 변경을 다른 PC로 전달할 때는 Linux 소스 ZIP을 WSL의 **Linux 홈 디렉터리**에 풉니다. ZIP 파일을 /mnt/c에서 읽는 것은 가능하지만 코드·런타임·개인 설정 실행 위치는 Linux 쪽이어야 합니다. Windows의 사용 중인 작업 폴더·개인 데이터·로그인은 유지합니다. Mac 개발 재개는 README의 ‘Mac에서 재개하기’를 따르며 현재 macOS 실행은 지원하지 않습니다.
+GitHub에 반영된 변경은 최신 main을 clone/pull해 받습니다. 아직 push하지 않은 로컬 변경을 다른 PC로 전달할 때는 Linux 소스 ZIP을 WSL의 **Linux 홈 디렉터리**에 풉니다. ZIP 파일을 /mnt/c에서 읽는 것은 가능하지만 코드·런타임·개인 설정 실행 위치는 Linux 쪽이어야 합니다. Windows의 사용 중인 작업 폴더·개인 데이터·로그인은 유지합니다. Mac은 현재 README의 설치·실행 절차를 따르며, 10/24의 미구현 인계는 검증 기록의 과거 이력으로 보존합니다.
 
 수정본 패키지를 준비하는 Windows 명령:
 
@@ -191,7 +194,7 @@ fix7은 하단 안내에도 전역 전송 모드를 확인해 읽기 전용 상�
 
 - Windows x64: 기존 경로·명령과 동작을 회귀 검사합니다.
 - Ubuntu WSL2 x64: 계정 없는 전체 회귀·합성 headless 화면, 일반 GUI 열기와 사용자가 시험한 실제 방/이름/이력 조회 성공. 실전 송수신·읽음·데스크톱 통합 기능은 후속 확인합니다. 다른 Linux x64 glibc 환경은 별도 미검증입니다.
-- macOS: 순수 경로 계산 준비 범위. 현재 실행은 명시적으로 차단하며, 브라우저·권한·계정 QA는 미실행입니다.
+- macOS: 10/23 당시에는 경로 계산만 준비하고 실행을 차단했습니다. 10/25 Intel 구현·사용자 확인 범위는 이 문서 첫 문단과 검증 기록을 따릅니다.
 - Linux ARM64·Alpine/musl·배포판별 데스크톱 통합·EXE/MSI/DMG 배포는 이번 범위에 포함하지 않습니다.
 
 fix1의 Linux 검사는 같은 UID 프로세스의 FD를 전수 열람했기 때문에 다른 프로세스의 접근 제한만으로도 실행이 막혔습니다. fix2는 Linux에 별도 대상 검증을 사용합니다. 기대 PID가 해당 포트의 IPv4/IPv6 모든 LISTEN inode를 보유해야 하며, 호출자 UID/eUID 일치·대상 proc 소유 UID·socket UID·전후 listener 집합·고정 Node 이미지·HMAC을 확인합니다. 대상 자신의 필수 FD 정보가 읽히지 않으면 계속 거절합니다. 기존 전수 소유자 조사 API와 Windows 경로는 유지합니다.
@@ -202,6 +205,6 @@ tar 설치의 원자적 비덮어쓰기 기능은 Linux glibc의 renameat2를 �
 
 Windows 보존 기준본은 커밋58a73a7의 소스 ZIP이며 `local-only/dist/web-kakao-windows-baseline-58a73a7-source.zip`에 보관합니다. 고정 런타임·공개 소스·npm 패키지 준비가 필요하고, 인증이나 실제 대화는 포함하지 않습니다.
 
-## 이번 검증 결과
+## 10/23 Windows/Linux 분리 검증 결과 (당시 기록)
 
 Windows 계정 없는 기존 회귀는 Node 1,040통과·1skip(총1,041), Python 전체 204통과·2skip(총206), 격리 Chrome 115조건 통과입니다. 이후 시험 2파일의 Windows 모의 범위·실제 브라우저 실행 차단만 보완하고 19/19 표적 재검사했습니다. 제품·Node·브라우저 불변을 대조해 이전 전체 결과를 재사용했으며 표적 19개를 전체 206개에 더하지 않습니다. 최초 ZIP 게시 후 임시 stage 정리 오류 1건은 이후 동일 9개와 전체에서 재현되지 않았지만 원인은 미확정으로 보존합니다. 사용자 WSL은 고정 Node 설치·fix2 mock·fix3 platform Python114/Node45·fix4 전달본 full에 이어 fix5 full과 fix6 격리 브라우저·mock4단계도 통과했습니다. 과거 화면 시작 실패와 TMPDIR 원인·수정 경과를 보존합니다. 후속 일반 GUI와 실계정 방/이름/이력 조회는 사용자 관찰 성공이며, Linux 실전 송수신·읽음과 macOS 실행 QA는 **미실행**입니다. Windows 임시 Git 정리 오류의 과거 실패와 fix5 표적 실행 오류도 따로 보존합니다.

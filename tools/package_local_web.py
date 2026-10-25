@@ -29,7 +29,7 @@ PRIVATE_PARTS = {'node_modules', '__pycache__', '.git', '.venv', 'venv', 'local-
                  'preferences', 'web-auth', 'secrets', 'dist', 'build', 'output',
                  'platform-tools', 'test-results', 'playwright-report'}
 PRIVATE_NAMES = {'runtime.json', 'identity.key', 'auth.json', 'cookies.txt', '.device-uuid',
-                 'apk-manifest.json', 'settings.local.json'}
+                 'apk-manifest.json', 'settings.local.json', 'reader-lifecycle.json'}
 # These exact shipped sources are code, unlike private diagnostic artifacts.
 PUBLIC_READER_DIAGNOSTICS = frozenset({
     'experiments/local-web/reader-diagnostics.mjs',
@@ -37,13 +37,13 @@ PUBLIC_READER_DIAGNOSTICS = frozenset({
 })
 PACKAGE_NOTE = '''# Web-Kakao 소스 패키지
 
-이 ZIP은 Windows/Linux 공통 소스 묶음입니다. 설치된 Windows 기준본이나
+이 ZIP은 Windows/Linux/macOS 공통 소스 묶음입니다. 설치된 실행 환경이나
 독립 실행파일이 아닙니다. Node 런타임, npm 의존성, 인증정보, 개인 설정,
 대화·사진·APK·분석 원본·실행 기록을 포함하지 않습니다.
 
 압축을 새 디렉터리에 풀고 README.md의 OS별 준비·실행 절차를 따르세요.
-macOS 실행은 아직 지원하지 않습니다. Linux 실제 지원 범위와 검증 상태는
-함께 포함한 README.md를 확인하세요. source-package-manifest.json은 포함한
+OS·CPU별 준비 조건과 실제 검증 범위는 함께 포함한 README.md를 확인하세요.
+source-package-manifest.json은 포함한
 공개 소스의 SHA-256 목록이며, 서명이나 출처 인증을 대신하지 않습니다.
 '''
 
@@ -109,8 +109,8 @@ def _source_file(root, name):
 
 
 def package_sources(root=ROOT, output=None, *, target_platform=None):
-    target_platform = ('windows' if sys.platform == 'win32' else 'linux') if target_platform is None else target_platform
-    if target_platform not in {'windows', 'linux'}:
+    target_platform = {'win32': 'windows', 'darwin': 'macos'}.get(sys.platform, 'linux') if target_platform is None else target_platform
+    if target_platform not in {'windows', 'linux', 'macos'}:
         raise ValueError('unsupported_source_package_platform')
     root = checked_path(root)
     output = checked_path(root / ('local-only/dist/web-kakao-' + target_platform + '-source.zip') if output is None else output)
@@ -158,10 +158,10 @@ def package_sources(root=ROOT, output=None, *, target_platform=None):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--platform', choices=('windows', 'linux'), default=None,
+    parser.add_argument('--platform', choices=('windows', 'linux', 'macos'), default=None,
                         help='대상 OS 표시만 기록합니다. 공통 소스이며 런타임은 포함하지 않습니다.')
     parser.add_argument('--output', type=Path, default=None)
-    args = parse_arguments(parser, argv, supported_platforms=('win32', 'linux'))
+    args = parse_arguments(parser, argv, supported_platforms=('win32', 'linux', 'darwin'))
     record = run_preparation(parser, lambda: package_sources(ROOT, args.output, target_platform=args.platform))
     print(json.dumps(record, ensure_ascii=False, indent=2))
     return 0

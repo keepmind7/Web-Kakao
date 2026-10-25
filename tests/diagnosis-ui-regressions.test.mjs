@@ -30,6 +30,9 @@ function fixture(){
     function renderComposer(){globalThis.renderCalls++;}
     function unavailable(){freshness='unavailable';}
     function clearImageDraft(){imageDraft=null;globalThis.clearedImages++;}
+    // Photo HTTP lifecycle is exercised by photo-loading tests; this fixture
+    // isolates selection/read admission and has no image DOM or loader.
+    function clearIncomingPhotos(){}
     function messageViewCovered(){return false;}
     function roomNow(){return roomsCache.find(room=>room.key===selectedRoom);}
     function roomCan(){return true;}

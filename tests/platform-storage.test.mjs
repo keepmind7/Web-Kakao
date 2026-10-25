@@ -1,4 +1,4 @@
-// Pure and synthetic OS contracts. Native Linux checks are separately marked.
+// Pure and synthetic OS contracts. Native POSIX checks are separately marked.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';
@@ -123,8 +123,9 @@ test('Windows helper retains native Python backend arguments and process options
   try{assert.equal(await nativeAsync(resolve('.'),'file',resolve('synthetic'),4096),true);assert.equal(calls.length,1);assert.equal(calls[0].command,'py.exe');assert.deepEqual(calls[0].args.slice(0,5),['-3','-I','-B','-X','utf8']);assert.ok(calls[0].args.some(value=>value.endsWith('windows_security.py')));assert.deepEqual(calls[0].args.slice(-2),['--max-bytes','4096']);assert.equal(calls[0].options.timeout,10000);assert.equal(calls[0].options.windowsHide,true);}
   finally{fs.existsSync=exists;cp.execFile=exec;if(previous===undefined)delete process.env.WEB_KAKAO_PYTHON;else process.env.WEB_KAKAO_PYTHON=previous;syncBuiltinESMExports();}
 });
-test('native Linux permissions and hardlink rejection',{skip:process.platform!=='linux'?'실제 Linux/WSL에서 실행':false},()=>{
-  const folder=fs.mkdtempSync(join(tmpdir(),'webkakao-platform-'));
+test('native POSIX permissions and hardlink rejection',{skip:!['linux','darwin'].includes(process.platform)?'실제 Linux/macOS에서 실행':false},()=>{
+  // Darwin tmpdir may use /var -> /private/var; production rejects symlink ancestors.
+  const folder=fs.mkdtempSync(join(fs.realpathSync(tmpdir()),'webkakao-platform-'));
   try{const privateFolder=join(folder,'private');ensurePrivateDirectory(privateFolder);assert.equal(fs.statSync(privateFolder).mode & 0o777,0o700);const path=join(privateFolder,'probe');fs.writeFileSync(path,'synthetic',{mode:0o600});assert.equal(verifyPrivateFile(path),true);fs.linkSync(path,join(privateFolder,'other'));assert.throws(()=>verifyPrivateFile(path),/private_file_acl/);}
   finally{fs.rmSync(folder,{recursive:true,force:true});}
 });

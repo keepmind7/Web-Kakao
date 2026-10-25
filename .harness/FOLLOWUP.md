@@ -1,10 +1,28 @@
 # Web-Kakao 후속 작업
 
-2026-10-24 기준. 현재 실행·구조·기능 제한은 [README](../README.md), 협업·역할·자원 사용권은 [OPERATING.md](OPERATING.md)를 따릅니다. 이 문서는 최신 상태와 다음 작업을 위한 공유 인수인계입니다. 세부 실행/실패 기록은 비공개 자료와 Git 이력에 보존합니다.
+2026-10-25 기준. 현재 실행·구조·기능 제한은 [README](../README.md), 협업·역할·자원 사용권은 [OPERATING.md](OPERATING.md)를 따릅니다. 이 문서는 최신 상태와 다음 작업을 위한 공유 인수인계입니다. 세부 실행/실패 기록은 비공개 자료와 Git 이력에 보존합니다.
 
-## Mac에서 이어서 개발
+## 다른 사용자용 안정화 인계
 
-사용자는 현재 공유 가능한 Windows/common/Linux 변경과 다음 재개 위치를 README에 남겨 GitHub push할 것을 요청했습니다. macOS 실행은 현재 미지원이며 이번 인계 차수에서 구현하지 않습니다. 최신 시작점은 README의 ‘Mac에서 재개하기 (2026-10-24)’입니다. 새 Mac에서 소스 clone/pull과 아키텍처·OS·Python·Git을 확인한 뒤 Darwin 고정 런타임/안전 설치→Mac launcher/신원/브라우저→POSIX 개인 저장소→CLI/회귀→Mac 자체 mock/합성 화면→별도 승인 실계정 순으로 진행합니다. 현재 OS 차단을 제거하거나 Linux backend를 그대로 선택하는 방식으로 우회하지 않습니다. 기존 역할/스킬 정의는 공유하되 비공개 실행 장부와 과거 승인을 재사용하지 않습니다. 아래 WSL 전송 모드 재개는 별도 미실행 범위로 남습니다.
+사용자의 ‘다른 사용자가 사용할 정도’ 요청에 따라 기존 로컬 앱 범위에서 사진 비정상 치수 방어·최근8연결의 정제 종료 기록·비동기 제한 저장·종료 IPC 배출·사진 표시/확대/다운로드 공유 큐를 구현했습니다. Web Locks 지원 시 동일 origin 여러 탭 전체 사진 HTTP2건, 미지원 시 탭당2건입니다. 새 서비스·에이전트 대시보드는 만들지 않았고 이전 미커밋 변경을 보존했습니다. 독립 검수의 중요5건(마지막 IPC·동기 저장·Windows DWORD·spawn close·종료 중 신규접수)은 회귀와 별도 재현으로 해소했습니다.
+
+최종 검증은 Python248pass/14skip, Node1099pass/2skip(58파일·실패/취소0), Chrome11프로그램210조건과 추가4조건 총214조건입니다. 최초 브라우저 대화창 fixture1건은 새 이미지 완료 대기로 교정 후6/6, 초기화 fetch실패1건은 진단만 보강한1회 재실행8/8이며 초기 fetch원인은 미확정입니다. 실제 SDK/worker/IPC8시나리오, 임시HOME Mac mock 시작/상태/종료, 최종 ZIP의 manifest·개인경로제외·새모듈포함과 무Git 추출검사를 확인했습니다. 과거 겹치는 검사 수를 이 수치에 더하지 않습니다.
+
+인계는 [새 사용자 안내](../reports/USER_GUIDE.ko.md)와 [최종 안정화 보고서](../reports/READINESS_20261025.ko.md)를 따릅니다. 소스 묶음은 `local-only/dist/web-kakao-readiness-20261025-source.zip`과 별도SHA-256입니다. runtime/dependencies/credentials/evidence는 제외하고 받는 OS에서 새로 준비합니다. 안정화 검증 차수에서는 commit/push·실계정·실행 중 서버 교체를 수행하지 않았습니다. 실제15:56사건 원인·Windows/Linux/Apple Silicon 이번 변경 실기기·장시간/절전은 미검증입니다. 현재 서버 적용은 초안보관→로컬세션삭제→정상stop→start/open→새QR이 필요하며 별도 범위 확인 없이 실행하지 않습니다.
+
+후속 사용자 요청으로 완료된 코드·테스트·운영 문서와 `MD_docs/` 참고 문서를 현재 GitHub 저장소에 함께 공유합니다. 개인 저장소·런타임·ZIP·실행 기록은 Git에서 제외합니다. 위 ZIP은 검증 당시 스냅샷이며 이후 게시 안내 수정과 참고 문서 추가를 포함한 원격 최신본과는 구분합니다. 실제 커밋·원격 반영은 Git 기록을 기준으로 확인합니다.
+
+## 이전 Mac 지원과 운영 최적화
+
+macOS Intel은 고정 런타임·실행 신원 검증·POSIX 개인 저장소·브라우저 실행을 구현했고, 사용자가 QR·목록/이력·오픈채팅/나와의 채팅 텍스트 도착을 확인했습니다. Apple Silicon 실기기 실행, Mac 사진·답장·읽음·절전 후 복구는 미확인입니다. 과거 ‘Mac에서 재개하기’의 미지원 안내는 10/24 시점의 기록이며 [검증 기록](../reports/VALIDATION_HISTORY.ko.md)에서 보존합니다. 새 환경에서는 현재 README의 설치·실행 절차를 사용합니다.
+
+10/25 진단 후 사진 캐시에 512개 항목 상한(기존 30MiB·4개 동시 조회 유지), 설정 폴더별 실행/대기 합계 64개 상한, 닫힌 설정 profile의 즉시 거절, 최신 송신 진단의 송신별 시간 기준을 보완했습니다. 방 제목 회귀 검사는 고정 대기 대신 bootstrap 제목 발행과 실제 선택 조회를 기다립니다. 측정·검증·남은 제한은 [최적화 보고서](../reports/OPTIMIZATION_20261025.ko.md)를 따릅니다. 실행 중 서버는 자동 교체하지 않았으며 적용하려면 사용자 주도로 README의 재시작·새 QR 절차가 필요합니다. 이번 차수에 실제 계정 동작·커밋·push는 수행하지 않습니다.
+
+이후 사용자 요청의 심화 QA는 Python243pass/14skip, Node1057pass/2skip, Chrome9종194보고조건과 별도 Mac mock 시작/상태/종료를 새로 통과했습니다. 실제 파일·사진 epoch·메모리 순환과 검사 조건 보완을 포함하며 이번 QA의 제품 수정은0입니다. [심화 QA 보고서](../reports/QA_20261025.ko.md)를 우선 읽습니다. 실서버 read-only 관측은 인증 유지·대화 연결 비활성이며, 정제 진단의 transport 실패 종료는 QA 전17:02:41 KST입니다. 실제 재연결·수신 성공은 아직 확인하지 않았고 연결을 조작하지 않았습니다.
+
+사진 수신 후속 조사는 [원인 보고서](../reports/PHOTO_BURST_DIAGNOSIS_20261025.ko.md)를 따릅니다. 이후 사용자는10/25 15:56·사진 묶음2건 뒤 대화 서버 연결 종료 표시라고 확인했습니다. 새 합성 fork/IPC 검사의 정상2묶음(각30장 메타데이터)은 연결을 유지했고 특정 비정상 치수의 Number변환 예외는 decode단절을 재현했습니다. 실계정 사진의 해당 형식 근거는 없습니다. 당시 진단은 재연결로 덮어쓰였고 worker stderr/exit code/signal도 보존되지 않아 실제 원인은 미확정입니다. 20:03 KST read-only 관측은18:02시작세션의 대화 연결 활성·attempts3·최신PING0이며 과거 사건의 원인 근거와 분리합니다. 부모 종료 메타데이터·제한된 세션별 정제 진단 보존과 치수 변환 방어가 후속 변경 대상입니다. 이전 사진3장·8초의 status지연0ms,12/40장·8초의 약6초 큐잉은 독립 병목이며 실제 단절/12초timeout은 미재현입니다. 브라우저 사진 큐는 표시 성능 대상으로 따로 다룹니다. 이번 조사 제품 수정·실계정 조작·서버 교체는0이고17:02 단절도15:56의 증거로 합치지 않습니다.
+
+아래는 이전 Windows/WSL 인계 이력입니다. 당시 상태와 현재 지원 범위를 구분하고 비공개 장부·과거 승인을 새 환경에서 재사용하지 않습니다.
 
 ## 최신 WSL 실행 모드 확인
 
@@ -12,7 +30,7 @@
 
 ## Windows/common/Linux 분리
 
-사용자 요청으로 Windows 기준본58a73a7의 공개 소스 ZIP을 local-only/dist에 보존하고 Python의 tools/platforms/common·windows·linux·paths 및 Node의 platform/common·windows·linux 모듈로 OS 경계를 분리했습니다. 기존 실행 진입점과 Windows 저장소 ID·ACL backend·PID/실행 경로→HMAC→제어 토큰 순서 및 대화 정책을 보존합니다. Linux x64 glibc·WSL2를 대상으로 /proc 소유 확인·POSIX 파일 보호·고정 Node tar 준비·소스 패키징·격리 mock runner를 추가했습니다. macOS는 순수 경로 계산만 준비했고 실행은 차단합니다.
+10/23 사용자 요청으로 Windows 기준본58a73a7의 공개 소스 ZIP을 local-only/dist에 보존하고 Python의 tools/platforms/common·windows·linux·paths 및 Node의 platform/common·windows·linux 모듈로 OS 경계를 분리했습니다. 기존 실행 진입점과 Windows 저장소 ID·ACL backend·PID/실행 경로→HMAC→제어 토큰 순서 및 대화 정책을 보존합니다. Linux x64 glibc·WSL2를 대상으로 /proc 소유 확인·POSIX 파일 보호·고정 Node tar 준비·소스 패키징·격리 mock runner를 추가했습니다. 당시 macOS는 순수 경로 계산만 준비하고 실행을 차단한 상태였습니다.
 
 수정본 전달과 실행 절차는 [플랫폼 지원 안내](../reports/PLATFORM_SUPPORT.ko.md)를 따릅니다. 아직 커밋/push하지 않았다면 원격 clone에는 이번 변경이 없으므로 현재 source ZIP을 WSL의 Linux 홈에 풀어 준비합니다. Windows의 실행파일·node_modules·개인 저장소를 복사하거나 /mnt/c 작업 폴더에서 권한 검증 성공을 주장하지 않습니다.
 

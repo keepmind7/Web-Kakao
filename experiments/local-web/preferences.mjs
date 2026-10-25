@@ -14,6 +14,7 @@ export function securePreferenceFolder(folder){
 }
 // Settings and an installation HMAC key only. No raw account/room identifiers.
 const queues=new Map();
+const QUEUE_LIMIT=64;
 export function createPreferenceStore({folder=null,asyncSecurity=false,secureFolder=asyncSecurity?ensurePrivateDirectoryAsync:securePreferenceFolder,verifyFile=null}={}){
   const base=folder?resolve(folder):null;let secret=randomBytes(32),loaded=false,secured=false,keyError=false;
   const verifier=verifyFile ?? ([securePreferenceFolder,ensurePrivateDirectoryAsync].includes(secureFolder)?(asyncSecurity?verifyPrivateFileAsync:verifyPrivateFile):null);
@@ -21,11 +22,20 @@ export function createPreferenceStore({folder=null,asyncSecurity=false,secureFol
     if(asyncSecurity)return (async()=>{let step=generator.next();while(!step.done){try{step=generator.next(await step.value);}catch(error){step=generator.throw(error);}}return step.value;})();
     let step=generator.next();while(!step.done){try{if(step.value?.then)throw new Error('async_security_required');step=generator.next(step.value);}catch(error){step=generator.throw(error);}}return step.value;
   }
-  function enqueue(operation){
+  function enqueue(operation,onBusy){
     if(!asyncSecurity)return run(operation());
-    const name=base ?? operation,previous=queues.get(name) ?? Promise.resolve();
-    const result=previous.then(()=>run(operation())),tail=result.catch(()=>{});queues.set(name,tail);
-    void tail.then(()=>{if(queues.get(name)===tail)queues.delete(name);});return result;
+    const name=base ?? operation;
+    let queue=queues.get(name);
+    if(!queue){queue={pending:0,tail:Promise.resolve()};queues.set(name,queue);}
+    // Count running and waiting work together, across stores for this folder.
+    // Do not race or skip an admitted security check to recover capacity.
+    if(queue.pending>=QUEUE_LIMIT)return onBusy?onBusy():Promise.reject(Object.assign(new Error('settings_busy'),{code:'settings_busy'}));
+    queue.pending++;
+    const result=queue.tail.then(()=>run(operation())).finally(()=>{
+      queue.pending--;
+      if(!queue.pending && queues.get(name)===queue)queues.delete(name);
+    });
+    queue.tail=result.catch(()=>{});return result;
   }
   function* check(path){
     try{
@@ -69,7 +79,9 @@ export function createPreferenceStore({folder=null,asyncSecurity=false,secureFol
       if(!keyError)try{const disk=yield* load(path);if(disk){state=disk.state;error=disk.dropped;}}catch{error=corrupt=true;}
       // Each change is applied to the file as it is now, so another store's earlier changes survive.
       // ponytail: no cross-process lock; two servers writing one account within the same instant can still race.
-      function commit(change,reset=false,{isCurrent=()=>true}={}){return enqueue(function*(){
+      function commit(change,reset=false,{isCurrent=()=>true}={}){
+        if(closed)return false;
+        return enqueue(function*(){
         const current=()=>{if(closed || !isCurrent())throw new Error('settings_stale');};
         try{
           current();let latest=state;if(!corrupt && !keyError)try{latest=(yield* load(path))?.state ?? state;}catch(failure){if(failure.code==='settings_security')throw failure;corrupt=true;}
@@ -85,7 +97,7 @@ export function createPreferenceStore({folder=null,asyncSecurity=false,secureFol
           }else if(path && existsSync(path) && (!corrupt || reset)){yield* check(path);current();unlinkSync(path);corrupt=false;}
           state=next;error=corrupt;return true;
         }catch{if(!closed)error=true;return false;}
-      });}
+      },()=>{error=true;return false;});}
       return {
         key:()=>Buffer.from(secret),
         snapshot(){const {rooms,...settings}=state;return {...settings,storageAvailable:Boolean(base)&&!keyError,storageError:error};},

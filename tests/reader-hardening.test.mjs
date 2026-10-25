@@ -149,7 +149,7 @@ test('J3/J4 diagnostics write at most once per second compactly and uploads coll
   const recorded=[],upload=createReaderDiagnostic({writeSnapshot:raw=>recorded.push(JSON.parse(raw))});for(const step of steps)upload.note('photo-upload',step);upload.end('synthetic');
   assert.equal(recorded.at(-1).uploadStages.stream.frames,streams[1].frames);assert.ok(recorded.at(-1).uploadStages.ship && recorded.at(-1).uploadStages.post);
 });
-test('J5 photo cache has no entry-count cap and fetched images over 8192px or 40MP are refused',async()=>{
+test('J5 photo cache retains a 200-photo gallery and fetched images over 8192px or 40MP are refused',async()=>{
   const calls=new Map(),cache=createPhotoCache({fetcher:async url=>{calls.set(url,(calls.get(url)||0)+1);return {data:png,type:'image/png'};}});
   try{for(let n=0;n<200;n++)await cache.get('synthetic:'+n);await cache.get('synthetic:0');assert.equal(calls.get('synthetic:0'),1);}finally{cache.clear();}
   const sized=(w,h)=>{const data=Buffer.from(png);data.writeUInt32BE(w,16);data.writeUInt32BE(h,20);return data;};

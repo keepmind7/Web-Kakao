@@ -14,11 +14,12 @@ import unittest
 from unittest.mock import Mock, patch
 
 from tools import local_web
+from tools.runtime_distribution import runtime_path
 
 ROOT = Path(__file__).resolve().parents[1]
 PRIVATE = ROOT / "tools/private_storage.py"
 NODE_PRIVATE = ROOT / "experiments/local-web/private-storage.mjs"
-NODE = ROOT / "local-only/runtime/node-v24.21.0-win-x64/node.exe"
+NODE = runtime_path(ROOT)
 # WEB_KAKAO_STRICT=1 turns a missing prerequisite into a failure instead of a silent skip.
 STRICT = os.environ.get("WEB_KAKAO_STRICT") == "1"
 
@@ -145,7 +146,7 @@ class PrivateStorageContracts(unittest.TestCase):
             self.assertFalse(project.exists())
             self.assertFalse(appdata.exists())
 
-    @unittest.skipUnless(NODE_PRIVATE.is_file() and NODE.is_file() or STRICT, "Node private-storage calculation not implemented")
+    @unittest.skipUnless(NODE_PRIVATE.is_file() and NODE.is_file() or STRICT, "prepare the pinned runtime for this OS")
     def test_python_and_node_install_roots_agree_without_creating_a_directory(self):
         self.assertTrue(NODE_PRIVATE.is_file() and NODE.is_file(), "WEB_KAKAO_STRICT=1: project Node runtime missing")
         module = load_private()

@@ -27,6 +27,7 @@ export function encodeQr(text) {
 const assets = new Map([
   ['/', ['index.html', 'text/html; charset=utf-8']],
   ['/app.js', ['app.js', 'text/javascript; charset=utf-8']],
+  ['/photo-loader.js', ['photo-loader.js', 'text/javascript; charset=utf-8']],
   ['/theme.js', ['theme.js', 'text/javascript; charset=utf-8']],
   ['/style.css', ['style.css', 'text/css; charset=utf-8']],
   ['/local-launch.js', ['local-launch.js', 'text/javascript; charset=utf-8']],
@@ -49,7 +50,7 @@ export function createLocalServer({ transport, mode = 'mock', encode = encodeQr,
   const forgetAccount=()=>{try{reader.close();}finally{try{photos.clear();}finally{lab.cancel();}}};
   // Only internal cleanup may own onEmpty; options inject bounded clocks/timers for QA.
   const presence=createTabPresence({...presenceOptions,onEmpty:forgetAccount}),streams=new Map();
-  let disposed=false;
+  let disposed=false,closing=false;
   const dispose=()=>{
     if(disposed)return;disposed=true;presence.close();
     try{for(const finish of streams.values())finish();}finally{forgetAccount();}
@@ -70,7 +71,7 @@ export function createLocalServer({ transport, mode = 'mock', encode = encodeQr,
       res.writeHead(code, { ...headers, 'Content-Type': type, ...extra });
       res.end(typeof data === 'string' || Buffer.isBuffer(data) ? data : JSON.stringify(data));
     };
-    if(disposed)return reply(503,{error:'server_closing'});
+    if(disposed || closing)return reply(503,{error:'server_closing'});
     if (req.headers.host !== new URL(origin).host || !['127.0.0.1', '::ffff:127.0.0.1'].includes(req.socket.remoteAddress)) return reply(403, { error: 'local_only' });
     if (req.headers['sec-fetch-site'] && !['none', 'same-origin'].includes(req.headers['sec-fetch-site'])) return reply(403, { error: 'same_origin_required' });
     if(req.method==='GET' && req.url==='/launch')return reply(200,'<!doctype html><html lang="ko"><meta charset="utf-8"><title>로컬 연결</title><script src="/local-launch.js" defer></script><body>로컬 연결을 여는 중입니다.</body></html>','text/html; charset=utf-8');
@@ -110,7 +111,7 @@ export function createLocalServer({ transport, mode = 'mock', encode = encodeQr,
       const key=requestUrl.searchParams.get('room'),message=requestUrl.searchParams.get('message'),index=requestUrl.searchParams.get('index');
       if([...requestUrl.searchParams.keys()].sort().join(',')!=='index,message,room' && [...requestUrl.searchParams.keys()].sort().join(',')!=='cap,index,message,room' || !roomKeyValid(key) || !/^m_[a-f0-9]{24}$/.test(message) || !/^(?:[0-9]|[12][0-9])$/.test(index))return reply(400,{error:'invalid_photo'});
       const url=reader.photo?.(key,message,Number(index));if(!url)return reply(404,{error:'photo_unavailable'});
-      try{const item=await photos.get(url);if(disposed)return reply(503,{error:'server_closing'});presence.snapshot();if(!lab.snapshot().credentialInMemory)return reply(409,{error:'authentication_required'});return reply(200,item.data,item.type);}catch{return disposed?reply(503,{error:'server_closing'}):reply(502,{error:'photo_unavailable'});}
+      try{const item=await photos.get(url);if(disposed || closing)return reply(503,{error:'server_closing'});presence.snapshot();if(!lab.snapshot().credentialInMemory)return reply(409,{error:'authentication_required'});return reply(200,item.data,item.type);}catch{return disposed || closing?reply(503,{error:'server_closing'}):reply(502,{error:'photo_unavailable'});}
     }
     if(req.method==='GET' && ['/api/reader/rooms','/api/reader/messages'].includes(requestUrl.pathname)){
       if(!lab.snapshot().credentialInMemory)return reply(409,{error:'authentication_required'});
@@ -135,7 +136,7 @@ export function createLocalServer({ transport, mode = 'mock', encode = encodeQr,
       let bytes = 0; const chunks = [];
       for await (const chunk of req) { bytes += chunk.length; if (bytes > (imageRequest?Math.ceil(IMAGE_LIMIT/3)*4+2048:req.url==='/api/reader/send'?20000:2048)) { reply(413, { error: 'body_limit' }); return; } chunks.push(chunk); }
       // Finish the iterator before rejecting: early return can destroy its socket.
-      if(disposed)return reply(503,{error:'server_closing'});
+      if(disposed || closing)return reply(503,{error:'server_closing'});
       body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
       if(authenticated || controlled && (controlPath || localLaunch))presence.snapshot();
       // The reader can be replaced by start while this request awaits its body.
@@ -163,7 +164,7 @@ export function createLocalServer({ transport, mode = 'mock', encode = encodeQr,
       }else if(req.url==='/api/preferences'){
         if(!validSettings(body))return reply(400,{error:'invalid_preferences'});
       }else if(Object.keys(body).length)return reply(400,{error:'empty_object_required'});
-    } catch { return disposed?reply(503,{error:'server_closing'}):reply(400, { error: 'invalid_json' }); }
+    } catch { return disposed || closing?reply(503,{error:'server_closing'}):reply(400, { error: 'invalid_json' }); }
     finally{if(imageRequest)receivingImage=false;}
     if(req.url==='/api/presence'){
       if(req.aborted || res.destroyed)return;
@@ -230,7 +231,7 @@ export function createLocalServer({ transport, mode = 'mock', encode = encodeQr,
       if(req.url==='/api/notifications/claim')return reply(200,{notices:reader.claimNotifications?.() ?? []});
       const owner=reader;
       let accepted=false;try{accepted=await(req.url==='/api/preferences'?owner.updateSettings?.(body):owner.forgetSettings?.());}catch{/* A rejected durable write is not a saved setting. */}
-      if(disposed)return reply(503,{error:'server_closing'});
+      if(disposed || closing)return reply(503,{error:'server_closing'});
       if(reader!==owner || !readerScopeMatches() || !lab.snapshot().credentialInMemory)return reply(409,{error:'reader_scope_changed'});
       return accepted?reply(200,{settings:owner.settingsSnapshot()}):reply(409,{error:'settings_unavailable'});
     }
@@ -241,8 +242,8 @@ export function createLocalServer({ transport, mode = 'mock', encode = encodeQr,
         :imageRequest?messaging && reader.sendPhoto?.(body.room,body.image,body.clientId)
         :req.url==='/api/reader/context'?messaging && reader.openRoom(body.room)
         :req.url==='/api/reader/seen'?reader.seen(body.room,body.token,body.notify)
-        :await Promise.resolve().then(()=>!disposed && (typeof owner.roomPreferences==='function'?owner.roomPreferences(body.room,Object.fromEntries(Object.entries(body).filter(([key])=>key!=='room'))):Object.keys(body).sort().join(',')==='room,title' && owner.rename(body.room,body.title))).catch(()=>false);
-      if(disposed)return reply(503,{error:'server_closing'});
+        :await Promise.resolve().then(()=>!disposed && !closing && (typeof owner.roomPreferences==='function'?owner.roomPreferences(body.room,Object.fromEntries(Object.entries(body).filter(([key])=>key!=='room'))):Object.keys(body).sort().join(',')==='room,title' && owner.rename(body.room,body.title))).catch(()=>false);
+      if(disposed || closing)return reply(503,{error:'server_closing'});
       if(req.url==='/api/preferences/room' && (reader!==owner || !readerScopeMatches() || !lab.snapshot().credentialInMemory))return reply(409,{error:'reader_scope_changed'});
       if(!accepted && messaging && req.url==='/api/reader/context'){
         const retryAfterMs=reader.contextRetryAfterMs?.(body.room);
@@ -251,9 +252,16 @@ export function createLocalServer({ transport, mode = 'mock', encode = encodeQr,
       return accepted?reply(202,{accepted:true}):reply(409,{error:'action_not_ready'});
     }
     if(req.url==='/api/shutdown' && (['checking','generating','waiting','approval','authenticated'].includes(lab.snapshot().phase) || ['connecting','connected'].includes(reader.snapshot().phase)))return reply(409,{error:'active_session_cancel_first'});
+    if(req.url==='/api/shutdown')closing=true;
     reader.close();
     photos.clear();
     lab.cancel();
+    if(req.url==='/api/shutdown' && typeof reader.flushDiagnostics==='function'){
+      let timer;
+      try{await Promise.race([Promise.resolve().then(()=>reader.flushDiagnostics()),new Promise(resolve=>{timer=setTimeout(resolve,1000);})]);}
+      catch{/* Diagnostic storage failure must not prevent an authorized stop. */}
+      finally{clearTimeout(timer);}
+    }
     reply(200, { app: APP, ...snapshot() });
     if (req.url === '/api/shutdown') { server.close(); server.closeIdleConnections(); }
   });

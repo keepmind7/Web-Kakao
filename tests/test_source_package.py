@@ -72,6 +72,48 @@ class SourcePackageTests(unittest.TestCase):
                 self.assertEqual(hashlib.sha256(package.read(name)).hexdigest(), digest)
             self.assertIn('독립 실행파일이 아닙니다', package.read('SOURCE-PACKAGE.ko.md').decode('utf-8'))
 
+    def test_macos_target_has_a_matching_source_zip_name_and_manifest(self):
+        try:
+            result = package_local_web.package_sources(self.root, target_platform='macos')
+        except ValueError:
+            self.fail('macOS source packages must be accepted without bundling a runtime')
+        self.assertEqual(result['path'], 'local-only/dist/web-kakao-macos-source.zip')
+        self.assertEqual(result['target_platform'], 'macos')
+        with zipfile.ZipFile(self.root / result['path']) as package:
+            manifest = json.loads(package.read('source-package-manifest.json'))
+            self.assertEqual(manifest['target_platform'], 'macos')
+            self.assertFalse(manifest['includes_runtime'])
+            self.assertFalse(manifest['includes_dependencies'])
+            self.assertFalse(manifest['includes_credentials'])
+
+    def test_source_zip_default_target_tracks_each_supported_host(self):
+        for host, target in [('win32', 'windows'), ('linux', 'linux'), ('darwin', 'macos')]:
+            with self.subTest(host=host), patch.object(package_local_web.sys, 'platform', host):
+                result = package_local_web.package_sources(self.root)
+                output = self.root / result['path']
+                try:
+                    self.assertEqual(result['target_platform'], target)
+                    self.assertEqual(result['path'], 'local-only/dist/web-kakao-' + target + '-source.zip')
+                    with zipfile.ZipFile(output) as package:
+                        manifest = json.loads(package.read('source-package-manifest.json'))
+                        self.assertEqual(manifest['target_platform'], target)
+                finally:
+                    output.unlink()
+
+    def test_macos_cli_packages_the_synthetic_root(self):
+        output = io.StringIO()
+        with patch.object(package_local_web, 'ROOT', self.root), \
+                patch.object(package_local_web.sys, 'platform', 'darwin'), \
+                contextlib.redirect_stdout(output), contextlib.redirect_stderr(io.StringIO()):
+            try:
+                result = package_local_web.main(['--platform', 'macos'])
+            except SystemExit:
+                self.fail('the source-package CLI must support Darwin and its macos target')
+        self.assertEqual(result, 0)
+        record = json.loads(output.getvalue())
+        self.assertEqual(record['target_platform'], 'macos')
+        self.assertTrue((self.root / record['path']).is_file())
+
     def test_private_and_unknown_files_are_excluded_even_if_force_tracked(self):
         rejected = ['.env', '.env.example', 'local-only/runtime/node.exe', 'docs/private.md',
                     '.harness/runs/private.json', '.codex/settings.json', 'tools/identity.key',
@@ -102,6 +144,49 @@ class SourcePackageTests(unittest.TestCase):
             manifest = json.loads(package.read('source-package-manifest.json'))
             entries = [item for item in manifest['files'] if item['path'] == name]
             self.assertEqual(entries, [{'path': name, 'sha256': hashlib.sha256(content).hexdigest()}])
+
+    def test_current_public_runtime_modules_are_packaged_once_with_source_hash(self):
+        names = ['experiments/local-web/reader-lifecycle.mjs',
+                 'experiments/local-web/photo-loader.js']
+        contents = {name: self.read_public_source(name) for name in names}
+        for name, content in contents.items():
+            candidate = self.root / name
+            candidate.parent.mkdir(parents=True, exist_ok=True)
+            candidate.write_bytes(content)
+        result = package_local_web.package_sources(self.root)
+        with zipfile.ZipFile(self.root / result['path']) as package:
+            manifest = json.loads(package.read('source-package-manifest.json'))
+            for name, content in contents.items():
+                with self.subTest(name=name):
+                    self.assertEqual(package.namelist().count(name), 1)
+                    self.assertEqual(package.read(name), content)
+                    entries = [item for item in manifest['files'] if item['path'] == name]
+                    self.assertEqual(entries, [{'path': name, 'sha256': hashlib.sha256(content).hexdigest()}])
+
+    def test_private_reader_journals_are_excluded_even_if_force_tracked(self):
+        rejected = [
+            'local-only/web-auth/reader-lifecycle.json',
+            'experiments/local-web/web-auth/reader-lifecycle.json',
+            'experiments/local-web/web-auth/reader-diagnostic.json',
+            'experiments/local-web/web-auth/reader-send-diagnostic.json',
+            'tools/web-auth/archive/reader-lifecycle.json',
+            'tools/Web-Auth/reader-lifecycle.json',
+            'evidence/readiness-20261025/reader-lifecycle.json',
+            'experiments/local-web/reader-lifecycle.json',
+            'tools/archive/reader-lifecycle.json',
+            'tests/Reader-Lifecycle.json',
+        ]
+        marker = 'SYNTHETIC_PRIVATE_READER_JOURNAL_NEVER_PACKAGE'
+        for name in rejected:
+            self.write(name, json.dumps({'fixture': marker}))
+        self.git('add', '-f', *rejected)
+        result = package_local_web.package_sources(self.root)
+        with zipfile.ZipFile(self.root / result['path']) as package:
+            self.assertTrue(set(rejected).isdisjoint(package.namelist()))
+            manifest = json.loads(package.read('source-package-manifest.json'))
+            self.assertTrue(set(rejected).isdisjoint({entry['path'] for entry in manifest['files']}))
+            for name in package.namelist():
+                self.assertNotIn(marker.encode('ascii'), package.read(name))
 
     def test_all_current_public_node_entrypoints_are_packaged_without_root_git(self):
         tests_folder = package_local_web.checked_path(ROOT / 'tests')

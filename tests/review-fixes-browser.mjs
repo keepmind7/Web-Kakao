@@ -58,7 +58,11 @@ try{
   // Context is disabled for independent photo continuation checks.
   await evaluate("window.fetch=nativeFetch;roomsCache[0].canContext=false");
   await check('R2 delayed blob after close is aborted and never saved',async()=>{await photoGate();await evaluate("el('photo-close').click()");await sleep(30);const r=await completeGate();assert.equal(r.saves,0);assert.equal(r.aborted,true);assert.equal(r.open,false);return r;});
-  await check('R2 delayed old blob never mutates a replacement photo dialog',async()=>{await photoGate();await evaluate("el('photo-close').click()");await sleep(30);await evaluate("document.querySelectorAll('.photo-open')[1].click();el('photo-download').textContent='NEW DIALOG';el('photo-download').disabled=true");const r=await completeGate();assert.equal(r.saves,0);assert.equal(r.aborted,true);assert.equal(r.button,'NEW DIALOG');assert.equal(r.disabled,true);await evaluate("el('photo-close').click()");return r;});
+  await check('R2 delayed old blob never mutates a replacement photo dialog',async()=>{await photoGate();await evaluate("el('photo-close').click()");await sleep(30);await evaluate("document.querySelectorAll('.photo-open')[1].click()");
+    // The new dialog's own image load legitimately enables its download button.
+    // Observe that completion before testing the unrelated old blob callback.
+    await until("el('photo-dialog').open && el('photo-full').getAttribute('src')===document.querySelectorAll('.photo-open')[1].dataset.photoSrc && el('photo-full').complete && el('photo-full').naturalWidth>0 && !el('photo-download').disabled");
+    await evaluate("el('photo-download').textContent='NEW DIALOG';el('photo-download').disabled=true");const r=await completeGate();assert.equal(r.saves,0);assert.equal(r.aborted,true);assert.equal(r.button,'NEW DIALOG');assert.equal(r.disabled,true);await evaluate("el('photo-close').click()");return r;});
   await check('R2 delayed blob after account generation change is aborted and never saved',async()=>{await photoGate();instance='b'.repeat(24);await refresh();const r=await completeGate();assert.equal(r.saves,0);assert.equal(r.aborted,true);assert.equal(r.open,false);return r;});
   await openApp();await evaluate('showAccount(true)');
   for(let n=1;n<=4;n++){await evaluate("el('start').click()");await until("lastState.phase==='waiting'&&!busy&&!refreshing");await evaluate("el('cancel').click()");await until("lastState.phase==='cancelled'&&!busy&&!refreshing");}

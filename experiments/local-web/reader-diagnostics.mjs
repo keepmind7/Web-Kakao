@@ -1,6 +1,6 @@
-import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { privateDataRoot,ensurePrivateDirectory } from './private-storage.mjs';
+import { atomicReaderFile,safeReaderDiagnostic } from './reader-lifecycle.mjs';
 import { randomUUID } from 'node:crypto';
 import { responseStatus } from './reader-response.mjs';
 import { createOwnReadDiagnostics } from './reader-own-read-diagnostics.mjs';
@@ -22,8 +22,8 @@ export function schemaShape(value,depth=0){
 }
 export function safeFault(error){
   const names=new Set(['Error','TypeError','RangeError','SyntaxError','BSONError','BSONRuntimeError']);
-  const stack=typeof error?.stack==='string'?error.stack:'';
-  return {category:names.has(error?.name)?error.name:'other',frames:['onData','decrypt','fromBuffer','deserialize','syncMsg','history','request'].filter(name=>new RegExp('\\b'+name+'\\b').test(stack))};
+  const raw=safeValue(error,'stack'),name=safeValue(error,'name'),stack=typeof raw==='string'?raw.slice(0,8192):'';
+  return {category:names.has(name)?name:'other',frames:['onData','decrypt','fromBuffer','deserialize','syncMsg','history','request','photoAttachments','merge','onPush'].filter(name=>new RegExp('\\b'+name+'\\b').test(stack))};
 }
 const UPLOAD_STAGES=new Set(['ship','route','connect','post','offset','stream','await_complete','received_complete','complete_observed','transport','deadline','exception']);
 for(const stage of ['https_start','https_route','https_upload','https_uploaded','https_write','https_ack','https_deadline','https_exception'])UPLOAD_STAGES.add(stage);
@@ -61,17 +61,20 @@ function safePhotoDetails(value){
 const SEND_STAGES=new Set(['start','entry','member_lookup','member_verified','blocked','write_attempt','response','result']);
 const SEND_PHASES=new Set(['sending','accepted','failed','unknown']);
 const SEND_REASONS=new Set(['entry_unavailable','open_member_unverified','member_missing','member_rejected','member_timeout','member_invalid','permission_changed','write_rejected','write_ack_unrecognized','write_correlation','write_timeout','transport','invalidated']);
-export function createReaderDiagnostic({writeSnapshot=null,writeSendSnapshot=null,debounceMs=1000}={}){
+export function createReaderDiagnostic({writeSnapshot=null,writeSendSnapshot=null,onSnapshot=null,debounceMs=1000}={}){
   const ownRead=createOwnReadDiagnostics();
   const state={runId:randomUUID(),startedAt:Date.now(),rawValuesRecorded:false,lastOperation:'startup',readSync:{requests:0,responses:0,accepted:0,rejected:0,unknown:0},events:[],uploadStages:{}};let ended=false,timer=null,dirty=false,sendDirty=false,sendAttempted=false,streamBytes=0,outputFolder=null;
   const folder=()=>{if(!outputFolder){const path=join(privateDataRoot(),'web-auth');ensurePrivateDirectory(path);outputFolder=path;}return outputFolder;};
   const save=()=>{
     clearTimeout(timer);timer=null;
-    if(dirty){dirty=false;try{const data=JSON.stringify({...state,ownRead:ownRead.snapshot()})+'\n';if(writeSnapshot)writeSnapshot(data);else writeFileSync(join(folder(),'reader-diagnostic.json'),data);}catch{/* Never fall back to raw stderr. */}}
-    if(sendDirty){sendDirty=false;try{const data=JSON.stringify(state.lastSend)+'\n';if(writeSendSnapshot)writeSendSnapshot(data);else if(!writeSnapshot)writeFileSync(join(folder(),'reader-send-diagnostic.json'),data);}catch{/* An injected primary writer never falls back to disk. */}}
+    if(dirty){dirty=false;
+      try{onSnapshot?.(safeReaderDiagnostic(state));}catch{/* Observation never changes worker lifetime. */}
+      try{const data=JSON.stringify({...state,ownRead:ownRead.snapshot()})+'\n';if(writeSnapshot)writeSnapshot(data);else atomicReaderFile('reader-diagnostic.json',data,{folder:folder()});}catch{/* Never fall back to raw stderr. */}}
+    if(sendDirty){sendDirty=false;try{const data=JSON.stringify(state.lastSend)+'\n';if(writeSendSnapshot)writeSendSnapshot(data);else if(!writeSnapshot)atomicReaderFile('reader-send-diagnostic.json',data,{folder:folder()});}catch{/* An injected primary writer never falls back to disk. */}}
   };
   const schedule=()=>{dirty=true;if(!timer){timer=setTimeout(save,debounceMs);timer.unref?.();}};
   return {
+    fault(stage,input){if(ended)return;const safe=safeReaderDiagnostic({fault:input,events:[{event:'failed',stage}]});if(safe.fault)state.fault=safe.fault;state.events.push({...safe.events[0],elapsedMs:Date.now()-state.startedAt});state.events=state.events.slice(-40);schedule();},
     ownRead(stage,reason,method){if(ended)return;try{ownRead.record(stage,reason,method);schedule();}catch{/* Diagnostics cannot change packet processing. */}},
     note(event,details={}){
       if(ended)return;
@@ -81,18 +84,19 @@ export function createReaderDiagnostic({writeSnapshot=null,writeSendSnapshot=nul
       if(event==='photo-upload'){details=safePhotoDetails(details);if(!details)return;}
       if(event==='send-stage'){
         if(!SEND_STAGES.has(details?.stage))return;
+        const now=Date.now(),elapsedSince=start=>Math.max(0,Math.min(2147483647,now-start));
         if(details.stage==='start'){
           if(!['text','reply'].includes(details.kind))return;
-          state.lastSend={rawValuesRecorded:false,startedAt:state.startedAt,kind:details.kind,events:[]};sendAttempted=false;
+          state.lastSend={rawValuesRecorded:false,startedAt:now,kind:details.kind,events:[]};sendAttempted=false;
         }else if(!state.lastSend)return;
         sendAttempted ||= details.writeAttempted===true;
-        const row={stage:details.stage,elapsedMs:Math.max(0,Math.min(2147483647,Date.now()-state.startedAt))};
+        const row={stage:details.stage,elapsedMs:elapsedSince(state.lastSend.startedAt)};
         if(typeof details.writeAttempted==='boolean' || sendAttempted)row.writeAttempted=sendAttempted;
         if(SEND_PHASES.has(details.phase))row.phase=details.phase;
         if(Number.isInteger(details.status) && details.status>=-2147483648 && details.status<=2147483647)row.status=details.status;
         if(SEND_REASONS.has(details.reason))row.reason=details.reason;
         state.lastSend.events.push(row);state.lastSend.events=state.lastSend.events.slice(-12);
-        state.events.push({event:'send-stage',...row});state.events=state.events.slice(-40);
+        state.events.push({event:'send-stage',...row,elapsedMs:elapsedSince(state.startedAt)});state.events=state.events.slice(-40);
         sendDirty=true;schedule();return;
       }
       if(event==='request' && details.method==='NOTIREAD')state.readSync.requests++;

@@ -6,6 +6,25 @@ import { guardReaderClient } from '../experiments/local-web/reader-protocol.mjs'
 import { createReaderStore } from '../experiments/local-web/reader-data.mjs';
 import { responseStatus } from '../experiments/local-web/reader-response.mjs';
 
+test('latest send timing starts at each send while rolling events retain the session timeline',t=>{
+  let now=1000,snapshot,latest;
+  t.mock.method(Date,'now',()=>now);
+  const diagnostic=createReaderDiagnostic({writeSnapshot:raw=>{snapshot=JSON.parse(raw);},writeSendSnapshot:raw=>{latest=JSON.parse(raw);}});
+  try{
+    now=3601000;diagnostic.note('send-stage',{stage:'start',kind:'text'});
+    now+=12;diagnostic.note('send-stage',{stage:'write_attempt',writeAttempted:true});
+    now+=13;diagnostic.note('send-stage',{stage:'result',phase:'accepted',status:0});diagnostic.flush();
+    assert.equal(latest.startedAt,3601000);
+    assert.deepEqual(latest.events.map(row=>row.elapsedMs),[0,12,25]);
+    assert.equal(snapshot.startedAt,1000);
+    assert.deepEqual(snapshot.events.map(row=>row.elapsedMs),[3600000,3600012,3600025]);
+    now+=10000;diagnostic.note('send-stage',{stage:'start',kind:'reply'});
+    now+=7;diagnostic.note('send-stage',{stage:'result',phase:'failed'});diagnostic.flush();
+    assert.equal(latest.startedAt,3611025);
+    assert.deepEqual(latest.events.map(row=>row.elapsedMs),[0,7]);
+  }finally{diagnostic.end('synthetic');}
+});
+
 test('diagnostics contain structural metadata only, including for unknown field names and error stacks',()=>{
   const body={chatDatas:[{c:'9007199254740993',k:['FAKE_PRIVATE_PERSON'],l:{msg:'FAKE_PRIVATE_MESSAGE',logId:'9007199254740995'}}],FAKE_PRIVATE_FIELD:'FAKE_PRIVATE_TOKEN','246810':'FAKE_PRIVATE_ACCOUNT'};
   const encoded=JSON.stringify(schemaShape(body));

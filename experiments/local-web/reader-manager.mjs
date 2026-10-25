@@ -9,6 +9,7 @@ import { createPreferenceStore,validSettings,validRoomSettings } from './prefere
 import { photoUrl } from './photos.mjs';
 import { messageKeyValid,clientIdValid,decodeImage } from './message-content.mjs';
 import { DEFAULT_PHOTO_TRANSPORT,normalizePhotoTransport } from './photo-transport.mjs';
+import { createReaderLifecycle } from './reader-lifecycle.mjs';
 
 const integer=value=>Number.isSafeInteger(value) && value>=0 ? value : 0;
 const text=(value,max)=>typeof value==='string'?(value.length<=max?value:[...value].slice(0,max).join('')):'';
@@ -29,8 +30,10 @@ export function safeMessages(rows){
   for(const row of rows.slice(-MESSAGE_LIMIT))if(messageKeyValid(row?.key))unique.set(row.key,{key:row.key,text:text(row.text,4000),sender:text(row.sender,80),mine:row.mine===true,canReply:row.canReply===true,reply:row.reply && typeof row.reply.text==='string'?{text:text(row.reply.text,4000),sender:text(row.reply.sender,80),verified:row.reply.verified===true}:null,at:at(row.at),photos:(Array.isArray(row.photos)?row.photos:[]).slice(0,30).map(photo=>({url:photoUrl(photo?.url),width:Number.isInteger(photo?.width)&&photo.width>0&&photo.width<=20000?photo.width:null,height:Number.isInteger(photo?.height)&&photo.height>0&&photo.height<=20000?photo.height:null})).filter(photo=>photo.url),unreadCount:row.mine===true && Number.isSafeInteger(row.unreadCount) && row.unreadCount>=0 && row.unreadCount<=100?row.unreadCount:null});
   return [...unique.values()];
 }
-export function createReadOnlyReader({spawn=fork,now=Date.now,onBlocked=()=>{},gapProbe=false,messaging=false,photoTransport=DEFAULT_PHOTO_TRANSPORT,preferenceStore=createPreferenceStore()}={}){
+export function createReadOnlyReader({spawn=fork,now=Date.now,onBlocked=()=>{},gapProbe=false,messaging=false,photoTransport=DEFAULT_PHOTO_TRANSPORT,preferenceStore=createPreferenceStore(),lifecycleOptions={}}={}){
   photoTransport=normalizePhotoTransport(photoTransport);
+  const lifecycle=createReaderLifecycle({...lifecycleOptions,writeSnapshot:lifecycleOptions.writeSnapshot??(spawn===fork?null:()=>{})});
+  const workerLifecycle=new WeakMap(),closingExits=new Set();let activeAttempt=null;
   const instanceId=randomBytes(12).toString('hex');
   const ownReadDiagnostics=createOwnReadDiagnostics({component:'manager'});
   const observeOwnRead=reason=>{try{ownReadDiagnostics.record('apply',reason);}catch{/* Observation cannot affect receipt application. */}};
@@ -89,16 +92,19 @@ export function createReadOnlyReader({spawn=fork,now=Date.now,onBlocked=()=>{},g
     if(outboxEntry){outbox.set(outboxEntry.clientId,outboxEntry);sendRequests++;outboxRevision++;}
     send({type:'reader-action',key,requestId,action:kind,payload});touch(key);revision++;return true;
   }
-  function terminate(){
+  function terminate(reason='failure'){
     preparation++;
     unknownPending();
     if(pending?.action==='read' && readStates.get(pending.key)?.phase==='sending'){readStates.set(pending.key,{phase:'unknown',messageKey:pending.message});touch(pending.key);}
     clearTimeout(deadline);deadline=null;pending=null;
     for(const key of entries.keys())touch(key);entries.clear();activeRoom=null;
     if(signal && abortHandler)signal.removeEventListener('abort',abortHandler);
-    if(child){const owned=child;child=null;owned.removeAllListeners();owned.on('error',()=>{});owned.kill();}
+    if(child){const owned=child,info=workerLifecycle.get(owned);child=null;
+      if(info&&!info.exited){closingExits.add(info.exitPromise);lifecycle.record(info.attempt,'termination',{reason});}
+      owned.removeAllListeners();owned.on('error',()=>{});if(info&&!info.exited){owned.once('exit',info.onExit);owned.once('close',info.onClose);}owned.kill();}
   }
   function fail(nextStage,code=null){
+    lifecycle.record(activeAttempt,'failure',{stage:nextStage,status:code});
     const handshakeDenied=phase==='connecting' && ['booking','getconf','checkin','loginlist'].includes(nextStage) && Number.isInteger(code) && code!==0;
     phase=handshakeDenied?'blocked':'disconnected';stage=nextStage;status=Number.isInteger(code)?code:null;
     unknownPending();
@@ -175,6 +181,7 @@ export function createReadOnlyReader({spawn=fork,now=Date.now,onBlocked=()=>{},g
       if(typeof credential?.userId!=='string' || boundAccount!==null && boundAccount!==credential.userId)return false;
       boundAccount ??= credential.userId;
       attempts++;consecutiveFailures++;phase='connecting';stage='booking';status=null;rooms=[];pages.clear();pinned=null;cacheLost.clear();cacheEpochs.clear();pageRevisions.clear();roomsRevision++;contexts.clear();entries.clear();activeRoom=null;readMarks.clear();readStates.clear();viewTokens.clear();connectedAt=null;lastActivityAt=null;sourceRoomCount=0;truncated=false;revision++;
+      const lifecycleAttempt=lifecycle.start();activeAttempt=lifecycleAttempt;
       signal=authSignal;abortHandler=()=>this.close();signal?.addEventListener('abort',abortHandler,{once:true});
       const epoch=++preparation,current=()=>preparation===epoch && phase==='connecting' && !authSignal?.aborted;
       deadline=setTimeout(()=>{if(current())fail('settings');},22000);deadline.unref?.();
@@ -185,26 +192,34 @@ export function createReadOnlyReader({spawn=fork,now=Date.now,onBlocked=()=>{},g
       try{
         checkPinnedSource({workingCopy:true});
         const allowedEnv=new Set(['PATH','SYSTEMROOT','WINDIR','TEMP','TMP','USERPROFILE','LOCALAPPDATA','APPDATA','COMSPEC','LANG','LC_ALL','WEB_KAKAO_PYTHON','HOME','XDG_DATA_HOME','XDG_STATE_HOME','XDG_RUNTIME_DIR','TMPDIR']);
+        lifecycle.record(lifecycleAttempt,'spawn');
         const worker=spawn(fileURLToPath(new URL('./reader-worker.mjs',import.meta.url)),[],{
           execArgv:['--max-old-space-size=128','--import',new URL('../../local-only/spikes/modern/node_modules/tsx/dist/loader.mjs',import.meta.url).href],
           stdio:['ignore','ignore','ignore','ipc'],windowsHide:true,
           env:{...Object.fromEntries(Object.entries(process.env).filter(([key])=>allowedEnv.has(key.toUpperCase()))),KAKAO_DEBUG_LOCO:'0'},
         });
         child=worker;let credentialSent=false;
+        let resolveExit;const info={attempt:lifecycleAttempt,exited:false,onExit:null,onClose:null,exitPromise:new Promise(resolve=>{resolveExit=resolve;})};
+        info.onExit=(code,signal)=>{if(info.exited)return;info.exited=true;lifecycle.record(lifecycleAttempt,'exit',{code,signal});closingExits.delete(info.exitPromise);resolveExit();if(child===worker)fail('disconnected');};workerLifecycle.set(worker,info);
+        // Spawn failure emits error+close without an exit. Drain it without
+        // inventing an OS exit code for a process that never started.
+        info.onClose=()=>{closingExits.delete(info.exitPromise);resolveExit();};
         deadline=setTimeout(()=>fail('deadline'),22000);deadline.unref?.();
-        worker.on('error',()=>{if(child===worker)fail('worker');});
-        worker.on('exit',()=>{if(child===worker)fail('disconnected');});
+        worker.on('error',error=>{lifecycle.record(lifecycleAttempt,'worker-error',error);if(child===worker)fail('worker');});
+        worker.once('exit',info.onExit);
+        worker.once('close',info.onClose);
         worker.on('message',message=>{
           if(child!==worker)return;
+          if(message?.type==='reader-diagnostic'){try{lifecycle.diagnostic(lifecycleAttempt,Object.getOwnPropertyDescriptor(message,'snapshot')?.value);}catch{/* A diagnostic cannot change reader state. */}return;}
           if(message?.type==='reader-alive'){lastActivityAt=now();return;}
-          if(message?.type==='reader-ready' && !credentialSent){credentialSent=true;send({type:'reader-start',gapProbe:gapProbe===true,messaging,photoTransport,sessionSalt,settingsSecret:profile.key().toString('hex'),credential:{userId:credential.userId,deviceUUID:credential.deviceUUID,accessToken:credential.accessToken}});}
+          if(message?.type==='reader-ready' && !credentialSent){lifecycle.record(lifecycleAttempt,'ready');credentialSent=true;send({type:'reader-start',gapProbe:gapProbe===true,messaging,photoTransport,sessionSalt,settingsSecret:profile.key().toString('hex'),credential:{userId:credential.userId,deviceUUID:credential.deviceUUID,accessToken:credential.accessToken}});}
           else if(message?.type==='reader-failed')fail(['booking','getconf','checkin','loginlist','history','ping','push','transport','decode','disconnected','worker','send','photo','context','read','discovery'].includes(message.stage)?message.stage:'worker',message.status);
           else if(message?.type==='reader-rooms' && ['loginlist','push'].includes(message.source)){
             const nextRooms=safeRooms(message.rooms);
             for(const room of rooms)if(!nextRooms.some(next=>next.key===room.key && next.canContext)){entries.delete(room.key);contexts.delete(room.key);readMarks.delete(room.key);touch(room.key);}
             if(JSON.stringify(nextRooms)!==JSON.stringify(rooms))roomsRevision++;
             rooms=nextRooms;sourceRoomCount=integer(message.stats?.sourceRoomCount);truncated=message.stats?.truncated===true;duplicates=integer(message.stats?.duplicates);
-            if(phase==='connecting' && message.source==='loginlist'){roomState.bind(rooms,{reconnect:attempts>1,seedBounds:message.seedBounds,generation:attempts});clearTimeout(deadline);deadline=null;phase='connected';stage='loginlist';status=0;consecutiveFailures=0;connectedAt=now();}
+            if(phase==='connecting' && message.source==='loginlist'){roomState.bind(rooms,{reconnect:attempts>1,seedBounds:message.seedBounds,generation:attempts});clearTimeout(deadline);deadline=null;phase='connected';stage='loginlist';status=0;consecutiveFailures=0;connectedAt=now();lifecycle.record(lifecycleAttempt,'connected');}
             else roomState.bind(rooms,{seedBounds:message.seedBounds,generation:attempts});
             applySettings(message.rooms);
             revision++;
@@ -278,7 +293,8 @@ export function createReadOnlyReader({spawn=fork,now=Date.now,onBlocked=()=>{},g
       const previous=pages.get(key);touch(key);pages.set(key,{key,messages:previous?.messages ?? [],history:{phase:'loading'},revision:++revision});trimPages();
       deadline=setTimeout(()=>fail('history'),22000);deadline.unref?.();send({type:'reader-history',key,requestId});return true;
     },
-    disconnect(){if(['blocked','closed'].includes(phase))return;terminate();phase='disconnected';stage='manual';revision++;},
-    close(){terminate();if(phase!=='blocked'){phase='closed';stage='cancelled';}rooms=[];pages.clear();roomState.clear();ownReadDiagnostics.reset();outbox.clear();retired.clear();pageRevisions.clear();cacheLost.clear();cacheEpochs.clear();pinned=null;outboxRevision++;roomsRevision++;settingsRevision++;contexts.clear();readMarks.clear();readStates.clear();viewTokens.clear();preferenceKeys.clear();profile?.close();profile=null;revision++;},
+    async flushDiagnostics(){await Promise.allSettled([...closingExits]);await lifecycle.flush?.();},
+    disconnect(){if(['blocked','closed'].includes(phase))return;terminate('manual');phase='disconnected';stage='manual';revision++;},
+    close(){terminate('cancelled');if(phase!=='blocked'){phase='closed';stage='cancelled';}rooms=[];pages.clear();roomState.clear();ownReadDiagnostics.reset();outbox.clear();retired.clear();pageRevisions.clear();cacheLost.clear();cacheEpochs.clear();pinned=null;outboxRevision++;roomsRevision++;settingsRevision++;contexts.clear();readMarks.clear();readStates.clear();viewTokens.clear();preferenceKeys.clear();profile?.close();profile=null;revision++;},
   };
 }

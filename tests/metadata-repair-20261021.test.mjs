@@ -159,15 +159,46 @@ for(const mode of ['single exact','multi log','conflicting author','missing auth
  }finally{f.close();}
 });
 const titleRows=()=>Array.from({length:10},(_,n)=>row(String(n+1),{t:'MultiChat',li:undefined,title:'',lastLog:null,ll:null,updatedAt:1800000000+n}));
+async function waitForTitleState(predicate,description){
+ const deadline=performance.now()+5000;
+ while(!predicate()){assert.ok(performance.now()<deadline,'Timed out waiting for '+description);await sleep(10);}
+}
+async function waitForBootstrapTitles(f){
+ // Counting requests alone cannot prove the final bootstrap response was applied.
+ await waitForTitleState(()=>{
+  const rooms=f.events.findLast(e=>e.type==='reader-rooms')?.rooms??[];
+  return ['3','4','5','6','7','8','9','10'].every(id=>rooms.some(r=>r.key===f.key(id)&&r.title==='Recovered '+id));
+ },'all eight bootstrap titles to be published');
+ assert.equal(f.count('CHATINFO'),8);
+}
+async function waitForSelectedTitle(f){
+ await waitForTitleState(()=>f.calls.some(c=>c.method==='CHATINFO'&&String(c.body.chatId)==='1'),'selected room CHATINFO to become pending');
+ assert.equal(f.count('CHATINFO'),9,'selected room must have a real pending attempt');
+ return f.calls.find(c=>c.method==='CHATINFO'&&String(c.body.chatId)==='1');
+}
 test('bootstrap8 remain capped; selecting unknown ninth schedules one nonblocking3sec title attempt',async()=>{
- const d=defer(),f=fixture({rows:titleRows(),reply:(method,body)=>method==='CHATINFO'&&String(body.chatId)==='1'?d.promise:undefined});f.held.push(d);
- try{await f.start();await sleep(1050);assert.equal(f.count('CHATINFO'),8);const key=f.key('1');assert.equal(f.session.view(key),true);await f.settle();assert.equal(f.count('CHATINFO'),9);const call=f.calls.at(-1);assert.equal(call.method,'CHATINFO');assert.equal(String(call.body.chatId),'1');assert.equal(call.timeout,3000);assert.equal(call.policy.optional,true);assert.equal(f.session.view(key),true);assert.equal(await Promise.race([f.session.history(key,2),sleep(200).then(()=>false)]),true,'history cannot wait for optional selected title');d.resolve({status:0,body:{chatInfo:{c:'1',title:'Selected ninth'}}});await f.settle();assert.equal(f.count('CHATINFO'),9);assert.equal(f.events.findLast(e=>e.type==='reader-rooms').rooms.find(r=>r.key===key).title,'Selected ninth');quiet(f);}finally{f.close();}
+ const d=defer(),bootstrap=defer(),f=fixture({rows:titleRows(),reply:(method,body)=>method==='CHATINFO'?(String(body.chatId)==='1'?d.promise:String(body.chatId)==='3'?bootstrap.promise:undefined):undefined});f.held.push(d,bootstrap);
+ try{
+  await f.start();
+  await waitForTitleState(()=>f.calls.some(c=>c.method==='CHATINFO'&&String(c.body.chatId)==='3'),'eighth bootstrap request to become pending');
+  assert.equal(f.count('CHATINFO'),8);
+  assert.equal(f.events.some(e=>e.type==='reader-rooms'&&e.rooms.some(r=>r.key===f.key('3')&&r.title==='Recovered 3')),false,'a pending bootstrap response is not completion');
+  bootstrap.resolve({status:0,body:{chatInfo:{c:'3',t:'MultiChat',title:'Recovered 3',ll:'100'}}});
+  await waitForBootstrapTitles(f);
+  const key=f.key('1');assert.equal(f.session.view(key),true);const call=await waitForSelectedTitle(f);
+  assert.equal(call.method,'CHATINFO');assert.equal(String(call.body.chatId),'1');assert.equal(call.timeout,3000);assert.equal(call.policy.optional,true);assert.equal(f.session.view(key),true);
+  assert.equal(await Promise.race([f.session.history(key,2),sleep(200).then(()=>false)]),true,'history cannot wait for optional selected title');
+  d.resolve({status:0,body:{chatInfo:{c:'1',title:'Selected ninth'}}});
+  await waitForTitleState(()=>f.events.findLast(e=>e.type==='reader-rooms')?.rooms.some(r=>r.key===key&&r.title==='Selected ninth'),'selected title to be published');
+  assert.equal(f.count('CHATINFO'),9);assert.equal(f.events.findLast(e=>e.type==='reader-rooms').rooms.find(r=>r.key===key).title,'Selected ninth');quiet(f);
+ }finally{f.close();}
 });
 for(const outcome of ['wrong room','wrong link','timeout','A-B-A','revision','close'])test('selected-title '+outcome+' is rejected and never retried automatically',async()=>{
  const d=defer(),f=fixture({rows:titleRows(),reply:(method,body)=>method==='CHATINFO'&&String(body.chatId)==='1'?d.promise:undefined});f.held.push(d);
- try{await f.start();await sleep(1050);const key=f.key('1');f.session.view(key);await f.settle();assert.equal(f.count('CHATINFO'),9,'selected room must have a real pending attempt');
+ try{await f.start();await waitForBootstrapTitles(f);const key=f.key('1');f.session.view(key);await waitForSelectedTitle(f);
   if(outcome==='A-B-A'){f.session.view(f.key('2'));f.session.view(key);}if(outcome==='revision')f.carriage.emit('push',{method:'NEWMEM',status:0,body:{chatId:'1',userId:'111'}});if(outcome==='close')f.session.close();
   d.resolve(outcome==='timeout'?Promise.reject(Object.assign(new Error('Synthetic optional timeout'),{code:'READER_REQUEST_TIMEOUT'})):{status:0,body:{chatInfo:{c:outcome==='wrong room'?'2':'1',...(outcome==='wrong link'?{li:'701'}:{}),title:'Must not appear'}}});
+  // Observe beyond the 100ms queue tick so a forbidden retry would be visible.
   await f.settle();assert.equal(f.events.some(e=>e.type==='reader-rooms'&&e.rooms.some(r=>r.key===key&&r.title==='Must not appear')),false);if(outcome!=='close'){f.session.view(key);await f.settle();assert.equal(f.count('CHATINFO'),9);quiet(f);}
  }finally{f.close();}
 });

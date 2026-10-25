@@ -6,6 +6,7 @@ import { uploadPhoto } from './media-upload.mjs';
 import { uploadPhotoHttps } from './media-upload-https.mjs';
 import { DEFAULT_PHOTO_TRANSPORT,normalizePhotoTransport } from './photo-transport.mjs';
 import { PROFILE } from './kakao-auth.mjs';
+import { safeFault } from './reader-diagnostics.mjs';
 
 export const allowedReaderMethod = (method,{messaging=false}={}) => ['GETCONF','CHECKIN','LOGINLIST','SYNCMSG','MCHATLOGS','PING','CHATINFO'].includes(method)
   || messaging===true && ['WRITE','CHATONROOM','NOTIREAD','SHIP','SYNCLINK','INFOLINK','MEMBER'].includes(method);
@@ -324,7 +325,10 @@ export function createReaderSession(credential,factory,emit) {
               for(const update of updates){emitMessages(update,'push',{arrivalProof:store.arrivalProof(update.key,update.arrivals,packet.body)});lookupMembers(update.key);}
               if(updates.length)emitRooms('push');
               scheduleDiscovery();
-            } catch { fail('decode'); }
+            } catch(error) {
+              try{factory.observeFailure?.({stage:'decode',fault:safeFault(error)});}catch{/* Diagnostics cannot change the decode outcome. */}
+              fail('decode');
+            }
           };
           carriage.on('push',onPush);
           if(earlyPush.length){

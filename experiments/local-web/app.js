@@ -11,6 +11,18 @@ let localAuthorizationRequired=false,foregroundFocused=document.hasFocus();
 let localSession=null;try{const saved=sessionStorage.getItem('webKakaoLocalSession');if(/^[a-f0-9]{64}$/.test(saved ?? ''))localSession=saved;}catch{}
 const pageRevisions=new Map(),contextDispatches=new Set(),contextRetryAt=new Map();
 let photoDownload=null,photoDownloadEpoch=0;
+const photoModuleReady=typeof globalThis.createPhotoLoader==='function';
+const photoModuleUpdateNote='사진 표시 모듈 업데이트를 위해 로컬 서버를 재시작해 주세요. 대화와 로컬 세션 지우기는 계속 사용할 수 있습니다.';
+// A running older server can serve new app.js but not the new static module.
+// Keep account controls usable while refusing photo HTTP until it is restarted.
+const photoLoader=photoModuleReady?createPhotoLoader({root:document.querySelector('.chat-scroll')}):{
+  image(){},clear(){},remove(){},removeTree(){},setActive(){},
+  run(){return Promise.reject(new Error(photoModuleUpdateNote));},
+};
+if(!photoModuleReady){
+  const note=document.createElement('p');note.id='photo-module-notice';note.className='history-note';note.setAttribute('role','status');note.textContent=photoModuleUpdateNote;
+  document.querySelector('.chat-scroll').before(note);
+}
 let restoredOutbox=[];
 let renderedRooms=null,renderedMessages=null,renderedMessageRoom=null,renderedQr=null;
 let userSelected=false,currentPage=null,ackInFlight=false,pendingSend=null,uncertainPhoto=null,renameTarget=null;
@@ -30,7 +42,7 @@ function stampCurrent(stamp){return stamp.generation===readerGeneration && stamp
 function staleResult(){const error=new Error('Stale local response');error.name='StaleLocalResult';return error;}
 function unavailable(){localFailureVersion++;freshness='unavailable';readerRevision=-1;renderComposer();}
 function invalidateViewPin(){viewPin=null;viewPinEpoch++;viewPinPending=null;}
-function requireLocalAuthorization(){localAuthorizationRequired=true;csrf=null;stopTabPresence();unavailable();}
+function requireLocalAuthorization(){localAuthorizationRequired=true;csrf=null;clearIncomingPhotos();photoLoader.setActive(false);stopTabPresence();unavailable();}
 function renderLocalAuthorization(){
   el('title').textContent='브라우저 접근 승인 필요';
   el('message').textContent='로컬 도구의 open 명령으로 브라우저를 다시 열어 주세요. 작성 중인 내용은 유지됩니다.';
@@ -463,6 +475,7 @@ function renderChatHeading(){
 }
 const labels = { idle:'로그인 준비', checking:'등록 허용 확인', generating:'QR 요청 중', waiting:'휴대폰으로 QR 스캔', approval:'휴대폰 승인 대기', authenticated:'인증 응답 확인', blocked:'연결 시도 중단', error:'연결 오류', expired:'인증 시간 만료', cancelled:'로컬 세션 삭제' };
 function render(state) {
+  const previousReaderPhase=lastState?.reader?.phase;
   lastState=state;
   const nextInstance=typeof state.reader?.instanceId==='string' && /^[a-f0-9]{24}$/.test(state.reader.instanceId)?state.reader.instanceId:null;
   const instanceChanged=nextInstance!==null && readerInstance!==null && nextInstance!==readerInstance;
@@ -472,6 +485,7 @@ function render(state) {
   if(state.credentialInMemory && hasAccount && selectedRoom && selectedRoom===reconnectRoom
     && (nextAttempt!==readerAttempt || ['connecting','disconnected'].includes(state.reader?.phase))){reconnectRoom=selectedRoom;drafts.set(selectedRoom,el('compose-text').value);}
   if(accountEnded || (nextAttempt!==null && nextAttempt!==readerAttempt)){
+    clearIncomingPhotos();
     closeMessageMenu();
     closeRoomActions();document.querySelector('.app-shell').classList.remove('mobile-chat');
     seenDispatches.clear();contextDispatches.clear();contextRetryAt.clear();pageRevisions.clear();roomsRevision=-1;outboxRevision=-1;invalidateViewPin();
@@ -492,6 +506,9 @@ function render(state) {
   }
   readerAttempt=nextAttempt;
   hasAccount=Boolean(state.credentialInMemory);
+  const photosActive=hasAccount && state.reader?.phase==='connected' && presencePageActive && !localAuthorizationRequired;
+  if(previousReaderPhase==='connected' && state.reader?.phase!=='connected')clearIncomingPhotos();
+  photoLoader.setActive(photosActive);
   if (state.csrf) csrf = state.csrf;
   ensureTabPresence();renderTabPresenceNote();
   el('title').textContent = labels[state.phase] || '연결 상태 확인';
@@ -629,7 +646,7 @@ async function selectRoom(key){
   invalidateViewPin();
   const intent=selectionView={key,generation,attempt:readerAttempt,phase:'waiting',awaitingPage:true};pendingSelection=intent;
   if(selectedRoom)drafts.set(selectedRoom,el('compose-text').value);
-  if(key!==selectedRoom){if(!pendingSend)clearImageDraft();resetMessageSearch(false);renderedMessages=null;renderedMessageRoom=null;el('message-list').replaceChildren();}
+  if(key!==selectedRoom){clearIncomingPhotos();if(!pendingSend)clearImageDraft();resetMessageSearch(false);renderedMessages=null;renderedMessageRoom=null;el('message-list').replaceChildren();}
   selectedRoom=key;reconnectRoom=key;userSelected=true;currentPage=null;el('compose-text').value=drafts.get(key) || '';renderRooms();el('history-note').textContent='메시지 표시를 준비하고 있습니다.';
   renderChatHeading();showAccount(false);
   if(lastState)render(lastState);
@@ -644,7 +661,7 @@ async function selectRoom(key){
 }
 function reconcileChildren(parent,nodes){
   const desired=new Set(nodes);
-  for(const node of [...parent.childNodes])if(!desired.has(node))node.remove();
+  for(const node of [...parent.childNodes])if(!desired.has(node)){photoLoader.removeTree(node);node.remove();}
   let cursor=parent.firstChild;
   for(const node of nodes){if(node===cursor)cursor=cursor.nextSibling;else parent.insertBefore(node,cursor);}
 }
@@ -680,20 +697,19 @@ function updateMessageItem(item,message){
       let button=existing.get(photo.src);
       if(!button){
         button=document.createElement('button');button.type='button';button.className='photo-open';button.dataset.photoSrc=photo.src;button.setAttribute('aria-label','사진 크게 보기');
-        const image=document.createElement('img');image.loading='lazy';image.decoding='async';image.referrerPolicy='no-referrer';
+        const image=document.createElement('img');image.decoding='async';image.referrerPolicy='no-referrer';
         const fallback=document.createElement('span');fallback.textContent='사진을 불러올 수 없습니다. 눌러서 다시 시도';fallback.hidden=true;
-        image.addEventListener('error',()=>{image.hidden=true;fallback.hidden=false;button.setAttribute('aria-label','사진 다시 불러오기');});
-        image.addEventListener('load',()=>{image.hidden=false;fallback.hidden=true;button.setAttribute('aria-label','사진 크게 보기');});
         button.addEventListener('click',()=>{
           const current=messageForItem(item,item.dataset.room),src=button.dataset.photoSrc;
           if(!current?.photos?.some(row=>row.src===src))return;
-          if(fallback.hidden){cancelPhotoDownload();el('photo-error').hidden=true;el('photo-full').src=src;el('photo-download').disabled=false;el('photo-dialog').showModal();}
-          else{image.hidden=false;fallback.hidden=true;image.src=src;}
+          if(fallback.hidden){cancelPhotoDownload();el('photo-error').hidden=true;photoLoader.remove(el('photo-full'));el('photo-download').disabled=true;el('photo-dialog').showModal();loadFullPhoto(src);}
+          else{photoLoader.remove(image);image.hidden=false;fallback.hidden=true;loadMessagePhoto(button,src);}
         });
-        button.append(image,fallback);image.src=photo.src;
+        button.append(image,fallback);
       }
       const image=button.querySelector('img');image.alt=message.mine?'보낸 사진':'받은 사진';
       if(photo.width && photo.height){image.width=photo.width;image.height=photo.height;}else{image.removeAttribute('width');image.removeAttribute('height');}
+      loadMessagePhoto(button,photo.src);
       buttons.push(button);
     }
     reconcileChildren(gallery,buttons);nodes.push(gallery);
@@ -702,6 +718,14 @@ function updateMessageItem(item,message){
     const unread=item.querySelector(':scope > .message-read') || document.createElement('span');unread.className='message-read';unread.textContent=String(message.unreadCount);unread.setAttribute('aria-label',`읽지 않은 사람 ${message.unreadCount}명`);nodes.push(unread);
   }
   reconcileChildren(item,nodes);
+}
+function loadMessagePhoto(button,src){
+  const image=button.querySelector('img'),fallback=button.querySelector('span');
+  if(!photoModuleReady){image.hidden=true;fallback.hidden=false;fallback.textContent='사진 표시 업데이트가 필요합니다';button.disabled=true;return;}
+  photoLoader.image(image,src,{target:button,
+    onError:()=>{image.hidden=true;fallback.hidden=false;button.setAttribute('aria-label','사진 다시 불러오기');},
+    onLoad:()=>{image.hidden=false;fallback.hidden=true;button.setAttribute('aria-label','사진 크게 보기');},
+  });
 }
 async function refreshMessages(key,generation){
   const stamp=requestStamp(),request=++messageRequestId,revision=pageRevisionFor(lastState?.reader,key);
@@ -842,6 +866,7 @@ async function refreshReader(state){
   if(preferenceReady()){pinnedRooms.clear();for(const row of [...roomsCache].filter(row=>Number.isInteger(row.pinOrder)).sort((a,b)=>a.pinOrder-b.pinOrder))pinnedRooms.add(row.key);}
   if(state.reader.phase==='connected' && reconnectRoom && !roomsCache.some(room=>room.key===reconnectRoom))reconnectRoom=null;
   if(!roomsCache.some(room=>room.key===selectedRoom)){
+    clearIncomingPhotos();
     const restore=state.reader.phase==='connected' && roomsCache.some(room=>room.key===reconnectRoom)?reconnectRoom:null;
     selectedRoom=restore || roomsCache[0]?.key || null;userSelected=false;currentPage=null;el('compose-text').value=drafts.get(selectedRoom) || '';renderedMessages=null;renderedMessageRoom=null;el('message-list').replaceChildren();el('history-note').textContent='메시지 표시를 준비하고 있습니다.';
     // Keep the explicitly opened room as the target across repeated reconnects.
@@ -1105,7 +1130,17 @@ function cancelPhotoDownload(){
   photoDownloadEpoch++;const previous=photoDownload;photoDownload=null;previous?.controller.abort();
   el('photo-download').textContent='다운로드';
 }
-el('photo-dialog').addEventListener('close',()=>{cancelPhotoDownload();el('photo-full').removeAttribute('src');el('photo-download').disabled=true;});
+function clearIncomingPhotos(){
+  cancelPhotoDownload();if(el('photo-dialog').open)el('photo-dialog').close();
+  photoLoader.clear();renderedMessages=null;
+}
+function loadFullPhoto(src){
+  photoLoader.image(el('photo-full'),src,{eager:true,
+    onLoad:()=>{el('photo-download').disabled=false;},
+    onError:()=>{el('photo-error').textContent='사진을 불러오지 못했습니다. 만료됐거나 지원하지 않는 형식일 수 있습니다.';el('photo-error').hidden=false;el('photo-download').disabled=true;},
+  });
+}
+el('photo-dialog').addEventListener('close',()=>{cancelPhotoDownload();photoLoader.remove(el('photo-full'));el('photo-download').disabled=true;});
 // Download only on explicit click; the photo is fetched from the same local URL and never stored by the page.
 el('photo-download').addEventListener('click',async()=>{
   const src=el('photo-full').getAttribute('src'),button=el('photo-download');
@@ -1116,28 +1151,29 @@ el('photo-download').addEventListener('click',async()=>{
   button.disabled=true;button.textContent='받는 중…';
   try{
     const headers=localSession?{'X-Local-Session':localSession}:{};
-    const response=await fetch(src,{cache:'no-store',headers,signal:download.controller.signal});
+    const blob=await photoLoader.run(async signal=>{
+      const response=await fetch(src,{cache:'no-store',headers,signal});
+      if(!response.ok)throw new Error('photo_download_failed');
+      return response.blob();
+    },{signal:download.controller.signal});
     if(!current() || download.controller.signal.aborted)return;
-    if(!response.ok)throw new Error('photo_download_failed');
-    const blob=await response.blob();if(!current() || download.controller.signal.aborted)return;
     const ext={'image/jpeg':'jpg','image/png':'png','image/webp':'webp','image/gif':'gif'}[blob.type] ?? 'jpg';
     const stamp=new Date().toISOString().replace(/[-:]/g,'').replace('T','-').slice(0,15);
     const url=URL.createObjectURL(blob),link=document.createElement('a');
     link.href=url;link.download=`kakao-photo-${stamp}.${ext}`;document.body.append(link);link.click();link.remove();
     setTimeout(()=>URL.revokeObjectURL(url),10000);
-  }catch{if(current()){el('photo-error').textContent='사진을 받지 못했습니다. 잠시 후 다시 시도해 주세요.';el('photo-error').hidden=false;}}
+  }catch{if(current()){el('photo-error').textContent=photoModuleReady?'사진을 받지 못했습니다. 잠시 후 다시 시도해 주세요.':photoModuleUpdateNote;el('photo-error').hidden=false;}}
   finally{clearTimeout(timeout);const visible=current();if(photoDownload===download)photoDownload=null;if(visible){button.textContent='다운로드';button.disabled=false;}}
 });
 for(const dialog of document.querySelectorAll('dialog'))dialog.addEventListener('close',()=>requestAnimationFrame(()=>void maybeSeen()));
-el('photo-full').addEventListener('error',()=>{el('photo-error').textContent='사진을 불러오지 못했습니다. 만료됐거나 지원하지 않는 형식일 수 있습니다.';el('photo-error').hidden=false;el('photo-download').disabled=true;});
 el('new-messages').addEventListener('click',()=>{const scroll=document.querySelector('.chat-scroll');scroll.scrollTop=scroll.scrollHeight;requestAnimationFrame(()=>void maybeSeen());});
 document.querySelector('.chat-scroll').addEventListener('scroll',()=>{closeMessageMenu();renderComposer();void maybeSeen();},{passive:true});
 window.addEventListener('blur',()=>{foregroundFocused=false;invalidateViewPin();});
 window.addEventListener('focus',()=>{if(!foregroundFocused)invalidateViewPin();foregroundFocused=true;queueRefresh();});
 window.addEventListener('online',()=>{clearTimeout(presenceRetryTimer);presenceRetryTimer=null;ensureTabPresence();queueRefresh(true);});
 window.addEventListener('offline',()=>{resumeEpoch++;userSelected=false;unavailable();refreshPending=true;scheduleQueuedRefresh();});
-window.addEventListener('pagehide',()=>{presencePageActive=false;stopTabPresence();});
-window.addEventListener('pageshow',event=>{presencePageActive=true;ensureTabPresence();queueRefresh(event.persisted===true);});
+window.addEventListener('pagehide',()=>{presencePageActive=false;clearIncomingPhotos();photoLoader.setActive(false);stopTabPresence();});
+window.addEventListener('pageshow',event=>{presencePageActive=true;photoLoader.setActive(hasAccount && lastState?.reader?.phase==='connected' && !localAuthorizationRequired);ensureTabPresence();queueRefresh(event.persisted===true);});
 document.addEventListener('keydown',event=>{if(event.key==='Escape' && messageMenuTarget){event.preventDefault();closeMessageMenu(el('message-menu').contains(document.activeElement));}else if(event.key==='Escape' && !el('room-actions-menu').hidden){event.preventDefault();closeRoomActions(true);}else if(event.key==='Escape' && !el('account-panel').hidden){showAccount(false);el('account-toggle').focus();}});
 function scheduleRefresh(){
   clearTimeout(pollTimer);
