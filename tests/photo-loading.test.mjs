@@ -15,15 +15,15 @@ class Image extends EventTarget{
   addEventListener(name,fn,options){super.addEventListener(name,fn,options);this.listeners.set(name,fn);}
   removeEventListener(name,fn){super.removeEventListener(name,fn);if(this.listeners.get(name)===fn)this.listeners.delete(name);}
 }
-function fixture({locks,clock}={}){
+function fixture({locks,clock,cancelRequest,onTransportError,trackRequests}={}){
   let observer;const observers=[];
   class Observer{constructor(callback){this.callback=callback;this.targets=new Set();this.disconnects=0;observer=this;observers.push(this);}observe(target){this.targets.add(target);}unobserve(target){this.targets.delete(target);}disconnect(){this.targets.clear();this.disconnects++;}show(...targets){this.callback(targets.map(target=>({target,isIntersecting:true})));}hide(target){this.callback([{target,isIntersecting:false}]);}}
-  const context=vm.createContext({AbortController,DOMException,IntersectionObserver:Observer,navigator:{locks},queueMicrotask,setTimeout:clock?.setTimeout || setTimeout,clearTimeout:clock?.clearTimeout || clearTimeout});vm.runInContext(source,context);
-  const loader=context.createPhotoLoader({root:{}});return {loader,observer,observers,images:Array.from({length:5},()=>new Image())};
+  const context=vm.createContext({AbortController,DOMException,crypto:globalThis.crypto,IntersectionObserver:Observer,navigator:{locks},queueMicrotask,setTimeout:clock?.setTimeout || setTimeout,clearTimeout:clock?.clearTimeout || clearTimeout});vm.runInContext(source,context);
+  const loader=context.createPhotoLoader({root:{},cancelRequest,onTransportError,trackRequests});return {loader,observer,observers,images:Array.from({length:5},()=>new Image())};
 }
 const settle=async()=>{for(let n=0;n<5;n++)await Promise.resolve();};
 const deferred=()=>{let resolve;const promise=new Promise(accept=>resolve=accept);return {promise,resolve};};
-const until=async condition=>{const end=Date.now()+1000;while(!condition()){if(Date.now()>end)throw new Error('controlled lock fixture deadline');await delay(1);}};
+const until=async condition=>{const end=Date.now()+1000;while(!await condition()){if(Date.now()>end)throw new Error('controlled lock fixture deadline');await delay(1);}};
 
 test('viewport-gated images use only two slots and release on both load and error',()=>{
   const {loader,observer,images}=fixture();images.forEach((image,n)=>loader.image(image,src(n)));
@@ -103,4 +103,101 @@ test('image deadline releases a shared lock and a late old load cannot release i
     assert.ok(timers.size>0,'active images need a bounded deadline');timers.values().next().value();await until(()=>second.images[0].src);assert.equal(errors,1);assert.equal(first.images[0].src,undefined);
     late();await delay(5);assert.equal(second.images[1].src,undefined);assert.equal(second.images[2].src,undefined);
   }finally{first.loader.clear();second.loader.clear();}
+});
+test('visibility remains observed while a cross-tab lock is pending',async()=>{
+  const locks=[];
+  const f=fixture({locks:{request:(_name,_options,callback)=>new Promise(resolve=>locks.push(()=>resolve(callback())))}});
+  try{
+    f.loader.image(f.images[0],src(0));f.observer.show(f.images[0]);
+    assert.ok(f.observer.targets.has(f.images[0]),'lock wait must retain visibility observation');
+    f.observer.hide(f.images[0]);locks[0]();await settle();
+    assert.equal(f.images[0].src,undefined,'a hidden lock waiter cannot start HTTP after acquisition');
+    f.observer.show(f.images[0]);locks[1]();await settle();assert.ok(f.images[0].src);
+  }finally{f.loader.clear();}
+});
+test('a canceled tab keeps its origin locks until the server acknowledges HTTP close',async()=>{
+  const acknowledgments=[],cancelRequest=value=>{const gate=deferred();acknowledgments.push({...value,...gate});return gate.promise;};
+  const first=fixture({locks:navigator.locks,cancelRequest}),second=fixture({locks:navigator.locks,cancelRequest:async()=>true});
+  try{
+    first.images.slice(0,2).forEach((image,n)=>first.loader.image(image,src(n),{eager:true}));await until(()=>first.images[1].src);
+    assert.match(first.images[0].src,/&request=[a-f0-9]{32}$/);
+    second.images.slice(0,2).forEach((image,n)=>second.loader.image(image,src(n+10),{eager:true}));
+    first.loader.clear();await settle();assert.equal(acknowledgments.length,2);assert.ok(second.images.every(image=>!image.src));
+    for(const row of acknowledgments){assert.match(row.requestId,/^[a-f0-9]{32}$/);assert.ok(!row.src.includes('&request='));row.resolve(true);}
+    await until(()=>second.images[1].src);
+  }finally{for(const row of acknowledgments)row.resolve(true);first.loader.clear();second.loader.clear();await settle();}
+});
+test('explicit download cancellation uses its own HTTP request id and waits for close acknowledgment',async()=>{
+  const ack=deferred(),operation=deferred();let metadata,requestSrc;
+  const f=fixture({locks:navigator.locks,cancelRequest:row=>{metadata=row;return ack.promise;}}),controller=new AbortController();
+  try{
+    const run=f.loader.run((_signal,value)=>{requestSrc=value;return operation.promise;},{signal:controller.signal,src:src(0)});run.catch(()=>{});
+    await until(()=>requestSrc);controller.abort();await assert.rejects(run,{name:'AbortError'});await settle();
+    assert.equal(requestSrc,src(0)+'&request='+metadata.requestId);
+    assert.ok((await navigator.locks.query()).held.some(row=>row.name.startsWith('web-kakao-photo-')));
+    ack.resolve({canceled:true});operation.resolve('ignored');await settle();
+  }finally{ack.resolve(true);operation.resolve('ignored');f.loader.clear();await settle();}
+});
+test('an unconfirmed cancellation pauses that generation and retires its lock within a finite bound',async()=>{
+  const timers=new Map();let next=0,errors=0;
+  const clock={setTimeout:(callback,ms)=>{timers.set(++next,{callback,ms});return next;},clearTimeout:id=>timers.delete(id)};
+  const f=fixture({locks:navigator.locks,clock,cancelRequest:async()=>false,onTransportError:()=>errors++});
+  try{
+    f.loader.image(f.images[0],src(0),{eager:true});await until(()=>f.images[0].src);f.loader.remove(f.images[0]);await settle();
+    assert.equal(errors,1);f.loader.image(f.images[1],src(1),{eager:true});await settle();assert.equal(f.images[1].src,undefined);
+    const retirement=[...timers.values()].find(row=>row.ms>2000);assert.ok(retirement && retirement.ms<=30000);retirement.callback();
+    await until(async()=>!(await navigator.locks.query()).held.some(row=>row.name.startsWith('web-kakao-photo-')));
+  }finally{for(const row of timers.values())row.callback();f.loader.clear();await settle();}
+});
+test('a running older server keeps legacy photo URLs and cancellation behavior until it advertises support',async()=>{
+  let advertised=false,cancels=0;
+  const f=fixture({cancelRequest:async()=>{cancels++;return true;},trackRequests:()=>advertised});
+  try{
+    f.loader.image(f.images[0],src(0));advertised=true;f.observer.show(f.images[0]);
+    assert.equal(f.images[0].src,src(0),'support is captured when the job is created, not at a later lock grant');
+    f.loader.remove(f.images[0]);await settle();assert.equal(cancels,0);
+    advertised=false;let legacySrc;assert.equal(await f.loader.run((_signal,url)=>{legacySrc=url;return 'synthetic';},{src:src(1)}),'synthetic');assert.equal(legacySrc,src(1));
+  }finally{f.loader.clear();await settle();}
+});
+test('clearing already loaded photos does not send unnecessary cancellation controls',async()=>{
+  let cancels=0;const f=fixture({cancelRequest:async()=>{cancels++;return true;}});
+  f.loader.image(f.images[0],src(0),{eager:true});f.images[0].dispatchEvent(new Event('load'));f.loader.clear();await settle();assert.equal(cancels,0);
+});
+test('a throwing transport-error callback cannot prevent bounded retirement',async()=>{
+  const timers=new Map();let next=0;
+  const clock={setTimeout:(callback,ms)=>{timers.set(++next,{callback,ms});return next;},clearTimeout:id=>timers.delete(id)};
+  const f=fixture({clock,cancelRequest:async()=>false,onTransportError:()=>{throw new Error('synthetic_callback_failure');}});
+  try{
+    f.loader.image(f.images[0],src(0),{eager:true});f.loader.remove(f.images[0]);await settle();
+    assert.ok([...timers.values()].some(row=>row.ms>2000 && row.ms<=30000),'retirement must be scheduled even when the notification callback throws');
+  }finally{for(const row of timers.values())row.callback();f.loader.clear();await settle();}
+});
+test('without Web Locks, an HTTP cancellation keeps its local slot until the acknowledgment',async()=>{
+  const ack=deferred(),f=fixture({cancelRequest:()=>ack.promise});
+  try{
+    f.images.slice(0,3).forEach((image,n)=>f.loader.image(image,src(n),{eager:true}));
+    assert.equal(f.images[2].src,undefined);f.loader.remove(f.images[0]);await settle();
+    assert.equal(f.images[2].src,undefined,'one active response plus one retiring response still occupy both local slots');
+    ack.resolve(true);await until(()=>f.images[2].src);
+  }finally{ack.resolve(true);f.loader.clear();await settle();}
+});
+test('without Web Locks, clear retains canceled HTTP reservations across the new generation',async()=>{
+  const ack=deferred(),f=fixture({cancelRequest:()=>ack.promise});
+  try{
+    f.images.slice(0,2).forEach((image,n)=>f.loader.image(image,src(n),{eager:true}));f.loader.clear();
+    f.images.slice(2,4).forEach((image,n)=>f.loader.image(image,src(n+2),{eager:true}));await settle();
+    assert.ok(f.images.slice(2,4).every(image=>!image.src),'new generation cannot reuse old responses before they close');
+    ack.resolve(true);await until(()=>f.images.slice(2,4).every(image=>image.src));
+  }finally{ack.resolve(true);f.loader.clear();await settle();}
+});
+test('a late old-generation cancellation failure cannot resume a newer failed generation',async()=>{
+  const ackA=deferred(),ackB=deferred(),timers=new Map();let next=0,errors=0;
+  const clock={setTimeout:(callback,ms)=>{timers.set(++next,{callback,ms});return next;},clearTimeout:id=>timers.delete(id)};
+  const f=fixture({clock,cancelRequest:row=>row.src===src(0)?ackA.promise:ackB.promise,onTransportError:()=>errors++});
+  try{
+    f.loader.image(f.images[0],src(0),{eager:true});f.loader.clear();
+    f.loader.image(f.images[1],src(1),{eager:true});f.loader.remove(f.images[1]);await settle();
+    ackB.resolve(false);await until(()=>errors===1);ackA.resolve(false);await until(()=>errors===2);
+    f.loader.image(f.images[2],src(2),{eager:true});await settle();assert.equal(f.images[2].src,undefined,'old epoch must not overwrite the current epoch failure watermark');
+  }finally{ackA.resolve(true);ackB.resolve(true);for(const row of timers.values())row.callback();f.loader.clear();await settle();}
 });

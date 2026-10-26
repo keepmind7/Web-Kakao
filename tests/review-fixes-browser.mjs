@@ -61,7 +61,7 @@ try{
   await check('R2 delayed old blob never mutates a replacement photo dialog',async()=>{await photoGate();await evaluate("el('photo-close').click()");await sleep(30);await evaluate("document.querySelectorAll('.photo-open')[1].click()");
     // The new dialog's own image load legitimately enables its download button.
     // Observe that completion before testing the unrelated old blob callback.
-    await until("el('photo-dialog').open && el('photo-full').getAttribute('src')===document.querySelectorAll('.photo-open')[1].dataset.photoSrc && el('photo-full').complete && el('photo-full').naturalWidth>0 && !el('photo-download').disabled");
+    await until("el('photo-dialog').open && el('photo-full').getAttribute('src')?.replace(/&request=[a-f0-9]{32}$/,'')===document.querySelectorAll('.photo-open')[1].dataset.photoSrc && el('photo-full').complete && el('photo-full').naturalWidth>0 && !el('photo-download').disabled");
     await evaluate("el('photo-download').textContent='NEW DIALOG';el('photo-download').disabled=true");const r=await completeGate();assert.equal(r.saves,0);assert.equal(r.aborted,true);assert.equal(r.button,'NEW DIALOG');assert.equal(r.disabled,true);await evaluate("el('photo-close').click()");return r;});
   await check('R2 delayed blob after account generation change is aborted and never saved',async()=>{await photoGate();instance='b'.repeat(24);await refresh();const r=await completeGate();assert.equal(r.saves,0);assert.equal(r.aborted,true);assert.equal(r.open,false);return r;});
   await openApp();await evaluate('showAccount(true)');

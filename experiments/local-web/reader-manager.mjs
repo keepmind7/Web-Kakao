@@ -139,14 +139,15 @@ export function createReadOnlyReader({spawn=fork,now=Date.now,onBlocked=()=>{},g
       const owner=profile;if(!owner)return false;
       return preferenceResult(owner,owner.forget({isCurrent:()=>profile===owner}),()=>{for(const row of rooms)roomState.settings(row.key,{title:null,pinOrder:null,muted:false});roomState.notifications(false);settingsRevision++;roomsRevision++;revision++;return true;});
     },
-    roomPreferences(key,patch){
-      if(!rooms.some(row=>row.key===key) || !validRoomSettings(patch))return false;
-      const id=preferenceKeys.get(key),owner=profile,isCurrent=()=>profile===owner && rooms.some(row=>row.key===key);
+    roomPreferences(key,patch,{isCurrent:requestCurrent=()=>true}={}){
+      if(typeof requestCurrent!=='function' || !rooms.some(row=>row.key===key) || !validRoomSettings(patch))return false;
+      const id=preferenceKeys.get(key),owner=profile,isCurrent=()=>profile===owner && rooms.some(row=>row.key===key) && requestCurrent();
+      if(!isCurrent())return false;
       const apply=()=>{if(!isCurrent())return false;roomState.settings(key,{...patch,...(typeof patch.title==='string'?{title:patch.title.trim()}:{})});settingsRevision++;roomsRevision++;revision++;return true;};
       return id && owner?preferenceResult(owner,owner.setRoom(id,patch,{isCurrent}),apply):apply();
     },
     claimNotifications(){return profile?.snapshot().notifications?roomState.claim():[];},
-    rename(key,value){return this.roomPreferences(key,{title:value});},
+    rename(key,value,options){return this.roomPreferences(key,{title:value},options);},
     contextRetryAfterMs,
     openRoom(key){
       if(!messaging || phase!=='connected' || !rooms.some(row=>row.key===key && row.canContext))return false;
@@ -216,7 +217,19 @@ export function createReadOnlyReader({spawn=fork,now=Date.now,onBlocked=()=>{},g
           else if(message?.type==='reader-failed')fail(['booking','getconf','checkin','loginlist','history','ping','push','transport','decode','disconnected','worker','send','photo','context','read','discovery'].includes(message.stage)?message.stage:'worker',message.status);
           else if(message?.type==='reader-rooms' && ['loginlist','push'].includes(message.source)){
             const nextRooms=safeRooms(message.rooms);
-            for(const room of rooms)if(!nextRooms.some(next=>next.key===room.key && next.canContext)){entries.delete(room.key);contexts.delete(room.key);readMarks.delete(room.key);touch(room.key);}
+            const nextByKey=new Map(nextRooms.map(room=>[room.key,room]));
+            for(const key of preferenceKeys.keys())if(!nextByKey.has(key))preferenceKeys.delete(key);
+            for(const room of rooms){
+              if(!nextByKey.get(room.key)?.canContext){entries.delete(room.key);contexts.delete(room.key);readMarks.delete(room.key);touch(room.key);}
+              if(!nextByKey.has(room.key)){
+                for(const cache of [pages,readStates,viewTokens,cacheLost,cacheEpochs,pageRevisions,preferenceKeys])cache.delete(room.key);
+                if(pinned===room.key)pinned=null;if(activeRoom===room.key)activeRoom=null;
+                if(pending?.key===room.key){
+                  pending.invalidated=true;
+                  if(pending.action==='history'){clearTimeout(deadline);deadline=null;pending=null;}
+                }
+              }
+            }
             if(JSON.stringify(nextRooms)!==JSON.stringify(rooms))roomsRevision++;
             rooms=nextRooms;sourceRoomCount=integer(message.stats?.sourceRoomCount);truncated=message.stats?.truncated===true;duplicates=integer(message.stats?.duplicates);
             if(phase==='connecting' && message.source==='loginlist'){roomState.bind(rooms,{reconnect:attempts>1,seedBounds:message.seedBounds,generation:attempts});clearTimeout(deadline);deadline=null;phase='connected';stage='loginlist';status=0;consecutiveFailures=0;connectedAt=now();lifecycle.record(lifecycleAttempt,'connected');}

@@ -1,6 +1,7 @@
 import { allowedReaderMethod } from './reader-session.mjs';
 import { normalizedResponse } from './reader-response.mjs';
 import { serverId } from './reader-data.mjs';
+import { Socket } from 'node:net';
 
 const WRITE_RESPONSE_LIMIT=2048;
 const ROOM_RESPONSES=new Set(['CHATONROOM','CHATINFO','NOTIREAD']);
@@ -45,6 +46,37 @@ export function guardReaderClient(Client,diagnostic,{messaging=false,media=false
     expiredOptional=new Set();
     cancelledWrites=new Set();
     writeCancellationObserved=false;
+    connecting=null;
+    readerSocket=null;
+    connect(host,port,timeoutMs=10000){
+      // The pinned Carriage/Ticket SDK leaves its connect promise and private
+      // timer pending after an early socket error/close. Own that exact public
+      // SDK socket/crypto contract here instead of racing its destructive timer.
+      // Booking's TLS connect already rejects on error and retains its TLS path.
+      if(typeof this.crypto?.buildHandshake!=='function' || typeof this.onData!=='function' || typeof this.stopPing!=='function' || typeof this.rejectAll!=='function')return super.connect(host,port,timeoutMs);
+      if(!Number.isFinite(timeoutMs) || timeoutMs<=0 || timeoutMs>2147483647)return Promise.reject(new Error('connection_timeout_invalid'));
+      if(this.connecting || this.socket && !this.socket.destroyed)return Promise.reject(new Error('connection_already_active'));
+      return new Promise((resolve,reject)=>{
+        const socket=new Socket();this.socket=socket;this.readerSocket=socket;let done=false,timer;
+        const finish=error=>{
+          if(done)return;done=true;clearTimeout(timer);if(this.connecting===cancel)this.connecting=null;
+          if(error){socket.destroy();reject(error);}else resolve();
+        };
+        const cancel=()=>finish(new Error('Carriage disconnected'));this.connecting=cancel;
+        socket.setNoDelay(true);socket.setKeepAlive(true,30000);
+        socket.on('data',data=>{if(this.readerSocket===socket)this.onData(data);});
+        socket.on('error',error=>{finish(error);if(this.readerSocket===socket)this.emit('error',error);});
+        socket.on('close',()=>{
+          finish(new Error('Carriage disconnected'));
+          if(this.readerSocket===socket){this.readerSocket=null;this.stopPing();this.rejectAll(new Error('Carriage disconnected'));this.emit('disconnected');}
+        });
+        timer=setTimeout(()=>finish(new Error('Carriage connection timed out')),timeoutMs);
+        try{socket.connect(port,host,()=>{
+          try{socket.write(this.crypto.buildHandshake(),error=>finish(error));}catch(error){finish(error);}
+        });}catch(error){finish(error);}
+      });
+    }
+    disconnect(){this.connecting?.();return super.disconnect();}
     async request(method,body={},timeoutMs=10000,policy={}){
       const optional=policy?.optional===true,recoverable=policy?.recoverable===true;
       if(recoverable && (!RECOVERABLE_METHODS.has(method) || !Number.isFinite(timeoutMs) || timeoutMs<=0 || timeoutMs>2147483647))throw new Error('recoverable_policy_forbidden');

@@ -234,14 +234,38 @@ test('history begins another required page only with at least10250ms remaining',
   }
 });
 
-test('history budget includes waiting metadata and forbids even its first page below the margin',async()=>{
+test('foreground history does not wait for an unrelated optional title lookup',async()=>{
   const held=deferred(),clock={value:0};const f=sessionFixture({clock,source:[{c:'123',t:'DirectChat',ll:'100'}],reply:method=>method==='CHATINFO'?held.promise:undefined});
   try{
     const key=await f.start();await until(()=>f.calls.some(call=>call.method==='CHATINFO'));
-    const waiting=f.session.history(key,1);await sleep(0);clock.value=8000;held.resolve({status:0,body:{chatInfo:{c:'123',title:'Synthetic recovered'}}});await waiting;
-    assert.equal(f.calls.filter(call=>call.method==='SYNCMSG').length,0,'18000ms includes metadata wait, leaving only10000ms');
-    const page=f.events.findLast(event=>event.source==='history');assert.equal(page.hasMore,true);assert.equal(page.latestVisible,false);
+    const waiting=f.session.history(key,1);await sleep(0);
+    assert.equal(f.calls.filter(call=>call.method==='SYNCMSG').length,1,'current room history starts while metadata remains pending');
+    held.resolve({status:0,body:{chatInfo:{c:'123',title:'Synthetic recovered'}}});await waiting;
+    assert.equal(f.events.some(event=>event.type==='reader-failed'),false);
   }finally{held.resolve({status:0,body:{}});f.session.close();}
+});
+
+for(const operation of ['history','send'])test('foreground '+operation+' starts while unknown-room metadata is pending',async()=>{
+  const held=deferred(),f=sessionFixture({reply:method=>method==='CHATINFO'?held.promise:undefined});
+  try{
+    const key=await f.start();
+    f.carriage.emit('push',{method:'MSG',status:0,body:{chatId:'321',chatLog:{logId:'3',authorId:'111',type:1,msg:'Synthetic unknown room'}}});
+    await until(()=>f.calls.some(call=>call.method==='CHATINFO' && String(call.body.chatId)==='321'));
+    const waiting=operation==='history'?f.session.history(key,1):f.session.action(key,1,'send',{text:'Synthetic foreground'});
+    await sleep(0);
+    assert.equal(f.calls.filter(call=>call.method===(operation==='history'?'SYNCMSG':'WRITE')).length,1);
+    assert.equal(await waiting,true);assert.equal(f.events.some(event=>event.type==='reader-failed'),false);
+  }finally{held.resolve({status:0,body:{chatInfo:{c:'321',t:'DirectChat',title:'Synthetic discovered'}}});f.session.close();}
+});
+
+test('foreground send starts while a background title request is pending',async()=>{
+  const held=deferred(),f=sessionFixture({source:[{c:'123',t:'DirectChat',ll:'100'}],reply:method=>method==='CHATINFO'?held.promise:undefined});
+  try{
+    const key=await f.start();await until(()=>f.calls.some(call=>call.method==='CHATINFO'));
+    const waiting=f.session.action(key,1,'send',{text:'Synthetic foreground'});await sleep(0);
+    assert.equal(f.calls.filter(call=>call.method==='WRITE').length,1);assert.equal(await waiting,true);
+    assert.equal(f.events.some(event=>event.type==='reader-failed'),false);
+  }finally{held.resolve({status:0,body:{chatInfo:{c:'123',title:'Synthetic recovered'}}});f.session.close();}
 });
 
 test('gap probe is deferred when a successful first page leaves insufficient history budget',async()=>{

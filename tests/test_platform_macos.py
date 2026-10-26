@@ -25,7 +25,11 @@ class MacosContracts(unittest.TestCase):
         return patch.object(macos.subprocess, "run", return_value=result)
 
     def test_listener_owners_parses_pids_and_refuses_foreign_uid(self):
-        uid = os.getuid()
+        uid = 501
+        # This contract mocks macOS lsof on every host, including Windows.
+        uid_patch = patch.object(macos.os, "getuid", return_value=uid, create=True)
+        uid_patch.start()
+        self.addCleanup(uid_patch.stop)
         with self.lsof(f"p123\nu{uid}\nf5\n".encode()):
             self.assertEqual(macos.listener_owners(8787), {123})
         with self.lsof(f"p123\nu{uid + 1}\n".encode()), self.assertRaises(OSError):

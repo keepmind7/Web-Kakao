@@ -5,7 +5,7 @@ let csrf = null, busy = false, expiresAt = null;
 let refreshing=false,hasAccount=false,readerGeneration=0,readerRevision=-1,selectedRoom=null,roomsCache=[],lastState=null,actionEpoch=0,readerAttempt=null;
 let pendingSelection=null,selectionView=null,reconnectRoom=null,readerInstance=null;
 let roomsRevision=-1,outboxRevision=-1,outboxEpoch=0,viewPin=null,viewPinEpoch=0,outboxAcknowledging=false,acknowledgingClientId=null;
-const viewClientId=crypto.randomUUID();let viewSequence=0,viewPinPending=null;
+const viewClientId=crypto.randomUUID();let viewSequence=0,viewPinPending=null,roomPreferenceSequence=0;
 let localAuthorizationRequired=false,foregroundFocused=document.hasFocus();
 // Port-scoped session from the launch ticket exchange; sessionStorage only survives reload in this tab.
 let localSession=null;try{const saved=sessionStorage.getItem('webKakaoLocalSession');if(/^[a-f0-9]{64}$/.test(saved ?? ''))localSession=saved;}catch{}
@@ -15,7 +15,12 @@ const photoModuleReady=typeof globalThis.createPhotoLoader==='function';
 const photoModuleUpdateNote='사진 표시 모듈 업데이트를 위해 로컬 서버를 재시작해 주세요. 대화와 로컬 세션 지우기는 계속 사용할 수 있습니다.';
 // A running older server can serve new app.js but not the new static module.
 // Keep account controls usable while refusing photo HTTP until it is restarted.
-const photoLoader=photoModuleReady?createPhotoLoader({root:document.querySelector('.chat-scroll')}):{
+const photoLoader=photoModuleReady?createPhotoLoader({root:document.querySelector('.chat-scroll'),cancelRequest:cancelPhotoRequest,trackRequests:()=>lastState?.photoCancellation===true,
+  onTransportError:()=>{
+    if(!hasAccount || !currentPage?.messages?.some(message=>message.photos?.length))return;
+    el('history-note').textContent='사진 연결을 확인하지 못했습니다. 잠시 후 방을 다시 선택해 주세요.';el('history-note').hidden=false;
+  },
+}):{
   image(){},clear(){},remove(){},removeTree(){},setActive(){},
   run(){return Promise.reject(new Error(photoModuleUpdateNote));},
 };
@@ -30,13 +35,14 @@ const drafts=new Map(),sendNotes=new Map();
 const seenDispatches=new Map();
 const pinnedRooms=new Set();
 let roomFilter='all',messageQuery='',searchMatches=[],searchIndex=-1,copyStatusTimer=null;
-let personalSettings=null,settingsRevision=-1,settingsBusy=false,settingsEpoch=0,notificationBusy=false;
+let personalSettings=null,settingsRevision=-1,settingsBusy=false,settingsEpoch=0,notificationBusy=false,readSyncIntent=null;
 const shownNotifications=new Map();
 const replyDrafts=new Map();let imageDraft=null,imagePreparing=false,imageEpoch=0;
 let messageMenuTarget=null,messageMenuTimer=null;
 let freshness='checking',resumeEpoch=0,localFailureVersion=0,messageRequestId=0;
 let refreshPending=false,queuedRefreshTimer=null,pollTimer=null,lastPollAt=Date.now(),wasHidden=document.hidden;
 let presenceController=null,presenceRetryTimer=null,presenceEpoch=0,presencePhase='idle',presencePageActive=true;
+const messageReads=new Set();
 function requestStamp(){return {generation:readerGeneration,action:actionEpoch,resume:resumeEpoch};}
 function stampCurrent(stamp){return stamp.generation===readerGeneration && stamp.action===actionEpoch && stamp.resume===resumeEpoch;}
 function staleResult(){const error=new Error('Stale local response');error.name='StaleLocalResult';return error;}
@@ -59,15 +65,36 @@ function requestDeadline(path){
 async function localRequest(path,options={},bodyType='json',isCurrent=()=>true){
   const stamp=requestStamp(),controller=new AbortController();let timer;
   const instanceId=lastState?.reader?.instanceId,method=(options.method || 'GET').toUpperCase();
+  let read;
+  const canceled=new Promise((_resolve,reject)=>{
+    if(method==='GET' && /^\/api\/reader\/messages(?:\?|$)/.test(path)){
+      read={cancel(){read.canceled=true;controller.abort();reject(staleResult());}};messageReads.add(read);
+    }
+  });
   const headers=new Headers(options.headers);if(localSession)headers.set('X-Local-Session',localSession);
   if(['GET','POST'].includes(method) && /^\/api\/(?:reader|preferences|notifications)(?:[/?]|$)/.test(path) && typeof instanceId==='string' && /^[a-f0-9]{24}$/.test(instanceId))headers.set('X-Reader-Instance',instanceId);
   options={...options,headers};
   // Abort alone does not release a lock when a transport/body reader ignores it.
   // Race covers both response headers and the complete response body.
   const deadline=new Promise((resolve,reject)=>{timer=setTimeout(()=>{const error=new Error('Local request timed out');error.name='TimeoutError';controller.abort();reject(error);},requestDeadline(path));});
-  try{const result=await Promise.race([(async()=>{const response=await fetch(path,{cache:'no-store',...options,signal:controller.signal});const data=bodyType==='text'?await response.text():await response.json();return {response,data};})(),deadline]);if(!stampCurrent(stamp) || !isCurrent())throw staleResult();if(result.response.status===403){const error=new Error('Local browser authorization required');error.name='LocalAuthorizationRequired';throw error;}return result;}
-  catch(error){if(!stampCurrent(stamp) || !isCurrent())throw staleResult();if(error.name==='LocalAuthorizationRequired')requireLocalAuthorization();else if(error.name!=='StaleLocalResult')unavailable();throw error;}
-  finally{clearTimeout(timer);}
+  try{const result=await Promise.race([(async()=>{const response=await fetch(path,{cache:'no-store',...options,signal:controller.signal});const data=bodyType==='text'?await response.text():await response.json();return {response,data};})(),deadline,canceled]);if(!stampCurrent(stamp) || !isCurrent())throw staleResult();if(result.response.status===403){const error=new Error('Local browser authorization required');error.name='LocalAuthorizationRequired';throw error;}return result;}
+  catch(error){if(read?.canceled || !stampCurrent(stamp) || !isCurrent())throw staleResult();if(error.name==='LocalAuthorizationRequired')requireLocalAuthorization();else if(error.name!=='StaleLocalResult')unavailable();throw error;}
+  finally{clearTimeout(timer);if(read)messageReads.delete(read);}
+}
+function cancelMessageReads(){
+  for(const read of messageReads)read.cancel();
+  messageReads.clear();
+}
+async function cancelPhotoRequest({src,requestId}){
+  const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),2000);
+  try{
+    const url=new URL(src,location.origin);
+    if(url.origin!==location.origin || url.pathname!=='/api/photo' || !/^[a-f0-9]{32}$/.test(requestId))return false;
+    const headers={'Content-Type':'application/json','X-CSRF-Token':csrf};if(localSession)headers['X-Local-Session']=localSession;
+    const response=await fetch('/api/photo/cancel',{method:'POST',cache:'no-store',credentials:'omit',redirect:'error',headers,
+      body:JSON.stringify({room:url.searchParams.get('room'),message:url.searchParams.get('message'),index:Number(url.searchParams.get('index')),requestId}),signal:controller.signal});
+    return response.ok && (await response.json()).canceled===true;
+  }catch{return false;}finally{clearTimeout(timer);}
 }
 function tabGraceLabel(){
   const ms=lastState?.tabPresence?.graceMs;
@@ -349,7 +376,7 @@ async function maybeSeen(){
   // A gap in older history does not undo seeing the latest message. The server
   // acknowledgement, rather than HTTP queue acceptance, determines completion.
   const submitted=page.readSync?.messageKey===lastMessage && ['sending','accepted','unknown','failed'].includes(page.readSync.phase);
-  const notify=lastState.messaging===true && roomCan('read',room) && el('read-sync').checked && !submitted;
+  const notify=lastState.messaging===true && roomCan('read',room) && el('read-sync').checked && readSyncIntent===null && !submitted;
   if(!notify && !room?.unreadLocalCount)return;
   const key=selectedRoom,stamp=requestStamp(),view=[readerGeneration,key,page.seenToken,lastMessage].join(':');
   const dispatched=seenDispatches.get(view);
@@ -485,12 +512,13 @@ function render(state) {
   if(state.credentialInMemory && hasAccount && selectedRoom && selectedRoom===reconnectRoom
     && (nextAttempt!==readerAttempt || ['connecting','disconnected'].includes(state.reader?.phase))){reconnectRoom=selectedRoom;drafts.set(selectedRoom,el('compose-text').value);}
   if(accountEnded || (nextAttempt!==null && nextAttempt!==readerAttempt)){
+    cancelMessageReads();
     clearIncomingPhotos();
     closeMessageMenu();
     closeRoomActions();document.querySelector('.app-shell').classList.remove('mobile-chat');
     seenDispatches.clear();contextDispatches.clear();contextRetryAt.clear();pageRevisions.clear();roomsRevision=-1;outboxRevision=-1;invalidateViewPin();
     if(accountEnded)cancelPhotoDownload();
-    if(accountEnded){reconnectRoom=null;renameTarget=null;outboxEpoch++;outboxAcknowledging=false;acknowledgingClientId=null;settingsBusy=false;notificationBusy=false;ackInFlight=false;}
+    if(accountEnded){reconnectRoom=null;renameTarget=null;readSyncIntent=null;outboxEpoch++;outboxAcknowledging=false;acknowledgingClientId=null;settingsBusy=false;notificationBusy=false;ackInFlight=false;}
     if(hasAccount || nextAttempt!==readerAttempt || instanceChanged)readerGeneration++;
     const staleImageRoom=imageDraft?.room || (imagePreparing?selectedRoom:null);
     if(staleImageRoom && state.credentialInMemory)sendNotes.set(staleImageRoom,'연결이 바뀌어 사진 선택을 취소했습니다. ＋에서 다시 선택해 주세요.');
@@ -643,6 +671,7 @@ async function selectRoom(key){
   closeMessageMenu();closeRoomActions();document.querySelector('.app-shell').classList.add('mobile-chat');userSelected=true;showAccount(false);
   const generation=readerGeneration,stamp=requestStamp();
   if(key===selectedRoom && pendingSelection?.key===key)return;
+  cancelMessageReads();
   invalidateViewPin();
   const intent=selectionView={key,generation,attempt:readerAttempt,phase:'waiting',awaitingPage:true};pendingSelection=intent;
   if(selectedRoom)drafts.set(selectedRoom,el('compose-text').value);
@@ -812,27 +841,46 @@ async function refreshSettings(state){
     const data=await localJson('/api/preferences',()=>hasAccount && epoch===settingsEpoch && state===lastState);if(!hasAccount || generation!==readerGeneration || epoch!==settingsEpoch || state!==lastState)return;
     personalSettings=data.settings;settingsRevision=revision;
     if(!personalSettings)return;
-    roomFilter=personalSettings.roomFilter;el('read-sync').checked=personalSettings.readSync;
+    roomFilter=personalSettings.roomFilter;el('read-sync').checked=readSyncIntent?.value ?? personalSettings.readSync;
     el('browser-notifications').checked=personalSettings.notifications;el('persist-preferences').checked=personalSettings.persist;
     el('preferences-status').textContent=personalSettings.storageError?'개인 설정을 읽거나 저장하지 못했습니다.':personalSettings.persist?'이 노트북에 개인 설정을 저장합니다.':'현재 계정 연결 동안 설정을 유지합니다.';
+    if(readSyncIntent?.attempted)el('preferences-status').textContent='읽음 설정의 저장 결과를 확인하지 못했습니다. 이 탭에서는 대화 조회에 따른 읽음 알림을 보류합니다. 다시 선택해 주세요.';
     el('notification-status').textContent=!('Notification' in window) || !('silent' in Notification.prototype)?'이 브라우저는 무음 알림을 지원하지 않습니다.':personalSettings.notifications && Notification.permission!=='granted'?'브라우저 사이트 설정에서 알림을 허용해 주세요.':personalSettings.notifications?'웹이 열려 있는 동안 본문 없이 무음으로 알립니다.':'';
     if(!personalSettings.notifications){for(const notice of shownNotifications.values())notice.close();shownNotifications.clear();}
   }catch(error){if(error.name!=='StaleLocalResult' && hasAccount && generation===readerGeneration && epoch===settingsEpoch)el('preferences-status').textContent='개인 설정을 불러오지 못했습니다.';}
 }
-async function changeSettings(path,body){
+async function changeSettings(path,body,readIntent=null){
   if(!preferenceReady() || settingsBusy)return false;
   const generation=readerGeneration,stamp=requestStamp(),epoch=++settingsEpoch;
   // Reconnect changes readerGeneration but retains this account's pending write.
   // Account replacement advances settingsEpoch; only that owner may unlock it.
   const owns=()=>hasAccount && epoch===settingsEpoch,current=()=>owns() && generation===readerGeneration;
+  if(readIntent)readIntent.attempted=true;
   settingsBusy=true;renderComposer();
   let success=false;
   try{success=await postLocal(path,body);if(!current())return false;if(!success)el('preferences-status').textContent='설정을 저장하지 못했습니다. 다시 확인해 주세요.';}
   catch{if(current() && stampCurrent(stamp))el('preferences-status').textContent='설정을 저장하지 못했습니다. 연결 상태를 확인해 주세요.';}
-  finally{if(owns()){settingsBusy=false;settingsRevision=-1;readerRevision=-1;await refresh();if(owns())renderComposer();}}
+  finally{if(owns()){
+    settingsBusy=false;settingsRevision=-1;readerRevision=-1;
+    if(success && readIntent && readSyncIntent?.value===body.readSync)readSyncIntent=null;
+    // Drain only a newer explicit intent, never retry an uncertain write.
+    // Do this before refresh can expose a superseded ON to maybeSeen().
+    const next=readSyncIntent;
+    if(next && !next.attempted && next!==readIntent && preferenceReady())await changeSettings('/api/preferences',{readSync:next.value},next);
+    else await refresh();
+    if(owns())renderComposer();
+  }}
   return success;
 }
-async function saveSettings(patch){return changeSettings('/api/preferences',patch);}
+async function saveSettings(patch){
+  if(Object.hasOwn(patch,'readSync')){
+    if(!preferenceReady())return false;
+    readSyncIntent={value:patch.readSync};el('read-sync').checked=patch.readSync;
+    if(settingsBusy)return false; // Retained for the current owner's finalizer.
+    return changeSettings('/api/preferences',patch,readSyncIntent);
+  }
+  return changeSettings('/api/preferences',patch);
+}
 async function saveRoomSettings(patch){if(!selectedRoom)return false;return changeSettings('/api/preferences/room',{room:selectedRoom,...patch});}
 async function receiveNotifications(){
   if(notificationBusy || settingsBusy || !hasAccount || !personalSettings?.notifications || !('Notification' in window) || Notification.permission!=='granted' || !('silent' in Notification.prototype))return;
@@ -1103,17 +1151,25 @@ el('rename-room').addEventListener('click',()=>{
   renameTarget={key:room.key,generation:readerGeneration};el('room-title-input').value=room.localTitle || room.title;el('rename-error').textContent='';el('rename-dialog').showModal();el('room-title-input').select();
 });
 async function saveRoomTitle(value){
-  const target=renameTarget;if(!target || !hasAccount || target.generation!==readerGeneration)return;
+  const target=renameTarget;if(!target || target.saving || !hasAccount || target.generation!==readerGeneration || !el('rename-dialog').open)return;
+  const current=()=>hasAccount && target.generation===readerGeneration && renameTarget===target && el('rename-dialog').open;
   if(value!==null && (!value.trim() || [...value.trim()].length>120 || /[\u0000-\u001f\u007f]/u.test(value))){el('rename-error').textContent='이름은 줄바꿈 없이 1~120자로 입력해 주세요.';return;}
+  target.saving=true;
   try{
-    if(!await postLocal('/api/preferences/room',{room:target.key,title:value===null?null:value.trim()})){el('rename-error').textContent='이름을 변경하지 못했습니다.';return;}
-    if(target.generation!==readerGeneration)return;
-    el('rename-dialog').close();readerRevision=-1;await refresh();
-  }catch{if(target.generation===readerGeneration && renameTarget===target)el('rename-error').textContent='로컬 서버 연결을 확인해 주세요.';}
+    const body={room:target.key,title:value===null?null:value.trim()};
+    if(lastState?.roomPreferenceOrdering===true)Object.assign(body,{preferenceClientId:viewClientId,preferenceSequence:++roomPreferenceSequence});
+    const accepted=await postLocal('/api/preferences/room',body);
+    if(!current())return;
+    if(!accepted){el('rename-error').textContent='이름을 변경하지 못했습니다.';return;}
+    renameTarget=null;el('rename-dialog').close();readerRevision=-1;await refresh();
+  }catch{if(current())el('rename-error').textContent='로컬 서버 연결을 확인해 주세요.';}
+  finally{target.saving=false;}
 }
 el('rename-form').addEventListener('submit',event=>{event.preventDefault();void saveRoomTitle(el('room-title-input').value);});
 el('rename-reset').addEventListener('click',()=>void saveRoomTitle(null));
-el('rename-cancel').addEventListener('click',()=>el('rename-dialog').close());
+el('rename-cancel').addEventListener('click',()=>{renameTarget=null;el('rename-dialog').close();});
+el('rename-dialog').addEventListener('cancel',()=>{renameTarget=null;});
+el('rename-dialog').addEventListener('close',()=>{if(!el('rename-dialog').open)renameTarget=null;});
 el('read-sync').addEventListener('change',()=>{if(preferenceReady())void saveSettings({readSync:el('read-sync').checked});else{readerRevision=-1;void refresh();}});
 el('mute-room').addEventListener('click',()=>void saveRoomSettings({muted:!roomNow()?.muted}));
 el('persist-preferences').addEventListener('change',()=>void saveSettings({persist:el('persist-preferences').checked}));
@@ -1143,19 +1199,19 @@ function loadFullPhoto(src){
 el('photo-dialog').addEventListener('close',()=>{cancelPhotoDownload();photoLoader.remove(el('photo-full'));el('photo-download').disabled=true;});
 // Download only on explicit click; the photo is fetched from the same local URL and never stored by the page.
 el('photo-download').addEventListener('click',async()=>{
-  const src=el('photo-full').getAttribute('src'),button=el('photo-download');
+  const displaySrc=el('photo-full').getAttribute('src'),src=displaySrc?.replace(/&request=[a-f0-9]{32}$/,''),button=el('photo-download');
   if(photoDownload || !hasAccount || !el('photo-dialog').open || !src || !/^\/api\/photo\?/.test(src))return;
-  const download={controller:new AbortController(),epoch:photoDownloadEpoch,generation:readerGeneration,src};photoDownload=download;
+  const download={controller:new AbortController(),epoch:photoDownloadEpoch,generation:readerGeneration,src:displaySrc};photoDownload=download;
   const current=()=>photoDownload===download && photoDownloadEpoch===download.epoch && readerGeneration===download.generation && hasAccount && el('photo-dialog').open && el('photo-full').getAttribute('src')===download.src;
   const timeout=setTimeout(()=>download.controller.abort(),30000);
   button.disabled=true;button.textContent='받는 중…';
   try{
     const headers=localSession?{'X-Local-Session':localSession}:{};
-    const blob=await photoLoader.run(async signal=>{
-      const response=await fetch(src,{cache:'no-store',headers,signal});
+    const blob=await photoLoader.run(async(signal,requestSrc)=>{
+      const response=await fetch(requestSrc || src,{cache:'no-store',headers,signal});
       if(!response.ok)throw new Error('photo_download_failed');
       return response.blob();
-    },{signal:download.controller.signal});
+    },{signal:download.controller.signal,src});
     if(!current() || download.controller.signal.aborted)return;
     const ext={'image/jpeg':'jpg','image/png':'png','image/webp':'webp','image/gif':'gif'}[blob.type] ?? 'jpg';
     const stamp=new Date().toISOString().replace(/[-:]/g,'').replace('T','-').slice(0,15);

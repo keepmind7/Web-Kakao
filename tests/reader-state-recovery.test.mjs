@@ -103,7 +103,8 @@ test('membership changes during CHATONROOM cannot restore stale ready state, and
   f.reply=method=>method==='CHATONROOM'?held.promise:undefined;
   const {reader,key}=await managerFixture(f);
   try{
-    reader.openRoom(key);f.carriage.emit('push',{method:'NEWMEM',status:0,body:{c:'123'}});f.carriage.emit('push',{method:'LEFT',status:0,body:{c:'123'}});
+    reader.openRoom(key);await until(()=>f.calls.some(call=>call.method==='CHATONROOM'));
+    f.carriage.emit('push',{method:'NEWMEM',status:0,body:{c:'123'}});f.carriage.emit('push',{method:'LEFT',status:0,body:{c:'123'}});
     held.resolve({status:0,body:{c:'123',mi:['999','111'],a:['111'],w:['0']}});await until(()=>!reader.snapshot().operationBusy);
     assert.equal(reader.messages(key).receiptPhase,'idle');assert.equal(reader.messages(key).messages.at(-1).unreadCount,null);
     f.reply=null;reader.openRoom(key);await until(()=>!reader.snapshot().operationBusy);
@@ -268,7 +269,8 @@ test('link deletion during open CHATONROOM cannot restore an old permission snap
   f.reply=method=>method==='SYNCLINK'?{status:0,body:{ltk:0,ols:[{li:'700',ac:true}],dlis:[]}}:method==='CHATONROOM'?held.promise:undefined;
   const {session,events,rooms:known}=await sessionFixture(f),key=known[0].key;
   try{
-    const pending=session.action(key,1,'context');f.carriage.emit('push',{method:'SYNCLINKDL',status:0,body:{li:'700'}});
+    const pending=session.action(key,1,'context');await until(()=>f.calls.some(call=>call.method==='CHATONROOM'));
+    f.carriage.emit('push',{method:'SYNCLINKDL',status:0,body:{li:'700'}});
     held.resolve({status:0,body:{c:'123',li:'700',olu:{userId:'999',lmt:2,opt:0}}});await pending;
     assert.equal(events.findLast(event=>event.type==='reader-action').entryPhase,'failed');assert.equal(events.findLast(event=>event.type==='reader-rooms').rooms[0].canSend,false);
     assert.equal(await session.action(key,2,'send',{text:'Synthetic'}),false);

@@ -17,7 +17,7 @@ function fixture(){
   vm.runInContext(`
     let hasAccount=true,readerGeneration=1,actionEpoch=0,resumeEpoch=0,readerAttempt=1,selectedRoom='A';
     let pendingSend=null,uncertainPhoto=null,imageDraft={room:'A',generation:1},outboxEpoch=0,restoredOutbox=[],outboxRevision=-1;
-    let outboxAcknowledging=false,acknowledgingClientId=null,settingsBusy=false,settingsEpoch=0,settingsRevision=0,readerRevision=0;
+    let outboxAcknowledging=false,acknowledgingClientId=null,settingsBusy=false,settingsEpoch=0,settingsRevision=0,readerRevision=0,readSyncIntent=null;
     let viewPin=null,viewPinEpoch=0,viewPinPending=null,viewSequence=0;
     let selectionView=null,pendingSelection=null,reconnectRoom=null,userSelected=false,currentPage=null,busy=false,ackInFlight=false;
     let messageQuery='',renderedMessages=null,renderedMessageRoom=null;
@@ -33,6 +33,7 @@ function fixture(){
     // Photo HTTP lifecycle is exercised by photo-loading tests; this fixture
     // isolates selection/read admission and has no image DOM or loader.
     function clearIncomingPhotos(){}
+    function cancelMessageReads(){}
     function messageViewCovered(){return false;}
     function roomNow(){return roomsCache.find(room=>room.key===selectedRoom);}
     function roomCan(){return true;}

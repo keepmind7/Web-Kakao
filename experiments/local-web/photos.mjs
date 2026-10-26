@@ -109,26 +109,52 @@ export async function fetchPhoto(value,{signal,resolve=lookup,request=https.requ
   try{return await fetch(value,redirects);}finally{clearTimeout(timer);signal?.removeEventListener('abort',abort);controller.abort();for(const req of requests)req.destroy();requests.clear();}
 }
 export function createPhotoCache({fetcher=fetchPhoto}={}){
-  const entries=new Map(),pending=new Map();let bytes=0,epoch=0,active=0;const controllers=new Set(),waiting=[];
-  return {
-    async get(url){
-      if(entries.has(url)){const item=entries.get(url);entries.delete(url);entries.set(url,item);return item;}
-      if(pending.has(url))return pending.get(url);
-      if(pending.size>=40)throw new Error('photo_busy');
-      const current=epoch,controller=new AbortController();controllers.add(controller);
-      const promise=(async()=>{
-        if(active>=4)await new Promise(resolve=>waiting.push(resolve));else active++;
-        if(current!==epoch)throw new Error('photo_unavailable');
-        const item=await fetcher(url,{signal:controller.signal});if(!Buffer.isBuffer(item?.data) || item.data.length>10*1024*1024)throw new Error('photo_unavailable');if(current!==epoch)throw new Error('photo_unavailable');
-        // Tiny images can otherwise retain unbounded URL strings and objects.
+  const entries=new Map(),pending=new Map(),running=new Set(),waiting=new Set();let bytes=0,epoch=0;
+  const unavailable=()=>new Error('photo_unavailable');
+  const detach=consumer=>consumer.signal?.removeEventListener('abort',consumer.abort);
+  function complete(job,error,item){
+    for(const consumer of job.consumers){detach(consumer);(error?consumer.reject:consumer.resolve)(error || item);}
+    job.consumers.clear();
+  }
+  function abandon(job){
+    if(job.state==='done' || job.state==='canceled')return;
+    job.state='canceled';waiting.delete(job);if(pending.get(job.url)===job)pending.delete(job.url);
+    job.controller.abort();complete(job,unavailable());
+  }
+  function pump(){
+    while(running.size<4 && waiting.size){
+      const job=waiting.values().next().value;waiting.delete(job);
+      if(job.epoch!==epoch || job.state!=='waiting' || !job.consumers.size)continue;
+      job.state='active';running.add(job);
+      // Invoke synchronously for admission, then settle even a synchronous
+      // injected failure through the same ownership-safe cleanup path.
+      let operation;try{operation=fetcher(job.url,{signal:job.controller.signal});}catch(error){operation=Promise.reject(error);}
+      Promise.resolve(operation).then(item=>{
+        if(job.epoch!==epoch || job.state!=='active' || !job.consumers.size)throw unavailable();
+        if(!Buffer.isBuffer(item?.data) || item.data.length>10*1024*1024)throw unavailable();
         while(entries.size && (entries.size>=512 || bytes+item.data.length>30*1024*1024)){const [key,value]=entries.entries().next().value;bytes-=value.data.length;entries.delete(key);}
-        entries.set(url,item);bytes+=item.data.length;return item;
-      })().finally(()=>{
-        // Run after pending.set even when an injected fetcher throws synchronously.
-        controllers.delete(controller);
-        if(current===epoch){pending.delete(url);const next=waiting.shift();if(next)next();else active--;}
-      });pending.set(url,promise);return promise;
+        entries.set(job.url,item);bytes+=item.data.length;complete(job,null,item);
+      }).catch(error=>complete(job,error)).finally(()=>{
+        running.delete(job);job.state='done';if(pending.get(job.url)===job)pending.delete(job.url);pump();
+      });
+    }
+  }
+  return {
+    async get(url,{signal}={}){
+      if(signal?.aborted)throw unavailable();
+      if(entries.has(url)){const item=entries.get(url);entries.delete(url);entries.set(url,item);return item;}
+      let job=pending.get(url);
+      if(!job){
+        if(pending.size>=40)throw new Error('photo_busy');
+        job={url,epoch,controller:new AbortController(),consumers:new Set(),state:'waiting'};pending.set(url,job);waiting.add(job);
+      }
+      const promise=new Promise((resolve,reject)=>{
+        const consumer={resolve,reject,signal,abort:null};
+        consumer.abort=()=>{if(!job.consumers.delete(consumer))return;detach(consumer);reject(unavailable());if(!job.consumers.size)abandon(job);};
+        job.consumers.add(consumer);signal?.addEventListener('abort',consumer.abort,{once:true});if(signal?.aborted)consumer.abort();
+      });
+      pump();return promise;
     },
-    clear(){epoch++;for(const controller of controllers)controller.abort();controllers.clear();entries.clear();pending.clear();bytes=0;active=0;for(const resume of waiting.splice(0))resume();},
+    clear(){epoch++;for(const job of new Set([...pending.values(),...running]))abandon(job);entries.clear();pending.clear();waiting.clear();bytes=0;},
   };
 }

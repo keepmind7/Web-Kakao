@@ -377,8 +377,11 @@ export function createReaderSession(credential,factory,emit) {
     async history(key,requestId) {
       const started=now(),remaining=()=>18000-(now()-started);
       const selection=selectionVersion;
-      if(titlePromise && !titleInFlight?.selected)await titlePromise;
-      if(discoveryPromise)await discoveryPromise;
+      // Preserve the async admission boundary: a view change/close queued in
+      // this turn can invalidate the captured intent without awaiting metadata.
+      await Promise.resolve();
+      // Optional requests have independently retired timers and scoped late
+      // responses. They can remain in flight without blocking this room's data.
       if(closed || !store || !carriage || busy || !store.has(key) || selectionVersion!==selection)return false;
       activate(key);
       // A zero max was rejected by the actual server. Use only a bound already
@@ -450,10 +453,9 @@ export function createReaderSession(credential,factory,emit) {
     async action(key,requestId,action,payload={}){
       const started=Date.now(),bound=max=>{const remaining=22500-(Date.now()-started);if(remaining<=0)throw new Error('action_deadline');return Math.min(max,remaining);};
       const selection=selectionVersion;
-      if(titlePromise && !titleInFlight?.selected)await titlePromise;
-      if(discoveryPromise)await discoveryPromise;
-      // Context/read/photo belong to the selected view, including time spent
-      // waiting for metadata. Explicit text sends retain their distinct intent.
+      await Promise.resolve();
+      // Context/read/photo belong to the selected view. Unrelated optional
+      // discovery/title work does not consume this action's foreground budget.
       if(['context','read','photo'].includes(action) && selectionVersion!==selection)return false;
       if(factory.messaging!==true || closed || busy || !store?.has(key))return false;
       if(!['send','photo','context','read'].includes(action))return false;

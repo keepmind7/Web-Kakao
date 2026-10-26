@@ -9,11 +9,18 @@ import { createReaderStore } from '../experiments/local-web/reader-data.mjs';
 
 class SyntheticClient extends EventEmitter{
   constructor(){super();this.pending=new Map();this.sent=[];this.sequence=0;}
-  request(method,body){const packetId=++this.sequence;this.sent.push({packetId,method,body});return new Promise(resolve=>this.pending.set(packetId,{method,resolve,timer:null}));}
+  request(method,body){const packetId=++this.sequence;this.sent.push({packetId,method,body});return new Promise((resolve,reject)=>this.pending.set(packetId,{method,resolve,reject,timer:null}));}
 }
 const make=()=>new (guardReaderClient(SyntheticClient,null,{messaging:true}))();
 const ack=(packetId,body)=>({packetId,method:'WRITE',status:0,body});
 const begin=(client,chatId='123',msgId='101')=>({promise:client.request('WRITE',{chatId,msgId,msg:'synthetic'}),packetId:client.sent.at(-1).packetId});
+async function waitForSent(client,method){
+  const deadline=Date.now()+2000;
+  while(!client.sent.some(packet=>packet.method===method)){
+    if(Date.now()>deadline)throw new Error('synthetic request did not start: '+method);
+    await new Promise(resolve=>setImmediate(resolve));
+  }
+}
 
 test('exact packet ID plus method wins and a colliding MSG push cannot acknowledge WRITE',async()=>{
   const client=make(),write=begin(client);let pushes=0;client.on('push',()=>pushes++);
@@ -180,6 +187,8 @@ test('review: stale nonzero A entry/read replies leave B session connected until
   try{
     await session.start();const key=events[0].rooms[1].key;
     pending=session.action(key,1,'context');
+    // Inject replies only after the action's same-turn selection/close gate.
+    await waitForSent(carriage,'CHATONROOM');
     carriage.finishPacket({packetId:1,method:'CHATONROOM',status:-203,body:{c:'123',status:-203}});
     assert.equal(carriage.pending.has(1),true);assert.equal(events.some(event=>event.type==='reader-failed'),false);
     carriage.finishPacket({packetId:1,method:'CHATONROOM',status:0,body:{c:'456'}});await pending;
@@ -189,7 +198,7 @@ test('review: stale nonzero A entry/read replies leave B session connected until
     const names=carriage.sent.findLast(packet=>packet.method==='MEMBER');
     assert.ok(names);carriage.finishPacket({packetId:names.packetId,method:'MEMBER',status:0,body:{chatId:'456',members:[]}});
     const message=events.findLast(event=>event.type==='reader-messages').messages[0].key;
-    pending=session.action(key,2,'read',{message});await Promise.resolve();
+    pending=session.action(key,2,'read',{message});await waitForSent(carriage,'NOTIREAD');
     const read=carriage.sent.findLast(packet=>packet.method==='NOTIREAD');assert.ok(read);
     carriage.finishPacket({packetId:900,method:'NOTIREAD',status:-203,body:{c:'123',status:-203}});
     assert.equal(carriage.pending.has(read.packetId),true);assert.equal(events.some(event=>event.type==='reader-failed'),false);

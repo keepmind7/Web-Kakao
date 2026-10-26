@@ -1,5 +1,5 @@
 import { createHmac,randomBytes } from 'node:crypto';
-import { existsSync,lstatSync,readFileSync,writeFileSync,renameSync,unlinkSync,openSync,writeSync,fsyncSync,closeSync,rmSync } from 'node:fs';
+import { existsSync,lstatSync,readdirSync,readFileSync,renameSync,unlinkSync,openSync,fstatSync,writeSync,fsyncSync,closeSync,rmSync } from 'node:fs';
 import { resolve,join } from 'node:path';
 import { ensurePrivateDirectory,verifyPrivateFile,ensurePrivateDirectoryAsync,verifyPrivateFileAsync } from './private-storage.mjs';
 
@@ -16,7 +16,7 @@ export function securePreferenceFolder(folder){
 const queues=new Map();
 const QUEUE_LIMIT=64;
 export function createPreferenceStore({folder=null,asyncSecurity=false,secureFolder=asyncSecurity?ensurePrivateDirectoryAsync:securePreferenceFolder,verifyFile=null}={}){
-  const base=folder?resolve(folder):null;let secret=randomBytes(32),loaded=false,secured=false,keyError=false;
+  const base=folder?resolve(folder):null;let secret=randomBytes(32),loaded=false,keyError=false;
   const verifier=verifyFile ?? ([securePreferenceFolder,ensurePrivateDirectoryAsync].includes(secureFolder)?(asyncSecurity?verifyPrivateFileAsync:verifyPrivateFile):null);
   function run(generator){
     if(asyncSecurity)return (async()=>{let step=generator.next();while(!step.done){try{step=generator.next(await step.value);}catch(error){step=generator.throw(error);}}return step.value;})();
@@ -40,7 +40,7 @@ export function createPreferenceStore({folder=null,asyncSecurity=false,secureFol
   function* check(path){
     try{
       regular(path);const before=existsSync(path)?lstatSync(path):null;
-      if(verifier)yield verifier(path);
+      if(verifier && (yield verifier(path))===false && before)throw new Error('settings_file_unverified');
       regular(path);const after=existsSync(path)?lstatSync(path):null;
       if(Boolean(before)!==Boolean(after) || before && ['dev','ino','size','mtimeMs','ctimeMs'].some(key=>before[key]!==after[key]))throw new Error('settings_file_changed');
     }catch(cause){const error=new Error('settings_security',{cause});error.code='settings_security';throw error;}
@@ -49,15 +49,37 @@ export function createPreferenceStore({folder=null,asyncSecurity=false,secureFol
     if(loaded)return;
     try{
       if(!base || !existsSync(base))return;
-      yield secureFolder(base);secured=true;
+      yield secureFolder(base);
       const path=join(base,'identity.key');yield* check(path);
       if(existsSync(path)){const data=readFileSync(path);if(data.length!==32)throw new Error('settings_key');secret=data;}
     }finally{loaded=true;}
   }
-  // The target was verified by load() in the same commit; rename replaces it with a new file from the private folder.
-  function write(path,data){
-    regular(path);const temp=`${path}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`,fd=openSync(temp,'wx',0o600);
-    try{try{writeSync(fd,data);fsyncSync(fd);}finally{closeSync(fd);}renameSync(temp,path);}catch(error){rmSync(temp,{force:true});throw error;}
+  // Check a new file before placing private bytes in it, then verify the finished
+  // inode before publishing it. Windows mode0600 alone does not set a private ACL.
+  function* write(path,data,current,{createOnly=false}={}){
+    regular(path);
+    const temp=createOnly?path:`${path}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`,fd=openSync(temp,'wx',0o600);
+    let open=true,created;
+    const owned=()=>{regular(temp);const info=lstatSync(temp);if(!created || info.dev!==created.dev || info.ino!==created.ino)throw new Error('settings_file_changed');};
+    try{
+      created=fstatSync(fd);
+      yield* check(temp);current();owned();
+      const bytes=Buffer.isBuffer(data)?data:Buffer.from(data,'utf8');
+      for(let offset=0;offset<bytes.length;){
+        const written=writeSync(fd,bytes,offset,bytes.length-offset,null);
+        if(!Number.isSafeInteger(written) || written<=0 || written>bytes.length-offset)throw new Error('settings_write');
+        offset+=written;
+      }
+      fsyncSync(fd);closeSync(fd);open=false;
+      yield* check(temp);current();owned();
+      if(!createOnly)renameSync(temp,path);
+    }catch(error){
+      try{if(open)closeSync(fd);}finally{
+        // Never remove a replacement that did not originate from this operation.
+        try{owned();rmSync(temp,{force:true});}catch{}
+      }
+      throw error;
+    }
   }
   // null when absent; throws when the file itself is damaged. A damaged room entry drops only that room.
   function* load(path){
@@ -84,17 +106,30 @@ export function createPreferenceStore({folder=null,asyncSecurity=false,secureFol
         return enqueue(function*(){
         const current=()=>{if(closed || !isCurrent())throw new Error('settings_stale');};
         try{
+          // A damaged installation key cannot identify this account's files.
+          // Do not report a successful deletion in a random temporary namespace.
+          if(reset && keyError)throw new Error('settings_identity_unavailable');
           current();let latest=state;if(!corrupt && !keyError)try{latest=(yield* load(path))?.state ?? state;}catch(failure){if(failure.code==='settings_security')throw failure;corrupt=true;}
           current();const next=change(latest);
           if(next.persist){
             if(!base || keyError)throw new Error('settings_unavailable');
-            if(!secured){yield secureFolder(base);current();secured=true;}
+            // Folder inheritance may change while the store remains alive.
+            // Recheck before every persistent commit; successful ACLs are not cached.
+            yield secureFolder(base);current();
             const keyPath=join(base,'identity.key');yield* check(keyPath);current();
             if(existsSync(keyPath)){if(!readFileSync(keyPath).equals(secret))throw new Error('settings_key_changed');}
-            else writeFileSync(keyPath,secret,{mode:0o600,flag:'wx'});
+            else yield* write(keyPath,secret,current,{createOnly:true});
             if(corrupt && existsSync(path)){yield* check(path);current();renameSync(path,`${path}.corrupt-${Date.now()}`);}corrupt=false;
-            const {rooms,...settings}=next;write(path,JSON.stringify({version:1,settings,rooms})+'\n');
+            const {rooms,...settings}=next;yield* write(path,JSON.stringify({version:1,settings,rooms})+'\n',current);
           }else if(path && existsSync(path) && (!corrupt || reset)){yield* check(path);current();unlinkSync(path);corrupt=false;}
+          if(reset && base && existsSync(base)){
+            // Only this account's exact backup namespace belongs to forget().
+            // Validate each file before unlinking; no recursive deletion or key removal.
+            const prefix=id+'.json.corrupt-';
+            for(const name of readdirSync(base))if(name.startsWith(prefix) && /^\d+$/.test(name.slice(prefix.length))){
+              const backup=join(base,name);yield* check(backup);current();unlinkSync(backup);
+            }
+          }
           state=next;error=corrupt;return true;
         }catch{if(!closed)error=true;return false;}
       },()=>{error=true;return false;});}

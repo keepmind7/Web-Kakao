@@ -37,7 +37,12 @@ export function createLocalServer({ transport, mode = 'mock', encode = encodeQr,
   const access=createLocalAccess({controlToken});
   const lab = createAuthLab({ transport: transport ?? (mode === 'live' ? createTransport() : mockTransport()), encodeQr: encode, mode, credentialRetentionMs:null });
   const photos=createPhotoCache({fetcher:photoFetcher});
-  const newReader=()=>readerFactory({gapProbe,messaging,photoTransport,preferenceStore,onBlocked:()=>{photos.clear();reader.close();lab.blockConnection();}});
+  // Local HTTP consumer ids, not Kakao operations. Closed ids/tombstones last
+  // 30s; active responses have a 15s lease and are never silently evicted.
+  const photoRequests=new Map();
+  const prunePhotoRequests=()=>{for(const [id,row] of photoRequests)if(row.expiresAt<=Date.now())photoRequests.delete(id);};
+  const clearPhotos=()=>{for(const row of photoRequests.values())if(!row.closed){row.controller.abort();row.response.destroy();}photos.clear();};
+  const newReader=()=>readerFactory({gapProbe,messaging,photoTransport,preferenceStore,onBlocked:()=>{clearPhotos();reader.close();lab.blockConnection();}});
   let reader=newReader();
   // Shared worker view: accepted intent order, not an acknowledgment from Kakao.
   // A page UUID has its own sequence space; the local session is shared by tabs.
@@ -47,7 +52,15 @@ export function createLocalServer({ transport, mode = 'mock', encode = encodeQr,
     if(!viewScope || viewScope.reader!==reader || viewScope.attempts!==attempts)viewScope={reader,attempts,issued:0,accepted:0,clients:new Map()};
     return viewScope;
   };
-  const forgetAccount=()=>{try{reader.close();}finally{try{photos.clear();}finally{lab.cancel();}}};
+  // Alias writes belong to one room and connection. Keep watermarks even after
+  // a rejected/unknown write: an older request must never become current again.
+  let roomPreferenceScope=null;
+  const currentRoomPreferenceScope=()=>{
+    const {attempts,instanceId}=reader.snapshot();
+    if(!roomPreferenceScope || roomPreferenceScope.reader!==reader || roomPreferenceScope.attempts!==attempts || roomPreferenceScope.instanceId!==instanceId)roomPreferenceScope={reader,attempts,instanceId,issued:0,rooms:new Map()};
+    return roomPreferenceScope;
+  };
+  const forgetAccount=()=>{try{reader.close();}finally{try{clearPhotos();}finally{lab.cancel();}}};
   // Only internal cleanup may own onEmpty; options inject bounded clocks/timers for QA.
   const presence=createTabPresence({...presenceOptions,onEmpty:forgetAccount}),streams=new Map();
   let disposed=false,closing=false;
@@ -55,7 +68,7 @@ export function createLocalServer({ transport, mode = 'mock', encode = encodeQr,
     if(disposed)return;disposed=true;presence.close();
     try{for(const finish of streams.values())finish();}finally{forgetAccount();}
   };
-  const snapshot=()=>{const tabPresence=presence.snapshot(),auth=lab.snapshot(),reading=reader.snapshot();if(!auth.credentialInMemory)photos.clear();return {build:8,sessionPolicy:'tab-open',tabPresence,preferences:typeof reader.settingsSnapshot==='function',outboxRecovery:typeof reader.outbox==='function' && typeof reader.acknowledgeOutbox==='function',viewPin:typeof reader.view==='function',viewOrdering:true,gapProbe:gapProbe===true,messaging:messaging===true,photoTransport,...auth,actualMessageSent:auth.actualMessageSent || mode==='live' && reading.sendAccepted>0,actualChatConnected:auth.actualChatConnected || Number.isFinite(reading.connectedAt),chatConnectionActive:reading.phase==='connected',reader:reading,canOpenReader:mode==='live' && !auth.sessionBlocked && auth.credentialInMemory && auth.phase==='authenticated' && reading.canConnect};};
+  const snapshot=()=>{const tabPresence=presence.snapshot(),auth=lab.snapshot(),reading=reader.snapshot();if(!auth.credentialInMemory)clearPhotos();return {build:8,photoCancellation:true,roomPreferenceOrdering:true,sessionPolicy:'tab-open',tabPresence,preferences:typeof reader.settingsSnapshot==='function',outboxRecovery:typeof reader.outbox==='function' && typeof reader.acknowledgeOutbox==='function',viewPin:typeof reader.view==='function',viewOrdering:true,gapProbe:gapProbe===true,messaging:messaging===true,photoTransport,...auth,actualMessageSent:auth.actualMessageSent || mode==='live' && reading.sendAccepted>0,actualChatConnected:auth.actualChatConnected || Number.isFinite(reading.connectedAt),chatConnectionActive:reading.phase==='connected',reader:reading,canOpenReader:mode==='live' && !auth.sessionBlocked && auth.credentialInMemory && auth.phase==='authenticated' && reading.canConnect};};
   const csrf = randomBytes(32).toString('hex');
   const withPhotoCapabilities=page=>Array.isArray(page?.messages)?{...page,messages:page.messages.map(message=>Array.isArray(message?.photos)?{...message,photos:message.photos.map(photo=>{const match=typeof photo?.src==='string' && /^\/api\/photo\?room=(r_[a-f0-9]{24})&message=(m_[a-f0-9]{24})&index=([0-9]|[12][0-9])$/.exec(photo.src);return match?{...photo,src:photo.src+'&cap='+access.photoCapability(match[1],match[2],match[3])}:photo;})}:message)}:page;
   let origin,receivingImage=false;
@@ -86,7 +99,7 @@ export function createLocalServer({ transport, mode = 'mock', encode = encodeQr,
     const localLaunch=req.method==='POST' && req.url==='/api/local/launch';
     const localSession=req.method==='POST' && req.url==='/api/local/session';
     if(req.method==='GET' && req.url==='/api/local/status')return controlled?reply(200,{app:APP,...localControlStatus(snapshot())}):reply(403,{error:'local_control_required'});
-    const photoQuery=req.method==='GET' && /^\/api\/photo\?room=(r_[a-f0-9]{24})&message=(m_[a-f0-9]{24})&index=([0-9]|[12][0-9])&cap=([a-f0-9]{64})$/.exec(req.url);
+    const photoQuery=req.method==='GET' && /^\/api\/photo\?room=(r_[a-f0-9]{24})&message=(m_[a-f0-9]{24})&index=([0-9]|[12][0-9])&cap=([a-f0-9]{64})(?:&request=([a-f0-9]{32}))?$/.exec(req.url);
     const headerAuthenticated=access.authenticated(req.headers['x-local-session']);
     const authenticated = headerAuthenticated || Boolean(photoQuery) && access.photoAuthorized(photoQuery[4],photoQuery[1],photoQuery[2],photoQuery[3]);
     if ((controlPath || localLaunch) && !controlled || !(authenticated || localSession || controlled && (controlPath || localLaunch))) return reply(403, { error: 'local_session_required' });
@@ -109,9 +122,22 @@ export function createLocalServer({ transport, mode = 'mock', encode = encodeQr,
     if(req.method==='GET' && requestUrl.pathname==='/api/photo'){
       if(!lab.snapshot().credentialInMemory)return reply(409,{error:'authentication_required'});
       const key=requestUrl.searchParams.get('room'),message=requestUrl.searchParams.get('message'),index=requestUrl.searchParams.get('index');
-      if([...requestUrl.searchParams.keys()].sort().join(',')!=='index,message,room' && [...requestUrl.searchParams.keys()].sort().join(',')!=='cap,index,message,room' || !roomKeyValid(key) || !/^m_[a-f0-9]{24}$/.test(message) || !/^(?:[0-9]|[12][0-9])$/.test(index))return reply(400,{error:'invalid_photo'});
+      const fields=[...requestUrl.searchParams.keys()].sort().join(','),id=requestUrl.searchParams.get('request');
+      if(!['index,message,room','cap,index,message,room','index,message,request,room','cap,index,message,request,room'].includes(fields) || !roomKeyValid(key) || !/^m_[a-f0-9]{24}$/.test(message) || !/^(?:[0-9]|[12][0-9])$/.test(index) || id!==null && !/^[a-f0-9]{32}$/.test(id))return reply(400,{error:'invalid_photo'});
       const url=reader.photo?.(key,message,Number(index));if(!url)return reply(404,{error:'photo_unavailable'});
-      try{const item=await photos.get(url);if(disposed || closing)return reply(503,{error:'server_closing'});presence.snapshot();if(!lab.snapshot().credentialInMemory)return reply(409,{error:'authentication_required'});return reply(200,item.data,item.type);}catch{return disposed || closing?reply(503,{error:'server_closing'}):reply(502,{error:'photo_unavailable'});}
+      prunePhotoRequests();
+      if(id && photoRequests.has(id))return reply(409,{error:'photo_request_retired'});
+      if(id && photoRequests.size>=512)return reply(429,{error:'photo_request_limit'});
+      const controller=new AbortController(),row={scope:key+':'+message+':'+index,controller,response:res,closed:false,expiresAt:Infinity};
+      row.closedPromise=new Promise(resolve=>row.resolveClose=resolve);
+      const finish=()=>{
+        if(row.closed)return;row.closed=true;clearTimeout(row.timer);controller.abort();req.removeListener('aborted',abort);
+        row.response=null;row.expiresAt=Date.now()+30000;row.resolveClose();row.resolveClose=null;
+      };
+      const abort=()=>controller.abort();req.once('aborted',abort);res.once('close',finish);
+      row.timer=setTimeout(()=>{controller.abort();res.destroy();},15000);row.timer.unref?.();
+      if(id)photoRequests.set(id,row);
+      try{const item=await photos.get(url,{signal:controller.signal});if(res.destroyed)return;if(disposed || closing)return reply(503,{error:'server_closing'});presence.snapshot();if(!lab.snapshot().credentialInMemory)return reply(409,{error:'authentication_required'});return reply(200,item.data,item.type);}catch{if(res.destroyed)return;return disposed || closing?reply(503,{error:'server_closing'}):reply(502,{error:'photo_unavailable'});}
     }
     if(req.method==='GET' && ['/api/reader/rooms','/api/reader/messages'].includes(requestUrl.pathname)){
       if(!lab.snapshot().credentialInMemory)return reply(409,{error:'authentication_required'});
@@ -120,7 +146,7 @@ export function createLocalServer({ transport, mode = 'mock', encode = encodeQr,
       if(!roomKeyValid(key) || [...requestUrl.searchParams.keys()].length!==1)return reply(400,{error:'room_required'});
       const page=reader.messages(key);return page?reply(200,withPhotoCapabilities(page)):reply(404,{error:'unknown_room'});
     }
-    if (req.method !== 'POST' || !(controlPath || localLaunch || localSession || ['/api/presence','/api/start', '/api/cancel', '/api/shutdown', '/api/room-probe','/api/reader/connect','/api/reader/disconnect','/api/reader/history','/api/reader/send','/api/reader/photo','/api/reader/seen','/api/reader/context','/api/reader/view','/api/reader/outbox/ack','/api/preferences/room','/api/preferences','/api/preferences/forget','/api/notifications/claim'].includes(req.url))) return reply(404, { error: 'not_found' });
+    if (req.method !== 'POST' || !(controlPath || localLaunch || localSession || ['/api/presence','/api/start', '/api/cancel', '/api/shutdown', '/api/room-probe','/api/reader/connect','/api/reader/disconnect','/api/reader/history','/api/reader/send','/api/reader/photo','/api/reader/seen','/api/reader/context','/api/reader/view','/api/reader/outbox/ack','/api/preferences/room','/api/preferences','/api/preferences/forget','/api/notifications/claim','/api/photo/cancel'].includes(req.url))) return reply(404, { error: 'not_found' });
     const provided = req.headers['x-csrf-token'];
     if (req.headers.origin !== origin || !(localSession || controlled && (controlPath || localLaunch)) && (typeof provided !== 'string' || !/^[a-f0-9]{64}$/.test(provided) || !timingSafeEqual(Buffer.from(provided), Buffer.from(csrf)))) return reply(403, { error: 'same_origin_required' });
     if (!/^application\/json(?:;|$)/i.test(req.headers['content-type'] ?? '')) return reply(415, { error: 'json_required' });
@@ -128,6 +154,7 @@ export function createLocalServer({ transport, mode = 'mock', encode = encodeQr,
     // Capture authenticated arrival before awaiting a potentially slow body.
     // Reconnects reuse instanceId, so both reader ownership and attempt matter.
     const viewRequest=req.url==='/api/reader/view'?{scope:currentViewScope(),order:++viewScope.issued}:null;
+    const roomPreferenceRequest=req.url==='/api/preferences/room'?{scope:currentRoomPreferenceScope(),order:++roomPreferenceScope.issued}:null;
     const imageRequest=req.url==='/api/reader/photo';
     if(imageRequest && (!messaging || !lab.snapshot().credentialInMemory || receivingImage))return reply(409,{error:'action_not_ready'});
     if(imageRequest)receivingImage=true;
@@ -146,7 +173,9 @@ export function createLocalServer({ transport, mode = 'mock', encode = encodeQr,
         const session=Object.keys(body).join(',')==='ticket'?access.exchange(body.ticket):null;
         return session?reply(200,{accepted:true,session}):reply(403,{error:'launch_ticket_required'});
       }
-      if(req.url==='/api/reader/view'){
+      if(req.url==='/api/photo/cancel'){
+        if(Object.keys(body).sort().join(',')!=='index,message,requestId,room' || !roomKeyValid(body.room) || !messageKeyValid(body.message) || !Number.isInteger(body.index) || body.index<0 || body.index>29 || typeof body.requestId!=='string' || !/^[a-f0-9]{32}$/.test(body.requestId))return reply(400,{error:'invalid_photo_cancel'});
+      }else if(req.url==='/api/reader/view'){
         const fields=Object.keys(body).sort().join(',');
         if(!roomKeyValid(body.room) || fields!=='room' && (fields!=='room,viewClientId,viewSequence' || !clientIdValid(body.viewClientId) || !Number.isSafeInteger(body.viewSequence) || body.viewSequence<1))return reply(400,{error:'invalid_view'});
       }else if(['/api/reader/history','/api/reader/context'].includes(req.url)){
@@ -160,12 +189,25 @@ export function createLocalServer({ transport, mode = 'mock', encode = encodeQr,
       }else if(req.url==='/api/reader/seen'){
         if(Object.keys(body).sort().join(',')!=='notify,room,token' || !roomKeyValid(body.room) || typeof body.notify!=='boolean' || typeof body.token!=='string' || !/^[a-f0-9]{48}$/.test(body.token))return reply(400,{error:'invalid_seen'});
       }else if(req.url==='/api/preferences/room'){
-        const {room,...patch}=body;if(!roomKeyValid(room) || !validRoomSettings(patch))return reply(400,{error:'invalid_title'});
+        const {room,preferenceClientId,preferenceSequence,...patch}=body;
+        const ordered=Object.hasOwn(body,'preferenceClientId') || Object.hasOwn(body,'preferenceSequence');
+        if(!roomKeyValid(room) || !validRoomSettings(patch) || ordered && (!Object.hasOwn(patch,'title') || !clientIdValid(preferenceClientId) || !Number.isSafeInteger(preferenceSequence) || preferenceSequence<1))return reply(400,{error:'invalid_title'});
       }else if(req.url==='/api/preferences'){
         if(!validSettings(body))return reply(400,{error:'invalid_preferences'});
       }else if(Object.keys(body).length)return reply(400,{error:'empty_object_required'});
     } catch { return disposed || closing?reply(503,{error:'server_closing'}):reply(400, { error: 'invalid_json' }); }
     finally{if(imageRequest)receivingImage=false;}
+    if(req.url==='/api/photo/cancel'){
+      prunePhotoRequests();
+      const scope=body.room+':'+body.message+':'+body.index,row=photoRequests.get(body.requestId);
+      if(row && row.scope!==scope)return reply(409,{error:'photo_request_mismatch'});
+      if(!row){
+        if(photoRequests.size>=512)return reply(429,{error:'photo_request_limit'});
+        // The cancellation can arrive before the browser's image GET.
+        photoRequests.set(body.requestId,{scope,closed:true,expiresAt:Date.now()+30000});
+      }else if(!row.closed){row.controller.abort();row.response.destroy();await row.closedPromise;}
+      if(res.destroyed)return;return reply(200,{canceled:true});
+    }
     if(req.url==='/api/presence'){
       if(req.aborted || res.destroyed)return;
       const release=presence.acquire();if(!release)return reply(429,{error:'presence_limit'});
@@ -188,7 +230,7 @@ export function createLocalServer({ transport, mode = 'mock', encode = encodeQr,
     if (req.url === '/api/start') {
       if (!lab.snapshot().canStart) return reply(409, { app: APP, ...snapshot() });
       reader.close();reader=newReader();
-      photos.clear();
+      clearPhotos();
       const before=lab.snapshot().attempts;void lab.start();
       if(lab.snapshot().attempts>before)presence.arm();
       return reply(202, { app: APP, ...snapshot() });
@@ -230,21 +272,51 @@ export function createLocalServer({ transport, mode = 'mock', encode = encodeQr,
       if(!lab.snapshot().credentialInMemory)return reply(409,{error:'authentication_required'});
       if(req.url==='/api/notifications/claim')return reply(200,{notices:reader.claimNotifications?.() ?? []});
       const owner=reader;
+      // A validated explicit reset supersedes pre-reset aliases immediately,
+      // even if deletion later fails. Do not clear again after awaiting: a new
+      // post-reset edit already belongs to the new scope and must remain valid.
+      if(req.url==='/api/preferences/forget')roomPreferenceScope=null;
       let accepted=false;try{accepted=await(req.url==='/api/preferences'?owner.updateSettings?.(body):owner.forgetSettings?.());}catch{/* A rejected durable write is not a saved setting. */}
       if(disposed || closing)return reply(503,{error:'server_closing'});
       if(reader!==owner || !readerScopeMatches() || !lab.snapshot().credentialInMemory)return reply(409,{error:'reader_scope_changed'});
       return accepted?reply(200,{settings:owner.settingsSnapshot()}):reply(409,{error:'settings_unavailable'});
     }
-    if(['/api/reader/send','/api/reader/photo','/api/reader/seen','/api/reader/context','/api/preferences/room'].includes(req.url)){
+    if(req.url==='/api/preferences/room'){
       if(!lab.snapshot().credentialInMemory)return reply(409,{error:'authentication_required'});
-      const owner=reader;
+      const owner=reader,scope=currentRoomPreferenceScope();
+      if(scope!==roomPreferenceRequest.scope)return reply(409,{error:'reader_scope_changed'});
+      const {room,preferenceClientId:client,preferenceSequence:sequence,...patch}=body;
+      let state=null,reservation=null;
+      if(Object.hasOwn(patch,'title')){
+        state=scope.rooms.get(room);
+        if(!Number.isSafeInteger(roomPreferenceRequest.order) || (!state && scope.rooms.size>=500) || (client && state && !state.clients.has(client) && state.clients.size>=128))return reply(409,{error:'room_preference_limit'});
+        if(state){
+          const staleSequence=client && (state.clients.get(client) ?? 0)>=sequence;
+          const samePage=Boolean(client && state.latest.client===client);
+          if(staleSequence || !samePage && roomPreferenceRequest.order<state.order)return reply(409,{error:'stale_room_preference'});
+        }
+        if(!state){state={order:0,clients:new Map(),latest:null};scope.rooms.set(room,state);}
+        reservation={client};state.latest=reservation;state.order=Math.max(state.order,roomPreferenceRequest.order);
+        if(client)state.clients.set(client,sequence);
+      }
+      const scopeCurrent=()=>!disposed && !closing && reader===owner && currentRoomPreferenceScope()===scope && readerScopeMatches() && lab.snapshot().credentialInMemory;
+      const isCurrent=()=>scopeCurrent() && (!state || state.latest===reservation);
+      // The same predicate fences queued/durable commits and the manager's RAM
+      // projection, not just the HTTP response after a mutation has happened.
+      let accepted=false;
+      try{accepted=await Promise.resolve().then(()=>isCurrent() && (typeof owner.roomPreferences==='function'?owner.roomPreferences(room,patch,{isCurrent}):Object.keys(patch).join(',')==='title' && owner.rename?.(room,patch.title,{isCurrent})));}catch{/* Stale or failed storage is not a saved alias. */}
+      if(disposed || closing)return reply(503,{error:'server_closing'});
+      if(!scopeCurrent())return reply(409,{error:'reader_scope_changed'});
+      if(!isCurrent())return reply(409,{error:'stale_room_preference'});
+      return accepted?reply(202,{accepted:true}):reply(409,{error:'action_not_ready'});
+    }
+    if(['/api/reader/send','/api/reader/photo','/api/reader/seen','/api/reader/context'].includes(req.url)){
+      if(!lab.snapshot().credentialInMemory)return reply(409,{error:'authentication_required'});
       const accepted=req.url==='/api/reader/send'?messaging && reader.sendText(body.room,body.text,body.clientId,body.replyTo)
         :imageRequest?messaging && reader.sendPhoto?.(body.room,body.image,body.clientId)
         :req.url==='/api/reader/context'?messaging && reader.openRoom(body.room)
-        :req.url==='/api/reader/seen'?reader.seen(body.room,body.token,body.notify)
-        :await Promise.resolve().then(()=>!disposed && !closing && (typeof owner.roomPreferences==='function'?owner.roomPreferences(body.room,Object.fromEntries(Object.entries(body).filter(([key])=>key!=='room'))):Object.keys(body).sort().join(',')==='room,title' && owner.rename(body.room,body.title))).catch(()=>false);
+        :reader.seen(body.room,body.token,body.notify);
       if(disposed || closing)return reply(503,{error:'server_closing'});
-      if(req.url==='/api/preferences/room' && (reader!==owner || !readerScopeMatches() || !lab.snapshot().credentialInMemory))return reply(409,{error:'reader_scope_changed'});
       if(!accepted && messaging && req.url==='/api/reader/context'){
         const retryAfterMs=reader.contextRetryAfterMs?.(body.room);
         if(Number.isInteger(retryAfterMs) && retryAfterMs>0 && retryAfterMs<=60001)return reply(409,{error:'context_rate_limited',retryAfterMs});
@@ -254,7 +326,7 @@ export function createLocalServer({ transport, mode = 'mock', encode = encodeQr,
     if(req.url==='/api/shutdown' && (['checking','generating','waiting','approval','authenticated'].includes(lab.snapshot().phase) || ['connecting','connected'].includes(reader.snapshot().phase)))return reply(409,{error:'active_session_cancel_first'});
     if(req.url==='/api/shutdown')closing=true;
     reader.close();
-    photos.clear();
+    clearPhotos();
     lab.cancel();
     if(req.url==='/api/shutdown' && typeof reader.flushDiagnostics==='function'){
       let timer;

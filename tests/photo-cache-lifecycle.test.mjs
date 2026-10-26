@@ -98,6 +98,7 @@ test('clear aborts four active photos and rejects queued work without starting i
     assert.equal(results.length,40);for(const result of results){assert.equal(result.status,'rejected');assert.match(result.reason.message,/photo_unavailable/);}
     assert.equal(f.calls.length,4,'cleared queued work must never reach the fetcher');
     const fresh=f.get('synthetic:clear:39'),item=photo(3);
+    await f.started(5); // Consumer rejection can precede upstream settlement.
     assert.equal(f.calls.length,5);assert.equal(f.calls[4].signal.aborted,false);
     f.calls[4].resolve(item);assert.strictEqual(await fresh,item);
     assert.strictEqual(await f.get('synthetic:clear:39'),item);assert.equal(f.calls.length,5);
@@ -126,5 +127,13 @@ test('late old success cannot overwrite an already cached photo from the new epo
     const rejected=assert.rejects(old,/photo_unavailable/);f.calls[0].resolve(photo(7));await rejected;
     assert.strictEqual(await f.get(url),item,'stale bytes must not replace the current cached item');
     assert.equal(f.calls.length,2);
+  }finally{await f.close();}
+});
+test('an uncooperative old epoch cannot create more than four running upstream operations', {timeout:5000},async()=>{
+  const f=controlledCache({ignoreAbort:true});
+  try{
+    const old=Array.from({length:4},(_,n)=>f.get('synthetic:old:'+n));f.cache.clear();await Promise.allSettled(old);
+    const fresh=f.get('synthetic:fresh');assert.equal(f.calls.length,4,'old transport promises still own their running capacity');
+    f.calls[0].resolve(photo(8));await f.started(5);assert.equal(f.calls[4].url,'synthetic:fresh');f.calls[4].resolve(photo(9));await fresh;
   }finally{await f.close();}
 });

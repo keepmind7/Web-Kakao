@@ -13,21 +13,60 @@ assert.ok(process.argv.slice(2).every(value=>value==='--four-tabs'),'only the su
 const tabCount=process.argv.includes('--four-tabs')?4:3;
 const rooms=Array.from({length:tabCount+1},(_,n)=>'r_'+String.fromCharCode(97+n).repeat(24)),empty=rooms.at(-1),message=n=>'m_'+(n+1).toString(16).padStart(24,'0');
 const png=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=','base64');
-let photos=false,browser,url,maxPhotoHTTP=0,maxServerPhotos=0,serverPhotos=0,fatal=null;
+let photos=false,browser,url,maxPhotoHTTP=0,maxServerPhotos=0,serverPhotos=0,upstreamPhotos=0,maxUpstreamPhotos=0,upstreamAborts=0,fatal=null;
 const started=Date.now(),at=()=>Date.now()-started,clients=[],timers=new Set(),trace=[],network=new Map(),checks=[];
+const photoEvents=[],switched=[];let networkSequence=0;
+// CDP delivery uses a separate WebSocket per target. Receipt order is retained
+// as diagnostic evidence; concurrency uses event occurrence timestamps.
+// wallTime anchors validate cross-target clock comparability.
+function photoTiming(){
+  const rows=[...network.values()].filter(row=>row.path==='/api/photo');
+  const incomplete=rows.filter(row=>!Number.isFinite(row.requestTimestamp) || !Number.isFinite(row.doneTimestamp));
+  const invalid=rows.filter(row=>Number.isFinite(row.requestTimestamp) && Number.isFinite(row.doneTimestamp) && row.doneTimestamp<row.requestTimestamp);
+  const offsets=rows.filter(row=>Number.isFinite(row.requestTimestamp) && Number.isFinite(row.requestWallTime)).map(row=>row.requestWallTime-row.requestTimestamp);
+  const events=photoEvents.filter(row=>Number.isFinite(row.monotonicTime)).slice().sort((a,b)=>a.monotonicTime-b.monotonicTime || (a.kind==='end'?-1:1)-(b.kind==='end'?-1:1) || a.sequence-b.sequence);
+  const active=new Set(),peaks=[];let peak=0,backwardEvents=0,maxBackwardMs=0,latest=-Infinity;
+  for(const row of events){
+    // Equal start/end timestamps describe an empty half-open interval.
+    const entry=network.get(row.id);if(entry?.requestTimestamp===entry?.doneTimestamp)continue;
+    if(row.kind==='end')active.delete(row.id);else active.add(row.id);
+    if(active.size>peak){peak=active.size;peaks.push({peak,monotonicTime:row.monotonicTime,requests:[...active]});}
+  }
+  for(const row of photoEvents){if(!Number.isFinite(row.monotonicTime))continue;if(row.monotonicTime<latest){backwardEvents++;maxBackwardMs=Math.max(maxBackwardMs,(latest-row.monotonicTime)*1000);}latest=Math.max(latest,row.monotonicTime);}
+  return {receiptOrderPeak:maxPhotoHTTP,monotonicPeak:peak,requestCount:rows.length,eventCount:photoEvents.length,incompleteIntervals:incomplete.length,invalidIntervals:invalid.length,wallClockAnchorCount:offsets.length,wallClockOffsetSpanMs:offsets.length?(Math.max(...offsets)-Math.min(...offsets))*1000:null,backwardReceiptEvents:backwardEvents,maxBackwardMs,peaks};
+}
+function measuredPhotoPeak({complete=false}={}){
+  const timing=photoTiming();
+  assert.ok(timing.requestCount>0,'the fixture must actually request photos');
+  assert.equal(timing.invalidIntervals,0,'request end must not precede start');
+  assert.equal(timing.wallClockAnchorCount,timing.requestCount,'every request needs both clocks');
+  assert.ok(timing.wallClockOffsetSpanMs<1,'target clocks must agree within 1ms');
+  if(complete){assert.equal(timing.incompleteIntervals,0,'every photo request must settle');assert.equal(timing.eventCount,timing.requestCount*2,'every request needs start and end events');}
+  return timing.monotonicPeak;
+}
 const reader={snapshot:()=>({instanceId:'a'.repeat(24),phase:'connected',attempts:1,canConnect:false,roomCount:rooms.length,revision:photos?2:1,roomsRevision:1,pageRevisions:Object.fromEntries(rooms.map(key=>[key,photos?2:1])),historyBusy:false,operationBusy:false}),rooms:()=>({rooms:rooms.map((key,n)=>({key,title:'Synthetic tab room '+n,kind:'DirectChat',canContext:false,canRead:false,canText:false,canPhoto:false,canReply:false,historyAvailable:false}))}),
   messages:key=>({key,messages:photos&&key!==empty?Array.from({length:40},(_,n)=>({key:message(n),text:'Synthetic photo',sender:'Synthetic peer',photos:[{src:`/api/photo?room=${key}&message=${message(n)}&index=0`,width:400,height:300}]})):[{key:message(99),text:'Synthetic text',sender:'Synthetic peer'}],latestVisible:true,history:{phase:'loaded'}}),
   view:()=>true,photo:(room,key)=>`https://synthetic.kakaocdn.net/multitab/${room}/${key}`,outbox:()=>[],close(){}};
 const app=createLocalServer({mode:'live',messaging:false,encode:()=>[[true]],readerFactory:()=>reader,preferenceStore:{account(){assert.fail('no private profile');}},transport:async op=>op==='allowlist'?{httpStatus:200,body:{allowlisted:true}}:op==='generate'?{httpStatus:200,body:{status:0,url:'SYNTHETIC_NO_LOGIN',remainingSeconds:180}}:{httpStatus:200,body:{status:0,user:{userId:'999'},accessToken:'SYNTHETIC_NO_ACCOUNT'}},
-  photoFetcher:async(_url,{signal})=>{await new Promise((accept,reject)=>{const abort=()=>{clearTimeout(timer);timers.delete(timer);reject(new Error('photo_unavailable'));};const timer=setTimeout(()=>{timers.delete(timer);signal.removeEventListener('abort',abort);accept();},8000);timers.add(timer);signal.addEventListener('abort',abort,{once:true});if(signal.aborted)abort();});return {data:png,type:'image/png'};}});
+  photoFetcher:async(_url,{signal})=>{
+    upstreamPhotos++;maxUpstreamPhotos=Math.max(maxUpstreamPhotos,upstreamPhotos);
+    try{await new Promise((accept,reject)=>{const abort=()=>{upstreamAborts++;clearTimeout(timer);timers.delete(timer);signal.removeEventListener('abort',abort);reject(new Error('photo_unavailable'));};const timer=setTimeout(()=>{timers.delete(timer);signal.removeEventListener('abort',abort);accept();},8000);timers.add(timer);signal.addEventListener('abort',abort,{once:true});if(signal.aborted)abort();});return {data:png,type:'image/png'};}
+    finally{upstreamPhotos--;}
+  }});
 app.server.on('request',(req,res)=>{const path=req.url.split('?')[0],row={path,atMs:at(),closeMs:null,probe:req.headers['x-qa-photo-probe'] || null};trace.push(row);if(path==='/api/photo'){serverPhotos++;maxServerPhotos=Math.max(maxServerPhotos,serverPhotos);res.once('close',()=>serverPhotos--);}res.once('close',()=>row.closeMs=at());});
 async function connect(page,index){
   const socket=new WebSocket(page.webSocketDebuggerUrl),pending=new Map();let sequence=0;
   await new Promise((accept,reject)=>{socket.addEventListener('open',accept,{once:true});socket.addEventListener('error',reject,{once:true});});
   const call=(method,params={})=>new Promise((accept,reject)=>{const id=++sequence,timer=setTimeout(()=>{pending.delete(id);reject(new Error('CDP deadline '+method));},12000);pending.set(id,{accept,reject,timer});socket.send(JSON.stringify({id,method,params}));});
   socket.addEventListener('message',event=>{const v=JSON.parse(event.data),entry=pending.get(v.id);if(entry){pending.delete(v.id);clearTimeout(entry.timer);v.error?entry.reject(new Error('CDP rejected')):entry.accept(v.result);return;}const p=v.params,id=index+':'+p?.requestId;
-    if(v.method==='Network.requestWillBeSent'){const parsed=new URL(p.request.url);if(parsed.origin!==url)return;network.set(id,{tab:index,path:parsed.pathname,atMs:at(),doneMs:null,canceled:false});if(parsed.pathname==='/api/photo')maxPhotoHTTP=Math.max(maxPhotoHTTP,[...network.values()].filter(r=>r.path==='/api/photo'&&r.doneMs===null).length);}
-    else if(v.method==='Network.loadingFinished'||v.method==='Network.loadingFailed'){const row=network.get(id);if(row){row.doneMs=at();row.canceled=p.canceled===true;}}});
+    if(v.method==='Network.requestWillBeSent'){
+      const parsed=new URL(p.request.url);if(parsed.origin!==url)return;
+      const receivedMs=at(),sequence=++networkSequence;
+      network.set(id,{tab:index,path:parsed.pathname,atMs:receivedMs,doneMs:null,canceled:false,requestTimestamp:Number.isFinite(p.timestamp)?p.timestamp:null,doneTimestamp:null,requestWallTime:Number.isFinite(p.wallTime)?p.wallTime:null,startSequence:sequence,endSequence:null});
+      if(parsed.pathname==='/api/photo'){photoEvents.push({id,tab:index,kind:'start',monotonicTime:Number.isFinite(p.timestamp)?p.timestamp:null,receivedMs,sequence});maxPhotoHTTP=Math.max(maxPhotoHTTP,[...network.values()].filter(r=>r.path==='/api/photo'&&r.doneMs===null).length);}
+    }else if(v.method==='Network.loadingFinished'||v.method==='Network.loadingFailed'){
+      const row=network.get(id);if(row){row.doneMs=at();row.canceled=p.canceled===true;row.doneTimestamp=Number.isFinite(p.timestamp)?p.timestamp:null;row.endSequence=++networkSequence;if(row.path==='/api/photo')photoEvents.push({id,tab:index,kind:'end',monotonicTime:row.doneTimestamp,receivedMs:row.doneMs,sequence:row.endSequence});}
+    }});
   const evaluate=async expression=>{const r=await call('Runtime.evaluate',{expression,returnByValue:true,awaitPromise:true});if(r.exceptionDetails)throw new Error(r.exceptionDetails.exception?.description || 'UI evaluation failed');return r.result?.value;};
   const until=async expression=>{const end=Date.now()+12000;while(!await evaluate(expression).catch(()=>false)){if(Date.now()>end)throw new Error('UI fixture deadline');await sleep(30);}};
   const client={socket,pending,call,evaluate,until,id:page.id};clients.push(client);await call('Network.enable');await call('Page.enable');
@@ -48,18 +87,17 @@ try{
   // Native IO does not paint new background tabs. Activate each tab once so
   // all tabs actually enter their photo viewport before measuring overlap.
   for(const c of clients){await c.call('Target.activateTarget',{targetId:c.id});await c.evaluate('queueRefresh()');await c.until("document.querySelectorAll('.photo-open img').length===40");await c.evaluate('new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))');await sleep(150);}
-  await check(`${tabCount} tabs share at most two photo HTTP slots in one origin`,async()=>{assert.ok(maxPhotoHTTP<=2,`observed ${maxPhotoHTTP} browser photo requests`);assert.ok(maxServerPhotos<=2,`observed ${maxServerPhotos} server photo requests`);return {tabs:tabCount,maxPhotoHTTP,maxServerPhotos};});
+  await check(`${tabCount} tabs share at most two photo HTTP slots in one origin`,async()=>{const browserPhotoPeak=measuredPhotoPeak();assert.ok(browserPhotoPeak<=2,`observed ${browserPhotoPeak} browser photo requests`);assert.ok(maxServerPhotos<=2,`observed ${maxServerPhotos} server photo requests`);assert.ok(maxUpstreamPhotos<=2,`observed ${maxUpstreamPhotos} injected upstream fetches`);return {tabs:tabCount,browserPhotoPeak,receiptOrderPeak:maxPhotoHTTP,maxServerPhotos,maxUpstreamPhotos};});
   await check('all tabs can send status without waiting for slow photo responses',async()=>{const start=at();await Promise.all(clients.map((c,n)=>c.evaluate(`fetch('/api/status',{headers:{'X-Local-Session':localSession,'X-QA-Photo-Probe':${JSON.stringify(String(n))}},cache:'no-store'}).then(r=>r.json()).then(()=>true)`)));const arrivals=trace.filter(r=>r.probe!==null).map(r=>r.atMs-start);assert.equal(arrivals.length,tabCount);assert.ok(Math.max(...arrivals)<1000,`status pre-server waits: ${arrivals.join(',')}`);return {preServerWaitMs:arrivals};});
-  const switched=[];
   // Each explicit selection is made in a visible tab. Hidden-tab admission is
   // intentionally deferred by the app and must not be mistaken for HTTP wait.
   // Cancel the first holder before the waiters to exercise cross-tab handoff.
   for(const [index,c] of clients.entries()){
     await c.call('Target.activateTarget',{targetId:c.id});const switchAt=at();
-    await c.evaluate(`void selectRoom(${JSON.stringify(empty)});queueRefresh();true`);await c.until(`currentPage?.key===${JSON.stringify(empty)}&&!pendingSelection&&!busy&&!refreshing`);switched.push({tab:index,atMs:switchAt});
+    const switchWallTime=await c.evaluate(`(()=>{const boundary=performance.timeOrigin+performance.now();void selectRoom(${JSON.stringify(empty)});queueRefresh();return boundary;})()`);assert.ok(Number.isFinite(switchWallTime));await c.until(`currentPage?.key===${JSON.stringify(empty)}&&!pendingSelection&&!busy&&!refreshing`);switched.push({tab:index,atMs:switchAt,wallTimeMs:switchWallTime});
   }
   await sleep(150);
-  await check('all room changes cancel images and queued cross-tab locks',async()=>{const states=await clients[0].evaluate('navigator.locks.query()');const photoLocks=[...states.held,...states.pending].filter(row=>row.name.startsWith('web-kakao-photo-'));assert.equal(photoLocks.length,0);for(const row of switched)assert.equal([...network.values()].filter(r=>r.path==='/api/photo'&&r.tab===row.tab&&r.atMs>row.atMs).length,0,'old tab queue never resumes after its own switch');assert.ok([...network.values()].filter(r=>r.path==='/api/photo').every(r=>r.doneMs!==null&&r.canceled));assert.ok(maxPhotoHTTP<=2,`handoff peak ${maxPhotoHTTP}`);assert.ok(maxServerPhotos<=2,`server handoff peak ${maxServerPhotos}`);return {heldOrPendingPhotoLocks:0,maxPhotoHTTP,maxServerPhotos};});
+  await check('all room changes cancel images and queued cross-tab locks',async()=>{const states=await clients[0].evaluate('navigator.locks.query()');const photoLocks=[...states.held,...states.pending].filter(row=>row.name.startsWith('web-kakao-photo-'));assert.equal(photoLocks.length,0);for(const row of switched)assert.equal([...network.values()].filter(r=>r.path==='/api/photo'&&r.tab===row.tab&&r.requestWallTime*1000>row.wallTimeMs).length,0,'old tab queue never resumes after its own switch');assert.ok([...network.values()].filter(r=>r.path==='/api/photo').every(r=>r.doneMs!==null&&r.canceled));const browserPhotoPeak=measuredPhotoPeak({complete:true});assert.ok(browserPhotoPeak<=2,`handoff peak ${browserPhotoPeak}`);assert.ok(maxServerPhotos<=2,`server handoff peak ${maxServerPhotos}`);assert.ok(maxUpstreamPhotos<=2,`injected upstream peak ${maxUpstreamPhotos}`);assert.equal(upstreamPhotos,0,'all abandoned upstream fetches settle');assert.ok(upstreamAborts>0);assert.equal(timers.size,0,'no abandoned injected fetch timers');return {heldOrPendingPhotoLocks:0,browserPhotoPeak,receiptOrderPeak:maxPhotoHTTP,maxServerPhotos,maxUpstreamPhotos,upstreamAborts,upstreamPhotos};});
 }catch(error){fatal=String(error.stack);}
 finally{
   if(clients[0]?.socket.readyState===WebSocket.OPEN){try{await Promise.race([clients[0].call('Browser.close'),sleep(1000)]);}catch{}}
@@ -68,5 +106,6 @@ finally{
   app.lab.cancel();app.server.closeAllConnections();await new Promise(r=>app.server.close(r));for(const timer of timers)clearTimeout(timer);timers.clear();
   if(chromeExitObserved)rmSync(temporaryRoot,{recursive:true,force:true,maxRetries:5,retryDelay:100});cleanup={chromeExitObserved,serverClosed:!app.server.listening,temporaryRootRemoved:!existsSync(temporaryRoot),pending:clients.reduce((n,c)=>n+c.pending.size,0)};
 }
-writeFileSync(resolve(output,'result.json'),JSON.stringify({classification:'account-free local Chrome integration',actualAccountUsed:false,actual8787Used:false,node:process.version,elapsedMs:at(),checks,fatal,maxPhotoHTTP,maxServerPhotos,trace,network:[...network.values()],cleanup},null,2));
-console.log(JSON.stringify({checks:checks.length,passed:checks.filter(r=>r.status==='passed').length,fatal,maxPhotoHTTP,maxServerPhotos,cleanup,output}));if(fatal||checks.some(r=>r.status!=='passed')||!cleanup.chromeExitObserved||!cleanup.serverClosed||!cleanup.temporaryRootRemoved)process.exitCode=1;
+const photoTimeline=photoTiming();
+writeFileSync(resolve(output,'result.json'),JSON.stringify({classification:'account-free local Chrome integration',actualAccountUsed:false,actual8787Used:false,node:process.version,elapsedMs:at(),checks,fatal,maxPhotoHTTP,maxServerPhotos,maxUpstreamPhotos,upstreamAborts,upstreamPhotos,photoTimeline,photoEvents,switches:switched,trace,network:[...network.values()],cleanup},null,2));
+console.log(JSON.stringify({checks:checks.length,passed:checks.filter(r=>r.status==='passed').length,fatal,maxPhotoHTTP,maxServerPhotos,maxUpstreamPhotos,upstreamAborts,photoTimeline,cleanup,output}));if(fatal||checks.some(r=>r.status!=='passed')||!cleanup.chromeExitObserved||!cleanup.serverClosed||!cleanup.temporaryRootRemoved)process.exitCode=1;

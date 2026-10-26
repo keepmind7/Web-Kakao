@@ -34,6 +34,15 @@ export function createRoomState({perRoomLimit=2000,totalLimit=20000,bloomBytes=2
   const bloom=Buffer.alloc(bloomBytes),bloomBits=bloom.length*8;
   const rooms=new Map(),tokens=new Map(),notices=new Map(),exact=new Map();
   let entries=0,notifications=false,occupiedBits=0,globalPartial=false;
+  const retire=key=>{
+    const state=rooms.get(key);if(!state)return;
+    entries-=state.events.size;
+    for(const fingerprint of state.exact.keys())exact.delete(fingerprint);
+    for(const [token,issued] of tokens)if(issued.key===key)tokens.delete(token);
+    notices.delete(key);rooms.delete(key);
+    // Bloom bits are session-wide replay evidence. Clearing shared bits here
+    // would also forget retained rooms; reappearing rooms remain conservative.
+  };
   const get=key=>{
     if(!rooms.has(key)){
       if(rooms.size>=ROOM_LIMIT)return null;
@@ -57,6 +66,13 @@ export function createRoomState({perRoomLimit=2000,totalLimit=20000,bloomBytes=2
   }
   return {
     bind(rows,{reconnect=false,seedBounds,generation}={}){
+      if(!Array.isArray(rows))return;
+      const current=new Map();
+      for(const row of rows){if(roomKeyValid(row?.key) && !current.has(row.key))current.set(row.key,row);if(current.size>=ROOM_LIMIT)break;}
+      // Every bind is a complete vetted room snapshot, not an incremental add.
+      // Current membership must not compete with an earlier snapshot's 500 keys.
+      for(const key of rooms.keys())if(!current.has(key))retire(key);
+      rows=[...current.values()];
       const proof=seedProof(rows,seedBounds);
       for(const row of rows){
         if(!roomKeyValid(row?.key))continue;
