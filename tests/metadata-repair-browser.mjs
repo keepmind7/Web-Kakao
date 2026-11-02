@@ -1,20 +1,20 @@
 // Real browser/server/manager/session, wholly injected account-free protocol.
 // Never attach to8787 or an existing browser; all storage/profile roots are private QA-owned.
 import {spawn} from 'node:child_process';
-import {existsSync,mkdirSync,mkdtempSync,readFileSync,writeFileSync,rmSync} from 'node:fs';
+import {existsSync,mkdirSync,mkdtempSync,writeFileSync,rmSync} from 'node:fs';
 import {resolve,sep} from 'node:path';
 import {tmpdir} from 'node:os';
 import {EventEmitter} from 'node:events';
 import assert from 'node:assert/strict';
-import {testBrowser} from './browser-platform.mjs';
+import {testBrowser,browserDebugPort,browserCleanupPassed} from './browser-platform.mjs';
 const output=resolve(process.env.WEB_KAKAO_QA_OUTPUT_ROOT||'local-only/metadata-repair-20261021/qa/browser',String(Date.now()));mkdirSync(output,{recursive:true});
 const browserEnvironment={...process.env};for(const key of ['USERPROFILE','APPDATA','LOCALAPPDATA']){const original=process.env['WEB_KAKAO_QA_BROWSER_ORIGINAL_'+key];if(original)browserEnvironment[key]=original;}
+const browserEngine=process.env.WEB_KAKAO_QA_BROWSER==='edge'?'Edge':'Chrome';
+const chrome=browserEngine==='Edge'?['C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe','C:/Program Files/Microsoft/Edge/Application/msedge.exe'].find(existsSync):testBrowser({env:browserEnvironment});assert.ok(chrome,browserEngine+' installation required');
 const tempBase=resolve(tmpdir()),temporaryRoot=mkdtempSync(resolve(tempBase,'wk-meta-'));
 const profile=resolve(temporaryRoot,'p'),environment=resolve(temporaryRoot,'env');mkdirSync(environment,{recursive:true});
 for(const key of ['LOCALAPPDATA','APPDATA','USERPROFILE','TEMP','TMP']){process.env[key]=resolve(environment,key);mkdirSync(process.env[key],{recursive:true});}
 const [{createLocalServer},{createReaderSession},{createReadOnlyReader}]=await Promise.all([import('../experiments/local-web/server.mjs'),import('../experiments/local-web/reader-session.mjs'),import('../experiments/local-web/reader-manager.mjs')]);
-const browserEngine=process.env.WEB_KAKAO_QA_BROWSER==='edge'?'Edge':'Chrome';
-const chrome=browserEngine==='Edge'?['C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe','C:/Program Files/Microsoft/Edge/Application/msedge.exe'].find(existsSync):testBrowser();assert.ok(chrome,browserEngine+' installation required');
 const sleep=ms=>new Promise(r=>setTimeout(r,ms)),defer=()=>{let resolve;return {promise:new Promise(r=>{resolve=r;}),resolve};};
 const own='999',id='9007199254740993',link='700',credential={userId:own,deviceUUID:'SYNTHETIC_DEVICE',accessToken:'SYNTHETIC_NO_ACCOUNT'};
 const malicious='<img src=x onerror="globalThis.metadataInjected=true">';
@@ -56,8 +56,7 @@ try{
  const roomRows=reader.rooms().rooms;key=roomRows.find(r=>r.kind==='OpenMultiChat').key;one=roomRows.find(r=>r.title==='이름 없는 대화방 2').key;two=roomRows.find(r=>r.title==='이름 없는 대화방 3').key;
  await sleep(1050);assert.equal(calls.filter(c=>c.method==='CHATINFO').length,8);
  browser=spawn(chrome,['--headless=new','--no-first-run','--no-default-browser-check','--disable-extensions','--disable-background-networking','--disable-background-timer-throttling','--disable-renderer-backgrounding','--no-proxy-server','--remote-debugging-address=127.0.0.1','--remote-debugging-port=0','--user-data-dir='+profile,'--window-size=1100,900','about:blank'],{windowsHide:true,stdio:['ignore','ignore','pipe'],env:browserEnvironment});browser.stderr.on('data',data=>{chromeStderr=(chromeStderr+data.toString()).slice(-8000);});
- const file=resolve(profile,'DevToolsActivePort'),end=Date.now()+15000;while(!existsSync(file)){if(Date.now()>end)throw new Error('fresh Chrome startup deadline');await sleep(40);}
- const port=Number(readFileSync(file,'utf8').split(/\r?\n/)[0]),pages=await(await fetch(`http://127.0.0.1:${port}/json/list`)).json();socket=new WebSocket(pages.find(p=>p.type==='page').webSocketDebuggerUrl);await new Promise((resolve,reject)=>{socket.addEventListener('open',resolve,{once:true});socket.addEventListener('error',reject,{once:true});});socket.addEventListener('message',e=>{const r=JSON.parse(e.data),p=pending.get(r.id);if(!p)return;pending.delete(r.id);clearTimeout(p.timer);r.error?p.reject(new Error(r.error.message)):p.resolve(r.result);});
+ const port=await browserDebugPort(resolve(profile,'DevToolsActivePort'),{timeout:15000}),pages=await(await fetch(`http://127.0.0.1:${port}/json/list`)).json();socket=new WebSocket(pages.find(p=>p.type==='page').webSocketDebuggerUrl);await new Promise((resolve,reject)=>{socket.addEventListener('open',resolve,{once:true});socket.addEventListener('error',reject,{once:true});});socket.addEventListener('message',e=>{const r=JSON.parse(e.data),p=pending.get(r.id);if(!p)return;pending.delete(r.id);clearTimeout(p.timer);r.error?p.reject(new Error(r.error.message)):p.resolve(r.result);});
  const launch=await fetch(url+'/api/local/launch',{method:'POST',headers:{Origin:url,'Content-Type':'application/json','X-Local-Control':app.controlToken},body:'{}'});assert.equal(launch.status,200);await command('Page.navigate',{url:url+'/launch#launch='+(await launch.json()).ticket});await until("location.pathname==='/'&&lastState?.reader?.phase==='connected'&&!busy&&!refreshing");
  await evaluate("clearTimeout(pollTimer);pollTimer=null;Object.defineProperty(document,'hidden',{configurable:true,get:()=>false});document.hasFocus=()=>true;foregroundFocused=true;showAccount(false)");
  await select(key);assert.equal(reader.openRoom(key),true);await sleep(180);await refreshUi();
@@ -88,5 +87,5 @@ finally{
  assert.ok(resolve(temporaryRoot).startsWith(tempBase+sep),'cleanup root must be a generated child of the original temporary directory');
  for(const target of [profile,environment])assert.ok(resolve(target).startsWith(resolve(temporaryRoot)+sep),'cleanup target must remain within this generated QA temporary root');
  let cleanupError=null;try{if(chromeExitObserved)rmSync(temporaryRoot,{recursive:true,force:true,maxRetries:8,retryDelay:200});else rmSync(environment,{recursive:true,force:true,maxRetries:8,retryDelay:200});}catch(error){cleanupError={code:error.code??'cleanup_failed'};}
- const result={checks,fatal,actualAccount:false,browserEngine,classification:'account-free local browser integration',chrome:{exitCode:browser?.exitCode??null,signalCode:browser?.signalCode??null,stderr:chromeStderr},cleanup:{chromeExitObserved,serverClosed,pending:pending.size,profileRemoved:!existsSync(profile),environmentRemoved:!existsSync(environment),temporaryRootRemoved:!existsSync(temporaryRoot),error:cleanupError,temporaryRoot}};writeFileSync(resolve(output,'result.json'),JSON.stringify(result,null,2));console.log(JSON.stringify({checks:checks.length,passed:checks.filter(c=>c.status==='passed').length,expectedRed:checks.filter(c=>c.status==='expected_red').length,fixtureErrors:checks.filter(c=>c.status==='fixture_error').length,fatal,browserEngine,chrome:result.chrome,cleanup:result.cleanup,output}));if(fatal||cleanupError||checks.some(c=>c.status!=='passed'))process.exitCode=1;
+ const result={checks,fatal,actualAccount:false,browserEngine,classification:'account-free local browser integration',chrome:{exitCode:browser?.exitCode??null,signalCode:browser?.signalCode??null,stderr:chromeStderr},cleanup:{chromeExitObserved,serverClosed,pending:pending.size,profileRemoved:!existsSync(profile),environmentRemoved:!existsSync(environment),temporaryRootRemoved:!existsSync(temporaryRoot),error:cleanupError,temporaryRoot}};writeFileSync(resolve(output,'result.json'),JSON.stringify(result,null,2));console.log(JSON.stringify({checks:checks.length,passed:checks.filter(c=>c.status==='passed').length,expectedRed:checks.filter(c=>c.status==='expected_red').length,fixtureErrors:checks.filter(c=>c.status==='fixture_error').length,fatal,browserEngine,chrome:result.chrome,cleanup:result.cleanup,output}));if(fatal||!browserCleanupPassed(result.cleanup)||cleanupError||checks.some(c=>c.status!=='passed'))process.exitCode=1;
 }

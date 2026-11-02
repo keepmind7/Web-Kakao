@@ -1,24 +1,24 @@
 // Account-free local browser integration. Fresh profile, injected session, ephemeral server only.
 import {spawn,execFileSync} from 'node:child_process';
-import {existsSync,mkdirSync,mkdtempSync,readFileSync,writeFileSync,rmSync} from 'node:fs';
+import {existsSync,mkdirSync,mkdtempSync,writeFileSync,rmSync} from 'node:fs';
 import {resolve,sep} from 'node:path';
 import {pathToFileURL} from 'node:url';
 import {tmpdir} from 'node:os';
 import {EventEmitter} from 'node:events';
 import assert from 'node:assert/strict';
-import {testBrowser} from './browser-platform.mjs';
+import {testBrowser,browserDebugPort,browserCleanupPassed} from './browser-platform.mjs';
 const output=resolve(process.env.WEB_KAKAO_QA_OUTPUT_ROOT||'local-only/own-read-sync-20261021/qa/browser',String(Date.now()));mkdirSync(output,{recursive:true});
 // Windows browser known-folder discovery needs the inherited Windows locations;
 // its actual browser data stays in the explicit generated profile below.
 const browserEnvironment={...process.env};
 for(const key of ['USERPROFILE','APPDATA','LOCALAPPDATA'])browserEnvironment[key]=process.env['WEB_KAKAO_QA_BROWSER_ORIGINAL_'+key]||process.env[key];
+const browserEngine=process.env.WEB_KAKAO_QA_BROWSER==='edge'?'Edge':'Chrome';
+const chrome=browserEngine==='Edge'?['C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe','C:/Program Files/Microsoft/Edge/Application/msedge.exe'].find(existsSync):testBrowser({env:browserEnvironment});assert.ok(chrome,browserEngine+' installation required');
 const tempBase=resolve(tmpdir()),temporaryRoot=mkdtempSync(resolve(tempBase,'wk-own-browser-'));
 const profile=resolve(temporaryRoot,'p'),environment=resolve(temporaryRoot,'env');mkdirSync(environment,{recursive:true});
 for(const key of ['LOCALAPPDATA','APPDATA','USERPROFILE','TEMP','TMP']){process.env[key]=resolve(environment,key);mkdirSync(process.env[key],{recursive:true});}
 const load=name=>import(pathToFileURL(resolve('experiments/local-web',name)).href);
 const [{createLocalServer},{createReaderSession},{createReadOnlyReader}]=await Promise.all([load('server.mjs'),load('reader-session.mjs'),load('reader-manager.mjs')]);
-const browserEngine=process.env.WEB_KAKAO_QA_BROWSER==='edge'?'Edge':'Chrome';
-const chrome=browserEngine==='Edge'?['C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe','C:/Program Files/Microsoft/Edge/Application/msedge.exe'].find(existsSync):testBrowser();assert.ok(chrome,browserEngine+' installation required');
 const own='999',credential={userId:own,deviceUUID:'SYNTHETIC_DEVICE',accessToken:'SYNTHETIC_NO_ACCOUNT'},calls=[],checks=[],pending=new Map();
 const rows=[{c:'2000',t:'DirectChat',title:'Synthetic control',ll:'100',n:0},...['123','456','789','1000'].map(c=>({c,t:'DirectChat',title:'Synthetic '+c,ll:'100',n:3}))];
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
@@ -54,8 +54,7 @@ try{
  startupStage='synthetic-reader';assert.equal(reader.connect(credential),true);{const end=Date.now()+4000;while(reader.snapshot().phase!=='connected'){if(Date.now()>end)throw new Error('synthetic session deadline');await sleep(20);}}controlKey=reader.rooms().rooms.find(r=>r.title==='Synthetic control').key;
  startupStage='chrome-start';
  browser=spawn(chrome,['--headless=new','--no-first-run','--no-default-browser-check','--disable-extensions','--disable-background-networking','--disable-background-timer-throttling','--disable-renderer-backgrounding','--no-proxy-server','--remote-debugging-address=127.0.0.1','--remote-debugging-port=0','--user-data-dir='+profile,'--window-size=1100,900','about:blank'],{windowsHide:true,env:browserEnvironment,stdio:['ignore','ignore','pipe']});browser.stderr.on('data',data=>{chromeStderr=(chromeStderr+data.toString()).slice(-8000);});
- const file=resolve(profile,'DevToolsActivePort'),end=Date.now()+15000;while(!existsSync(file)){if(Date.now()>end)throw new Error('fresh Chrome startup deadline');await sleep(40);}
- startupStage='cdp-list';const port=Number(readFileSync(file,'utf8').split(/\r?\n/)[0]),pages=await(await fetch(`http://127.0.0.1:${port}/json/list`)).json();startupStage='cdp-websocket';socket=new WebSocket(pages.find(p=>p.type==='page').webSocketDebuggerUrl);await new Promise((resolve,reject)=>{socket.addEventListener('open',resolve,{once:true});socket.addEventListener('error',reject,{once:true});});socket.addEventListener('message',e=>{const r=JSON.parse(e.data),p=pending.get(r.id);if(!p)return;pending.delete(r.id);clearTimeout(p.timer);r.error?p.reject(new Error(r.error.message)):p.resolve(r.result);});
+ startupStage='cdp-list';const port=await browserDebugPort(resolve(profile,'DevToolsActivePort'),{timeout:15000}),pages=await(await fetch(`http://127.0.0.1:${port}/json/list`)).json();startupStage='cdp-websocket';socket=new WebSocket(pages.find(p=>p.type==='page').webSocketDebuggerUrl);await new Promise((resolve,reject)=>{socket.addEventListener('open',resolve,{once:true});socket.addEventListener('error',reject,{once:true});});socket.addEventListener('message',e=>{const r=JSON.parse(e.data),p=pending.get(r.id);if(!p)return;pending.delete(r.id);clearTimeout(p.timer);r.error?p.reject(new Error(r.error.message)):p.resolve(r.result);});
  startupStage='local-launch';const launch=await fetch(url+'/api/local/launch',{method:'POST',headers:{Origin:url,'Content-Type':'application/json','X-Local-Control':app.controlToken},body:'{}'});assert.equal(launch.status,200);startupStage='app-bootstrap';await command('Page.navigate',{url:url+'/launch#launch='+(await launch.json()).ticket});await until("location.pathname==='/'&&lastState?.reader?.phase==='connected'&&!busy&&!refreshing&&roomsCache.length===5");await evaluate('showAccount(false)');
  const original=await evaluate('location.href');assert.equal(await evaluate('selectedRoom'),controlKey);assert.equal(await evaluate("el('read-sync').checked"),false);
  await evaluate("el('filter-unread').click()");await until("roomFilter==='unread'&&!busy&&!refreshing");
@@ -87,5 +86,5 @@ finally{
   }else profileProcessCount=0;
   if(chromeExitObserved&&profileProcessCount===0)rmSync(temporaryRoot,{recursive:true,force:true,maxRetries:8,retryDelay:200});else rmSync(environment,{recursive:true,force:true,maxRetries:4,retryDelay:80});
  }catch(error){cleanupError={code:error.code??'cleanup_failed'};}
- const result={checks,fatal,startupStage,startupFailure,actualAccount:false,actual8787:false,classification:'account-free local browser integration',browserEngine,chrome:{exitCode:browser?.exitCode??null,signalCode:browser?.signalCode??null,stderr:chromeStderr},cleanup:{chromeExitObserved,profileProcessCount,serverClosed,pending:pending.size,profileRemoved:!existsSync(profile),environmentRemoved:!existsSync(environment),temporaryRootRemoved:!existsSync(temporaryRoot),temporaryRoot,error:cleanupError}};writeFileSync(resolve(output,'result.json'),JSON.stringify(result,null,2));console.log(JSON.stringify({checks:checks.length,passed:checks.filter(c=>c.status==='passed').length,failed:checks.filter(c=>c.status==='failed').length,fixtureErrors:checks.filter(c=>c.status==='fixture_error').length,fatal,startupStage,startupFailure,browserEngine,cleanup:result.cleanup,output}));if(fatal||cleanupError||profileProcessCount!==0||checks.some(c=>c.status!=='passed'))process.exitCode=1;
+ const result={checks,fatal,startupStage,startupFailure,actualAccount:false,actual8787:false,classification:'account-free local browser integration',browserEngine,chrome:{exitCode:browser?.exitCode??null,signalCode:browser?.signalCode??null,stderr:chromeStderr},cleanup:{chromeExitObserved,profileProcessCount,serverClosed,pending:pending.size,profileRemoved:!existsSync(profile),environmentRemoved:!existsSync(environment),temporaryRootRemoved:!existsSync(temporaryRoot),temporaryRoot,error:cleanupError}};writeFileSync(resolve(output,'result.json'),JSON.stringify(result,null,2));console.log(JSON.stringify({checks:checks.length,passed:checks.filter(c=>c.status==='passed').length,failed:checks.filter(c=>c.status==='failed').length,fixtureErrors:checks.filter(c=>c.status==='fixture_error').length,fatal,startupStage,startupFailure,browserEngine,cleanup:result.cleanup,output}));if(fatal||!browserCleanupPassed(result.cleanup)||cleanupError||profileProcessCount!==0||checks.some(c=>c.status!=='passed'))process.exitCode=1;
 }

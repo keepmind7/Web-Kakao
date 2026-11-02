@@ -93,3 +93,11 @@ python .agents/skills/harness/scripts/validate.py --project . --run next-run --c
 연결 안정화 검증에는 실제 SDK와 계정 없는 loopback 상대를 사용해 부가 조회 기한 후 같은 소켓의 후속 요청을 확인한다. 즉시 Error를 던지는 가짜 응답만으로 소켓 보존을 판정하지 않는다. 인증 단계의 거절·개별 작업 실패·단절·전송 결과 불명을 구분하고, 메타데이터 대기와 다중 이력을 포함한 전체 기한을 검사한다. 부모 서버 모듈 변경은 서버 재시작과 QR 재인증이 필요하며 기존 사용자 연결을 자동 종료하지 않는다.
 
 상세 후속 계획은 `.harness/FOLLOWUP.md`를 읽는다. 실제 작업 범위는 최신 사용자 요청과 작업 패킷으로 정한다. 정의 복원만 요청한 차수에서 제품 수정이나 실계정 실험을 자동으로 시작하지 않는다.
+
+## Alibaba Open Code Review
+
+프로젝트 로컬 스킬 `.agents/skills/open-code-review-delegate/SKILL.md`를 기본 진입점으로 쓴다. CLI는 공식 v1.13.3을 `local-only/tools/open-code-review/`에 두며 전역 PATH·공급자 설정을 변경하지 않는다. 처음 복원할 때 `py -X utf8 tools/open_code_review.py --install`로 공식 릴리스와 SHA-256을 확인해 설치한다. 이미 설치된 실행 파일을 사용할 때는 네트워크 설치를 반복하지 않는다.
+
+이 프로젝트에서 스킬의 `ocr` 명령은 `py -X utf8 tools/open_code_review.py`로 치환한다. `delegate preview --format json`으로 선정한 모든 `(path,status)`를 장부에 기록하고 `delegate rule --format json <paths...>`의 규칙과 프로젝트 도메인 계약을 함께 적용한다. 기본 범위는 작업 복사본의 변경이며 전체 저장소 감사로 보고하지 않는다. 선정 파일·제외 파일·주변 경로 검토 범위를 구분한다.
+
+위임 모드는 OCR의 파일 선정·규칙 해석과 호스트의 실제 검토로 구성되며 별도 OCR LLM 키가 필요 없다. 별도 모델을 이용한 `review`/`scan`은 공급자·전송 범위가 정해진 경우에 사용한다. APK·인증·실제 대화는 입력에 넣지 않는다. 설치 스킬이 다음 대화에서 발견되는 것과 이번 대화에서 파일을 읽어 실행한 근거를 구분한다. 실제 계정 권한과 기존 서버 경계는 위 규칙을 그대로 따른다.

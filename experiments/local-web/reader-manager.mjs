@@ -69,9 +69,13 @@ export function createReadOnlyReader({spawn=fork,now=Date.now,onBlocked=()=>{},g
   }
   function trimPages(){while(pages.size>CACHE_LIMIT){const key=[...pages.keys()].find(value=>value!==pinned);evict(key);}}
 
-  let profile=null,preparation=0;const preferenceKeys=new Map();
-  function preferenceResult(owner,result,apply){
-    const finish=accepted=>{if(!accepted || profile!==owner || phase==='closed')return false;return apply();};
+  let profile=null,preparation=0,preferenceGeneration={};const preferenceKeys=new Map();
+  function preferenceCurrent(owner,requestCurrent){
+    const generation=preferenceGeneration,attempt=attempts;
+    return ()=>profile===owner && phase!=='closed' && attempts===attempt && preferenceGeneration===generation && requestCurrent();
+  }
+  function preferenceResult(owner,result,apply,isCurrent=()=>true){
+    const finish=accepted=>{if(!accepted || profile!==owner || phase==='closed' || !isCurrent())return false;return apply();};
     return result?.then?Promise.resolve(result).then(finish,()=>false):finish(result);
   }
   function applySettings(rawRooms){
@@ -131,17 +135,22 @@ export function createReadOnlyReader({spawn=fork,now=Date.now,onBlocked=()=>{},g
     },
     photo(key,message,index){return pages.get(key)?.messages.find(row=>row.key===message)?.photos?.[index]?.url ?? null;},
     settingsSnapshot(){return profile?.snapshot() ?? null;},
-    updateSettings(patch){
-      const owner=profile;if(!owner || !validSettings(patch))return false;
-      return preferenceResult(owner,owner.set(patch,{isCurrent:()=>profile===owner}),()=>{roomState.notifications(owner.snapshot().notifications);settingsRevision++;revision++;return true;});
+    updateSettings(patch,{isCurrent:requestCurrent=()=>true}={}){
+      const owner=profile;if(!owner || !validSettings(patch) || typeof requestCurrent!=='function')return false;
+      const isCurrent=preferenceCurrent(owner,requestCurrent);if(!isCurrent())return false;
+      return preferenceResult(owner,owner.set(patch,{isCurrent}),()=>{roomState.notifications(owner.snapshot().notifications);settingsRevision++;revision++;return true;},isCurrent);
     },
-    forgetSettings(){
-      const owner=profile;if(!owner)return false;
-      return preferenceResult(owner,owner.forget({isCurrent:()=>profile===owner}),()=>{for(const row of rooms)roomState.settings(row.key,{title:null,pinOrder:null,muted:false});roomState.notifications(false);settingsRevision++;roomsRevision++;revision++;return true;});
+    forgetSettings({isCurrent:requestCurrent=()=>true}={}){
+      const owner=profile;if(!owner || typeof requestCurrent!=='function' || !requestCurrent())return false;
+      // Retire earlier work at admission, including direct manager callers.
+      // Failure to delete must not revive a queued readSync:true intention.
+      preferenceGeneration={};
+      const isCurrent=preferenceCurrent(owner,requestCurrent);
+      return preferenceResult(owner,owner.forget({isCurrent}),()=>{for(const row of rooms)roomState.settings(row.key,{title:null,pinOrder:null,muted:false});roomState.notifications(owner.snapshot().notifications===true);settingsRevision++;roomsRevision++;revision++;return true;},isCurrent);
     },
     roomPreferences(key,patch,{isCurrent:requestCurrent=()=>true}={}){
       if(typeof requestCurrent!=='function' || !rooms.some(row=>row.key===key) || !validRoomSettings(patch))return false;
-      const id=preferenceKeys.get(key),owner=profile,isCurrent=()=>profile===owner && rooms.some(row=>row.key===key) && requestCurrent();
+      const id=preferenceKeys.get(key),owner=profile,current=preferenceCurrent(owner,requestCurrent),isCurrent=()=>current() && rooms.some(row=>row.key===key);
       if(!isCurrent())return false;
       const apply=()=>{if(!isCurrent())return false;roomState.settings(key,{...patch,...(typeof patch.title==='string'?{title:patch.title.trim()}:{})});settingsRevision++;roomsRevision++;revision++;return true;};
       return id && owner?preferenceResult(owner,owner.setRoom(id,patch,{isCurrent}),apply):apply();

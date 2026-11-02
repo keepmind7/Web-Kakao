@@ -1,0 +1,7 @@
+{
+  "repository": "https://github.com/alibaba/open-code-review",
+  "ref": "v1.13.3",
+  "path": "skills/open-code-review-delegate/SKILL.md",
+  "upstream_sha256": "1ad19cca0a584e3175e171616a314ee8de5d4fb90c31971a40eff9bb2fb1f2f8",
+  "local_adaptation": "Project-local launcher note only; upstream workflow preserved"
+}

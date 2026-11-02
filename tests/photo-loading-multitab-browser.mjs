@@ -1,11 +1,13 @@
 // Real Chrome tabs, one isolated profile/origin, synthetic photo sources.
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
-import {existsSync,mkdirSync,mkdtempSync,readFileSync,writeFileSync,rmSync} from 'node:fs';
+import {existsSync,mkdirSync,mkdtempSync,writeFileSync,rmSync} from 'node:fs';
 import {resolve,join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {createLocalServer} from '../experiments/local-web/server.mjs';
-import {testBrowser} from './browser-platform.mjs';
+import {testBrowser,browserDebugPort} from './browser-platform.mjs';
+import {photoRequestAliases,photoWorkPeak,photoCanceled,rejectedPhotoRetry,observePhotoReply} from './photo-assertions.mjs';
+let traceOrder=0;
 const output=resolve(process.env.WEB_KAKAO_QA_OUTPUT_ROOT || 'local-only/photo-loading-multitab');mkdirSync(output,{recursive:true});
 const temporaryRoot=mkdtempSync(join(tmpdir(),'wk-photo-tabs-')),profile=resolve(temporaryRoot,'profile'),browserEnv={...process.env,TMPDIR:resolve(temporaryRoot,'tmp')};mkdirSync(browserEnv.TMPDIR,{mode:0o700});
 const chrome=testBrowser();assert.ok(chrome);const sleep=ms=>new Promise(r=>setTimeout(r,ms));
@@ -16,6 +18,8 @@ const png=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42
 let photos=false,browser,url,maxPhotoHTTP=0,maxServerPhotos=0,serverPhotos=0,upstreamPhotos=0,maxUpstreamPhotos=0,upstreamAborts=0,fatal=null;
 const started=Date.now(),at=()=>Date.now()-started,clients=[],timers=new Set(),trace=[],network=new Map(),checks=[];
 const photoEvents=[],switched=[];let networkSequence=0;
+// Correlate only synthetic request IDs. Never retain capabilities or full URLs.
+const syntheticRequestId=photoRequestAliases();
 // CDP delivery uses a separate WebSocket per target. Receipt order is retained
 // as diagnostic evidence; concurrency uses event occurrence timestamps.
 // wallTime anchors validate cross-target clock comparability.
@@ -53,7 +57,18 @@ const app=createLocalServer({mode:'live',messaging:false,encode:()=>[[true]],rea
     try{await new Promise((accept,reject)=>{const abort=()=>{upstreamAborts++;clearTimeout(timer);timers.delete(timer);signal.removeEventListener('abort',abort);reject(new Error('photo_unavailable'));};const timer=setTimeout(()=>{timers.delete(timer);signal.removeEventListener('abort',abort);accept();},8000);timers.add(timer);signal.addEventListener('abort',abort,{once:true});if(signal.aborted)abort();});return {data:png,type:'image/png'};}
     finally{upstreamPhotos--;}
   }});
-app.server.on('request',(req,res)=>{const path=req.url.split('?')[0],row={path,atMs:at(),closeMs:null,probe:req.headers['x-qa-photo-probe'] || null};trace.push(row);if(path==='/api/photo'){serverPhotos++;maxServerPhotos=Math.max(maxServerPhotos,serverPhotos);res.once('close',()=>serverPhotos--);}res.once('close',()=>row.closeMs=at());});
+app.server.prependListener('request',(req,res)=>{
+  const parsed=new URL(req.url,'http://synthetic.invalid'),path=parsed.pathname;
+  const row={path,method:req.method,atMs:at(),closeMs:null,probe:req.headers['x-qa-photo-probe'] || null,startOrder:++traceOrder,endOrder:null,responseStatus:null,responseFinished:false,syntheticRequestId:syntheticRequestId(parsed.searchParams.get('request'))};trace.push(row);observePhotoReply(res,row);
+  if(path==='/api/photo'){serverPhotos++;maxServerPhotos=Math.max(maxServerPhotos,serverPhotos);res.once('close',()=>serverPhotos--);}
+  if(path==='/api/photo/cancel'){
+    const chunks=[];let bytes=0;
+    req.on('data',chunk=>{bytes+=chunk.length;if(bytes<=8192)chunks.push(chunk);});
+    req.once('end',()=>{if(bytes>8192)return;try{row.syntheticRequestId=syntheticRequestId(JSON.parse(Buffer.concat(chunks).toString('utf8')).requestId);}catch{/* Product validation owns invalid bodies. */}});
+  }
+  res.once('finish',()=>{row.responseFinished=true;row.responseStatus=res.statusCode;});
+  res.once('close',()=>{row.closeMs=at();row.endOrder=++traceOrder;if(res.headersSent)row.responseStatus=res.statusCode;});
+});
 async function connect(page,index){
   const socket=new WebSocket(page.webSocketDebuggerUrl),pending=new Map();let sequence=0;
   await new Promise((accept,reject)=>{socket.addEventListener('open',accept,{once:true});socket.addEventListener('error',reject,{once:true});});
@@ -62,10 +77,12 @@ async function connect(page,index){
     if(v.method==='Network.requestWillBeSent'){
       const parsed=new URL(p.request.url);if(parsed.origin!==url)return;
       const receivedMs=at(),sequence=++networkSequence;
-      network.set(id,{tab:index,path:parsed.pathname,atMs:receivedMs,doneMs:null,canceled:false,requestTimestamp:Number.isFinite(p.timestamp)?p.timestamp:null,doneTimestamp:null,requestWallTime:Number.isFinite(p.wallTime)?p.wallTime:null,startSequence:sequence,endSequence:null});
+      network.set(id,{tab:index,path:parsed.pathname,syntheticRequestId:syntheticRequestId(parsed.searchParams.get('request')),atMs:receivedMs,doneMs:null,canceled:false,endMethod:null,errorText:null,responseStatus:null,requestTimestamp:Number.isFinite(p.timestamp)?p.timestamp:null,doneTimestamp:null,requestWallTime:Number.isFinite(p.wallTime)?p.wallTime:null,startSequence:sequence,endSequence:null});
       if(parsed.pathname==='/api/photo'){photoEvents.push({id,tab:index,kind:'start',monotonicTime:Number.isFinite(p.timestamp)?p.timestamp:null,receivedMs,sequence});maxPhotoHTTP=Math.max(maxPhotoHTTP,[...network.values()].filter(r=>r.path==='/api/photo'&&r.doneMs===null).length);}
+    }else if(v.method==='Network.responseReceived'){
+      const row=network.get(id);if(row)row.responseStatus=Number.isInteger(p.response?.status)?p.response.status:null;
     }else if(v.method==='Network.loadingFinished'||v.method==='Network.loadingFailed'){
-      const row=network.get(id);if(row){row.doneMs=at();row.canceled=p.canceled===true;row.doneTimestamp=Number.isFinite(p.timestamp)?p.timestamp:null;row.endSequence=++networkSequence;if(row.path==='/api/photo')photoEvents.push({id,tab:index,kind:'end',monotonicTime:row.doneTimestamp,receivedMs:row.doneMs,sequence:row.endSequence});}
+      const row=network.get(id);if(row){row.doneMs=at();row.canceled=p.canceled===true;row.endMethod=v.method;row.errorText=typeof p.errorText==='string'?p.errorText:null;row.doneTimestamp=Number.isFinite(p.timestamp)?p.timestamp:null;row.endSequence=++networkSequence;if(row.path==='/api/photo')photoEvents.push({id,tab:index,kind:'end',monotonicTime:row.doneTimestamp,receivedMs:row.doneMs,sequence:row.endSequence,endMethod:row.endMethod,errorText:row.errorText,canceled:row.canceled,responseStatus:row.responseStatus,syntheticRequestId:row.syntheticRequestId});}
     }});
   const evaluate=async expression=>{const r=await call('Runtime.evaluate',{expression,returnByValue:true,awaitPromise:true});if(r.exceptionDetails)throw new Error(r.exceptionDetails.exception?.description || 'UI evaluation failed');return r.result?.value;};
   const until=async expression=>{const end=Date.now()+12000;while(!await evaluate(expression).catch(()=>false)){if(Date.now()>end)throw new Error('UI fixture deadline');await sleep(30);}};
@@ -79,25 +96,24 @@ let cleanup;
 try{
   url=await app.listen(0);assert.notEqual(app.server.address().port,8787);await app.lab.start();const authEnd=Date.now()+5000;while(!app.lab.snapshot().credentialInMemory){if(Date.now()>authEnd)throw new Error('synthetic auth deadline');await sleep(20);}
   browser=spawn(chrome,['--headless=new','--no-first-run','--no-default-browser-check','--disable-extensions','--disable-background-networking','--disable-component-update','--disable-background-timer-throttling','--disable-renderer-backgrounding','--no-proxy-server','--remote-debugging-address=127.0.0.1','--remote-debugging-port=0','--user-data-dir='+profile,'--window-size=1100,900','about:blank'],{env:browserEnv,stdio:'ignore'});
-  const portFile=resolve(profile,'DevToolsActivePort'),startupEnd=Date.now()+15000;while(!existsSync(portFile)){if(Date.now()>startupEnd)throw new Error('isolated Chrome startup deadline');await sleep(40);}
-  const port=Number(readFileSync(portFile,'utf8').split(/\r?\n/)[0]);assert.notEqual(port,8787);
+  const port=await browserDebugPort(resolve(profile,'DevToolsActivePort'),{timeout:15000});assert.notEqual(port,8787);
   const pages=await(await fetch(`http://127.0.0.1:${port}/json/list`)).json();await connect(pages.find(p=>p.type==='page'),0);
   for(let n=1;n<tabCount;n++){const page=await(await fetch(`http://127.0.0.1:${port}/json/new?about:blank`,{method:'PUT'})).json();await connect(page,n);}
   photos=true;
   // Native IO does not paint new background tabs. Activate each tab once so
   // all tabs actually enter their photo viewport before measuring overlap.
   for(const c of clients){await c.call('Target.activateTarget',{targetId:c.id});await c.evaluate('queueRefresh()');await c.until("document.querySelectorAll('.photo-open img').length===40");await c.evaluate('new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))');await sleep(150);}
-  await check(`${tabCount} tabs share at most two photo HTTP slots in one origin`,async()=>{const browserPhotoPeak=measuredPhotoPeak();assert.ok(browserPhotoPeak<=2,`observed ${browserPhotoPeak} browser photo requests`);assert.ok(maxServerPhotos<=2,`observed ${maxServerPhotos} server photo requests`);assert.ok(maxUpstreamPhotos<=2,`observed ${maxUpstreamPhotos} injected upstream fetches`);return {tabs:tabCount,browserPhotoPeak,receiptOrderPeak:maxPhotoHTTP,maxServerPhotos,maxUpstreamPhotos};});
+  await check(`${tabCount} tabs share at most two photo HTTP slots in one origin`,async()=>{const browserPhotoPeak=measuredPhotoPeak();assert.ok(browserPhotoPeak<=2,`observed ${browserPhotoPeak} browser photo requests`);assert.ok(photoWorkPeak(trace)<=2,`observed ${photoWorkPeak(trace)} admitted server photo jobs; total HTTP peak ${maxServerPhotos}`);assert.ok(maxUpstreamPhotos<=2,`observed ${maxUpstreamPhotos} injected upstream fetches`);return {tabs:tabCount,browserPhotoPeak,receiptOrderPeak:maxPhotoHTTP,maxServerPhotos,maxUpstreamPhotos};});
   await check('all tabs can send status without waiting for slow photo responses',async()=>{const start=at();await Promise.all(clients.map((c,n)=>c.evaluate(`fetch('/api/status',{headers:{'X-Local-Session':localSession,'X-QA-Photo-Probe':${JSON.stringify(String(n))}},cache:'no-store'}).then(r=>r.json()).then(()=>true)`)));const arrivals=trace.filter(r=>r.probe!==null).map(r=>r.atMs-start);assert.equal(arrivals.length,tabCount);assert.ok(Math.max(...arrivals)<1000,`status pre-server waits: ${arrivals.join(',')}`);return {preServerWaitMs:arrivals};});
   // Each explicit selection is made in a visible tab. Hidden-tab admission is
   // intentionally deferred by the app and must not be mistaken for HTTP wait.
   // Cancel the first holder before the waiters to exercise cross-tab handoff.
   for(const [index,c] of clients.entries()){
-    await c.call('Target.activateTarget',{targetId:c.id});const switchAt=at();
-    const switchWallTime=await c.evaluate(`(()=>{const boundary=performance.timeOrigin+performance.now();void selectRoom(${JSON.stringify(empty)});queueRefresh();return boundary;})()`);assert.ok(Number.isFinite(switchWallTime));await c.until(`currentPage?.key===${JSON.stringify(empty)}&&!pendingSelection&&!busy&&!refreshing`);switched.push({tab:index,atMs:switchAt,wallTimeMs:switchWallTime});
+    await c.call('Target.activateTarget',{targetId:c.id});const switchAt=at(),knownPhotoIds=[...new Set([...network.values()].filter(row=>row.path==='/api/photo'&&row.tab===index).map(row=>row.syntheticRequestId))];
+    const switchWallTime=await c.evaluate(`(()=>{const boundary=performance.timeOrigin+performance.now();void selectRoom(${JSON.stringify(empty)});queueRefresh();return boundary;})()`);assert.ok(Number.isFinite(switchWallTime));await c.until(`currentPage?.key===${JSON.stringify(empty)}&&!pendingSelection&&!busy&&!refreshing`);switched.push({tab:index,atMs:switchAt,wallTimeMs:switchWallTime,knownPhotoIds});
   }
   await sleep(150);
-  await check('all room changes cancel images and queued cross-tab locks',async()=>{const states=await clients[0].evaluate('navigator.locks.query()');const photoLocks=[...states.held,...states.pending].filter(row=>row.name.startsWith('web-kakao-photo-'));assert.equal(photoLocks.length,0);for(const row of switched)assert.equal([...network.values()].filter(r=>r.path==='/api/photo'&&r.tab===row.tab&&r.requestWallTime*1000>row.wallTimeMs).length,0,'old tab queue never resumes after its own switch');assert.ok([...network.values()].filter(r=>r.path==='/api/photo').every(r=>r.doneMs!==null&&r.canceled));const browserPhotoPeak=measuredPhotoPeak({complete:true});assert.ok(browserPhotoPeak<=2,`handoff peak ${browserPhotoPeak}`);assert.ok(maxServerPhotos<=2,`server handoff peak ${maxServerPhotos}`);assert.ok(maxUpstreamPhotos<=2,`injected upstream peak ${maxUpstreamPhotos}`);assert.equal(upstreamPhotos,0,'all abandoned upstream fetches settle');assert.ok(upstreamAborts>0);assert.equal(timers.size,0,'no abandoned injected fetch timers');return {heldOrPendingPhotoLocks:0,browserPhotoPeak,receiptOrderPeak:maxPhotoHTTP,maxServerPhotos,maxUpstreamPhotos,upstreamAborts,upstreamPhotos};});
+  await check('all room changes cancel images and queued cross-tab locks',async()=>{const states=await clients[0].evaluate('navigator.locks.query()');const photoLocks=[...states.held,...states.pending].filter(row=>row.name.startsWith('web-kakao-photo-'));assert.equal(photoLocks.length,0);for(const row of switched)assert.ok([...network.values()].filter(r=>r.path==='/api/photo'&&r.tab===row.tab&&r.requestWallTime*1000>row.wallTimeMs).every(r=>row.knownPhotoIds.includes(r.syntheticRequestId)&&r.endMethod==='Network.loadingFinished'&&r.responseStatus===409&&photoCanceled(r,trace)),'old tab queue never resumes; only rejected retries of known IDs are allowed');assert.ok([...network.values()].filter(r=>r.path==='/api/photo').every(r=>photoCanceled(r,trace)));const browserPhotoPeak=measuredPhotoPeak({complete:true});assert.ok(browserPhotoPeak<=2,`handoff peak ${browserPhotoPeak}`);assert.ok(photoWorkPeak(trace)<=2,`admitted server handoff peak ${photoWorkPeak(trace)}; total HTTP peak ${maxServerPhotos}`);assert.ok(maxUpstreamPhotos<=2,`injected upstream peak ${maxUpstreamPhotos}`);assert.equal(upstreamPhotos,0,'all abandoned upstream fetches settle');assert.ok(upstreamAborts>0);assert.equal(timers.size,0,'no abandoned injected fetch timers');return {heldOrPendingPhotoLocks:0,browserPhotoPeak,receiptOrderPeak:maxPhotoHTTP,maxServerPhotos,maxUpstreamPhotos,upstreamAborts,upstreamPhotos};});
 }catch(error){fatal=String(error.stack);}
 finally{
   if(clients[0]?.socket.readyState===WebSocket.OPEN){try{await Promise.race([clients[0].call('Browser.close'),sleep(1000)]);}catch{}}
@@ -106,6 +122,6 @@ finally{
   app.lab.cancel();app.server.closeAllConnections();await new Promise(r=>app.server.close(r));for(const timer of timers)clearTimeout(timer);timers.clear();
   if(chromeExitObserved)rmSync(temporaryRoot,{recursive:true,force:true,maxRetries:5,retryDelay:100});cleanup={chromeExitObserved,serverClosed:!app.server.listening,temporaryRootRemoved:!existsSync(temporaryRoot),pending:clients.reduce((n,c)=>n+c.pending.size,0)};
 }
-const photoTimeline=photoTiming();
+const photoTimeline=photoTiming();photoTimeline.admittedServerPeak=photoWorkPeak(trace);photoTimeline.rejectedRetries=trace.filter(rejectedPhotoRetry).length;
 writeFileSync(resolve(output,'result.json'),JSON.stringify({classification:'account-free local Chrome integration',actualAccountUsed:false,actual8787Used:false,node:process.version,elapsedMs:at(),checks,fatal,maxPhotoHTTP,maxServerPhotos,maxUpstreamPhotos,upstreamAborts,upstreamPhotos,photoTimeline,photoEvents,switches:switched,trace,network:[...network.values()],cleanup},null,2));
 console.log(JSON.stringify({checks:checks.length,passed:checks.filter(r=>r.status==='passed').length,fatal,maxPhotoHTTP,maxServerPhotos,maxUpstreamPhotos,upstreamAborts,photoTimeline,cleanup,output}));if(fatal||checks.some(r=>r.status!=='passed')||!cleanup.chromeExitObserved||!cleanup.serverClosed||!cleanup.temporaryRootRemoved)process.exitCode=1;

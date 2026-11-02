@@ -11,6 +11,8 @@ import sys
 import tomllib
 from urllib.parse import unquote, urlsplit
 
+from common import path_prefixes_overlap
+
 AGENT_NAME = re.compile(r"[a-z][a-z0-9_]{1,62}\Z")
 SKILL_NAME = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
 STALE = re.compile(r"\b(?:TeamCreate|TeamDelete|TaskCreate|TaskUpdate|SendMessage|CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS)\b|\.claude/(?:agents|skills)/|\bclaude -p\b|run_in_background\s*[:=]|model:\s*[\"']?opus\b")
@@ -158,7 +160,7 @@ def validate_plan(path: Path) -> list[str]:
         for right in running[index + 1:]:
             for a in prefixes[left]:
                 for b in prefixes[right]:
-                    if not a or not b or a == b or a.startswith(b + "/") or b.startswith(a + "/"):
+                    if path_prefixes_overlap(a, b):
                         raise ValueError(f"Running tasks {left} and {right} have overlapping write ownership.")
     if "schema_version" in data:
         from run_checks import validate_plan_metadata

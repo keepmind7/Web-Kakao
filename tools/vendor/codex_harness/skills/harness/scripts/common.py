@@ -4,18 +4,32 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import stat
 import tomllib
 
 
 def safe_path(path: Path) -> Path:
-    """Reject symlink traversal before writing project configuration."""
-    path = Path(os.path.abspath(path.expanduser()))
-    for part in (path, *path.parents):
-        if part.is_symlink():
-            raise ValueError(f"Refusing symlink destination: {part}")
-        if part != path and part.exists() and not part.is_dir():
+    """Reject lexical symlink/reparse traversal before configuration writes."""
+    path = path.expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    for part in reversed((path, *path.parents)):
+        try:
+            info = part.lstat()
+        except FileNotFoundError:
+            continue
+        if (stat.S_ISLNK(info.st_mode)
+                or getattr(info, "st_file_attributes", 0) & 0x400):
+            raise ValueError(f"Refusing symlink or reparse destination: {part}")
+        if part != path and not stat.S_ISDIR(info.st_mode):
             raise ValueError(f"Destination parent is not a directory: {part}")
-    return path
+    return Path(os.path.abspath(path))
+
+
+def path_prefixes_overlap(left: str, right: str) -> bool:
+    """Compare normalized ownership prefixes with the host's case semantics."""
+    a, b = (os.path.normcase(value).replace("\\", "/") for value in (left, right))
+    return not a or not b or a == b or a.startswith(b + "/") or b.startswith(a + "/")
 
 
 def existing_bytes(path: Path) -> bytes | None:

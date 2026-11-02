@@ -16,7 +16,7 @@ import re
 import tempfile
 import tomllib
 
-from common import safe_path
+from common import path_prefixes_overlap, safe_path
 from run_support import atomic_json, load_json, locked, project_path, run_path, snapshot_inputs
 from validate import ownership_prefix
 
@@ -44,8 +44,7 @@ def _strings(value: object, label: str) -> list[str]:
 
 
 def _overlap(left: str, right: str) -> bool:
-    a, b = ownership_prefix(left), ownership_prefix(right)
-    return not a or not b or a == b or a.startswith(b + "/") or b.startswith(a + "/")
+    return path_prefixes_overlap(ownership_prefix(left), ownership_prefix(right))
 
 
 def _project_overlap(project: Path, left: str, right: str) -> bool:

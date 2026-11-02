@@ -97,14 +97,19 @@ export function createPreferenceStore({folder=null,asyncSecurity=false,secureFol
       const id=preferenceId(secret,'account',userId),path=base?join(base,id+'.json'):null;
       // A damaged file is never overwritten or deleted implicitly: the next persistent write first renames it to
       // .corrupt-<time> in the same private folder (a failed rename keeps writes blocked); only forget() deletes it.
-      let state=defaults(),error=keyError,corrupt=false,closed=false;
+      let state=defaults(),error=keyError,corrupt=false,closed=false,generation={};
       if(!keyError)try{const disk=yield* load(path);if(disk){state=disk.state;error=disk.dropped;}}catch{error=corrupt=true;}
       // Each change is applied to the file as it is now, so another store's earlier changes survive.
       // ponytail: no cross-process lock; two servers writing one account within the same instant can still race.
       function commit(change,reset=false,{isCurrent=()=>true}={}){
-        if(closed)return false;
+        if(closed || typeof isCurrent!=='function')return false;
+        try{if(!isCurrent())return false;}catch{return false;}
+        // Reset admission fences work already queued or awaiting a permission
+        // check. Keep the new generation even when deletion itself fails.
+        if(reset)generation={};
+        const admitted=generation;
         return enqueue(function*(){
-        const current=()=>{if(closed || !isCurrent())throw new Error('settings_stale');};
+        const current=()=>{if(closed || generation!==admitted || !isCurrent())throw new Error('settings_stale');};
         try{
           // A damaged installation key cannot identify this account's files.
           // Do not report a successful deletion in a random temporary namespace.
@@ -130,8 +135,8 @@ export function createPreferenceStore({folder=null,asyncSecurity=false,secureFol
               const backup=join(base,name);yield* check(backup);current();unlinkSync(backup);
             }
           }
-          state=next;error=corrupt;return true;
-        }catch{if(!closed)error=true;return false;}
+          current();state=next;error=corrupt;return true;
+        }catch{if(!closed && generation===admitted)error=true;return false;}
       },()=>{error=true;return false;});}
       return {
         key:()=>Buffer.from(secret),

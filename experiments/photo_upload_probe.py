@@ -56,6 +56,8 @@ def main():
         raise SystemExit('Explicit approval of self-chat recipient and synthetic image is required.')
     # Only the generated, fixed image above can be sent. Never a user file.
     url, client, state = connect()
+    require(state.get('build', 0) < 8,
+            'Legacy photo probe does not support build8+ browser sessions; no photo request was sent. Use the web UI after separate approval.')
     require(state.get('credentialInMemory') and state.get('messaging'), 'An authenticated messaging session is required.')
     require(state.get('reader', {}).get('phase') == 'connected' and not state['reader'].get('operationBusy'), 'A connected, idle reader is required.')
     with client.open(url+'/api/reader/rooms', timeout=4) as response:

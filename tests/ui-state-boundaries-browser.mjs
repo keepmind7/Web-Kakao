@@ -1,11 +1,11 @@
 // Isolated real Chrome + synthetic local server. No real account or external transport.
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
-import {existsSync,mkdirSync,mkdtempSync,readFileSync,writeFileSync} from 'node:fs';
+import {mkdirSync,mkdtempSync,writeFileSync} from 'node:fs';
 import {resolve,join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {createLocalServer} from '../experiments/local-web/server.mjs';
-import {testBrowser} from './browser-platform.mjs';
+import {testBrowser,browserDebugPort,browserCleanupPassed} from './browser-platform.mjs';
 const output=resolve(process.env.WEB_KAKAO_QA_OUTPUT_ROOT || 'local-only/ui-state-boundaries-browser');mkdirSync(output,{recursive:true});
 const temporary=mkdtempSync(join(tmpdir(),'wk-ui-boundary-')),profile=resolve(temporary,'p'),chrome=testBrowser();assert.ok(chrome);
 const sleep=ms=>new Promise(r=>setTimeout(r,ms)),defer=()=>{let resolve;const promise=new Promise(r=>{resolve=r;});return {promise,resolve};};
@@ -27,8 +27,7 @@ try{
   const url=await app.listen(0);assert.notEqual(app.server.address().port,8787);await app.lab.start();
   const authEnd=Date.now()+5000;while(!app.lab.snapshot().credentialInMemory){if(Date.now()>authEnd)throw Error('synthetic auth deadline');await sleep(20);}
   browser=spawn(chrome,['--headless=new','--no-first-run','--no-default-browser-check','--disable-extensions','--disable-background-networking','--disable-background-timer-throttling','--disable-renderer-backgrounding','--no-proxy-server','--remote-debugging-address=127.0.0.1','--remote-debugging-port=0','--user-data-dir='+profile,'--window-size=1100,900','about:blank'],{windowsHide:true,stdio:'ignore'});
-  const file=resolve(profile,'DevToolsActivePort'),end=Date.now()+15000;while(!existsSync(file)){if(Date.now()>end)throw Error('Chrome startup deadline');await sleep(40);}
-  const port=Number(readFileSync(file,'utf8').split(/\r?\n/)[0]);assert.notEqual(port,8787);
+  const port=await browserDebugPort(resolve(profile,'DevToolsActivePort'),{timeout:15000});assert.notEqual(port,8787);
   const pages=await(await fetch(`http://127.0.0.1:${port}/json/list`)).json();socket=new WebSocket(pages.find(p=>p.type==='page').webSocketDebuggerUrl);
   await new Promise((a,b)=>{socket.addEventListener('open',a,{once:true});socket.addEventListener('error',b,{once:true});});
   socket.addEventListener('message',event=>{const r=JSON.parse(event.data),entry=pending.get(r.id);if(!entry)return;pending.delete(r.id);clearTimeout(entry.timer);r.error?entry.reject(Error(r.error.message)):entry.accept(r.result);});
@@ -95,5 +94,5 @@ finally{
   app.lab.cancel();app.server.closeAllConnections();await new Promise(r=>app.server.close(r));
   const result={actualAccountUsed:false,actual8787Used:false,checks,fatal,cleanup:{chromeExitObserved,serverListening:app.server.listening,pending:pending.size},temporary};
   writeFileSync(resolve(output,'result.json'),JSON.stringify(result,null,2));console.log(JSON.stringify({output,checks:checks.length,passed:checks.filter(c=>c.status==='passed').length,fatal,cleanup:result.cleanup}));
-  if(fatal||checks.some(c=>c.status!=='passed'))process.exitCode=1;
+  if(fatal||!browserCleanupPassed(result.cleanup)||checks.some(c=>c.status!=='passed'))process.exitCode=1;
 }

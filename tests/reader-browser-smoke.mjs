@@ -1,14 +1,14 @@
 // Explicit offline browser fixture. Never attach to the user's browser/profile
 // or the actual account server. Only synthetic text is captured.
 import { spawn } from 'node:child_process';
-import { existsSync,mkdirSync,readFileSync,writeFileSync } from 'node:fs';
+import {mkdirSync,writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { createLocalServer } from '../experiments/local-web/server.mjs';
 import { decodeImage } from '../experiments/local-web/message-content.mjs';
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import http from 'node:http';
-import {testBrowser} from './browser-platform.mjs';
+import {testBrowser,browserDebugPort,browserCleanupPassed} from './browser-platform.mjs';
 
 const chrome=testBrowser();
 if(!chrome)throw new Error('Chrome unavailable; browser test not executed');
@@ -61,17 +61,16 @@ const app=createLocalServer({controlToken,mode:'live',messaging:true,photoFetche
 })});
 app.server.on('request',req=>{if(req.url==='/api/status')statusRequests++;if(req.url.startsWith('/api/photo?'))photoRequests++;fixtureRequests.push({method:req.method,path:req.url.split('?')[0],room:new URL(req.url,'http://synthetic.invalid').searchParams.get('room')});});
 const url=await app.listen(0);
-let browser,ws;
+let browser,ws,summary;const pending=new Map();
 const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 try{
   browser=spawn(chrome,['--headless=new','--no-first-run','--no-default-browser-check','--disable-extensions','--disable-background-networking','--disable-background-timer-throttling','--disable-renderer-backgrounding','--disable-backgrounding-occluded-windows','--no-proxy-server','--remote-debugging-address=127.0.0.1','--remote-debugging-port=0','--user-data-dir='+resolve(folder,'profile'),'--window-size=1280,1000',url],{windowsHide:true,stdio:'ignore'});
   const deadline=Date.now()+15000;const portFile=resolve(folder,'profile/DevToolsActivePort');
-  while(!existsSync(portFile)){if(Date.now()>deadline)throw new Error('browser startup timeout');await sleep(100);}
-  const port=Number(readFileSync(portFile,'utf8').split(/\r?\n/)[0]);
+  const port=await browserDebugPort(portFile);
   let page;
   while(!page){const pages=await(await fetch(`http://127.0.0.1:${port}/json/list`)).json();page=pages.find(item=>item.url===url+'/');if(!page){if(Date.now()>deadline)throw new Error('page timeout');await sleep(100);}}
   ws=new WebSocket(page.webSocketDebuggerUrl);await new Promise((resolve,reject)=>{ws.addEventListener('open',resolve,{once:true});ws.addEventListener('error',reject,{once:true});});
-  let sequence=0;const pending=new Map();
+  let sequence=0;
   ws.addEventListener('message',event=>{const message=JSON.parse(event.data);const item=pending.get(message.id);if(item){pending.delete(message.id);clearTimeout(item.timer);message.error?item.reject(new Error(`CDP ${item.method} failed (${message.error.code}): ${String(message.error.message).slice(0,160)}`)):item.resolve(message.result);}});
   const call=(method,params={})=>new Promise((resolve,reject)=>{const id=++sequence;const timer=setTimeout(()=>{pending.delete(id);reject(new Error(`CDP ${method} timeout`));},5000);pending.set(id,{method,resolve,reject,timer});ws.send(JSON.stringify({id,method,params}));});
   const evaluate=async expression=>{
@@ -100,7 +99,7 @@ try{
       target=await call('Target.createTarget',{url:await launchUrl()});
       const targets=await(await fetch(`http://127.0.0.1:${port}/json/list`)).json();const remote=targets.find(row=>row.id===target.targetId);assert.ok(remote,'test-owned second target must exist');
       const socket=new WebSocket(remote.webSocketDebuggerUrl);extraSockets.push(socket);await new Promise((resolve,reject)=>{socket.addEventListener('open',resolve,{once:true});socket.addEventListener('error',reject,{once:true});});
-      let sequence=0;const pending=new Map();socket.addEventListener('message',event=>{const message=JSON.parse(event.data),entry=pending.get(message.id);if(!entry)return;pending.delete(message.id);clearTimeout(entry.timer);message.error?entry.reject(new Error('second target CDP error')):entry.resolve(message.result);});
+      let sequence=0;socket.addEventListener('message',event=>{const message=JSON.parse(event.data),entry=pending.get(message.id);if(!entry)return;pending.delete(message.id);clearTimeout(entry.timer);message.error?entry.reject(new Error('second target CDP error')):entry.resolve(message.result);});
       const tabCall=(method,params={})=>new Promise((resolve,reject)=>{const id=++sequence,timer=setTimeout(()=>{pending.delete(id);reject(new Error('second target timeout'));},5000);pending.set(id,{resolve,reject,timer});socket.send(JSON.stringify({id,method,params}));});
       const evalTab=async expression=>{const result=await tabCall('Runtime.evaluate',{expression,returnByValue:true,awaitPromise:true});if(result.exceptionDetails)throw new Error(result.exceptionDetails.exception?.description || 'second target evaluation failed');return result.result?.value;};
       const wait=async expression=>{const end=Date.now()+10000;while(!await evalTab(expression)){if(Date.now()>end)throw new Error('second target condition timeout');await sleep(50);}};
@@ -222,7 +221,7 @@ await check('closing the photo dialog disables download',async()=>{assert.equal(
       target=await call('Target.createTarget',{url:await launchUrl()});
       const targets=await(await fetch(`http://127.0.0.1:${port}/json/list`)).json();const remote=targets.find(row=>row.id===target.targetId);assert.ok(remote);
       socket=new WebSocket(remote.webSocketDebuggerUrl);await new Promise((resolve,reject)=>{socket.addEventListener('open',resolve,{once:true});socket.addEventListener('error',reject,{once:true});});
-      let sequence=0;const pending=new Map();socket.addEventListener('message',event=>{const message=JSON.parse(event.data),entry=pending.get(message.id);if(!entry)return;pending.delete(message.id);clearTimeout(entry.timer);message.error?entry.reject(Error('D2 second target CDP error')):entry.resolve(message.result);});
+      let sequence=0;socket.addEventListener('message',event=>{const message=JSON.parse(event.data),entry=pending.get(message.id);if(!entry)return;pending.delete(message.id);clearTimeout(entry.timer);message.error?entry.reject(Error('D2 second target CDP error')):entry.resolve(message.result);});
       const tabCall=(method,params={})=>new Promise((resolve,reject)=>{const id=++sequence,timer=setTimeout(()=>{pending.delete(id);reject(Error('D2 second target timeout'));},5000);pending.set(id,{resolve,reject,timer});socket.send(JSON.stringify({id,method,params}));});
       const evalTab=async expression=>{const value=await tabCall('Runtime.evaluate',{expression,returnByValue:true,awaitPromise:true});if(value.exceptionDetails)throw Error('D2 second target evaluation failed');return value.result?.value;};
       const waitTab=async expression=>{const end=Date.now()+10000;while(!await evalTab(expression)){if(Date.now()>end)throw Error('D2 second target readiness timeout');await sleep(30);}};
@@ -872,18 +871,18 @@ await check('closing the photo dialog disables download',async()=>{assert.equal(
   await until("document.querySelectorAll('.room-item').length===2");
   assert.equal(await evaluate("document.getElementById('title').textContent"),'대화 서버 연결됨');
   assert.equal(await evaluate("getComputedStyle(document.querySelector('.app-shell')).display"),'grid');
-  if(process.env.WEB_KAKAO_QA_D2_ONLY==='1'){await checkRejectedSelection();console.log(JSON.stringify({passed:true,scope:'synthetic two-tab rejected view only',checks:lifecycleChecks,actualAccountUsed:false,artifacts:folder}));}
-  else if(process.env.WEB_KAKAO_QA_HTTPS_LIFECYCLE_ONLY==='1'){await checkDefaultHttpsLifecycle();console.log(JSON.stringify({passed:true,scope:'synthetic default HTTPS QR and clear lifecycle',checks:lifecycleChecks,actualAccountUsed:false,artifacts:folder}));}
-  else if(process.env.WEB_KAKAO_QA_PHOTO_ONLY==='1'){await checkPhotoConversion();console.log(JSON.stringify({passed:true,scope:'synthetic photo conversion and submit only',checks:lifecycleChecks,actualAccountUsed:false,artifacts:folder}));}
-  else if(process.env.WEB_KAKAO_QA_ADVERSARIAL_ONLY==='1'){await checkAdversarialBrowser();console.log(JSON.stringify({passed:true,scope:'synthetic adversarial browser only',checks:lifecycleChecks,actualAccountUsed:false,artifacts:folder}));}
-  else if(process.env.WEB_KAKAO_QA_UI_ONLY==='1'){await checkMobileAndThemes();await checkThemeBrowser();await checkHeaderLayout();console.log(JSON.stringify({passed:true,scope:'synthetic A UI theme and mobile only',checks:lifecycleChecks,actualAccountUsed:false,artifacts:folder}));}
-  else if(process.env.WEB_KAKAO_QA_THEME_ONLY==='1'){await checkThemeBrowser();console.log(JSON.stringify({passed:true,scope:'synthetic theme only',checks:lifecycleChecks,actualAccountUsed:false,artifacts:folder}));}
-  else if(process.env.WEB_KAKAO_QA_CONFLICTS_ONLY==='1'){await checkConflicts();console.log(JSON.stringify({passed:true,scope:'synthetic HTTP409 only',checks:lifecycleChecks,actualAccountUsed:false,artifacts:folder}));}
-  else if(process.env.WEB_KAKAO_QA_HEADER_ONLY==='1'){await checkHeaderLayout();console.log(JSON.stringify({passed:true,scope:'synthetic header layout only',checks:lifecycleChecks,actualAccountUsed:false,artifacts:folder}));}
-  else if(process.env.WEB_KAKAO_QA_OPEN_EMPTY_ONLY==='1'){await checkEmptyOpenContext();console.log(JSON.stringify({passed:true,scope:'synthetic empty open context only',checks:lifecycleChecks,actualAccountUsed:false,artifacts:folder}));}
-  else if(process.env.WEB_KAKAO_QA_SELECTION_ONLY==='1'){await checkSelectionBusy();console.log(JSON.stringify({passed:true,scope:'synthetic selection only',checks:lifecycleChecks,actualAccountUsed:false,artifacts:folder}));}
-  else if(process.env.WEB_KAKAO_QA_CAPABILITIES_ONLY==='1'){await checkCapabilities();console.log(JSON.stringify({passed:true,scope:'synthetic capabilities only',checks:lifecycleChecks,actualAccountUsed:false,artifacts:folder}));}
-  else if(process.env.WEB_KAKAO_QA_LIFECYCLE_ONLY==='1'){await checkLifecycle();console.log(JSON.stringify({passed:true,scope:'synthetic lifecycle only',checks:lifecycleChecks,actualAccountUsed:false,artifacts:folder}));}
+  if(process.env.WEB_KAKAO_QA_D2_ONLY==='1'){await checkRejectedSelection();summary={passed:true,scope:'synthetic two-tab rejected view only',checks:lifecycleChecks,actualAccountUsed:false,artifacts:folder};}
+  else if(process.env.WEB_KAKAO_QA_HTTPS_LIFECYCLE_ONLY==='1'){await checkDefaultHttpsLifecycle();summary={passed:true,scope:'synthetic default HTTPS QR and clear lifecycle',checks:lifecycleChecks,actualAccountUsed:false,artifacts:folder};}
+  else if(process.env.WEB_KAKAO_QA_PHOTO_ONLY==='1'){await checkPhotoConversion();summary={passed:true,scope:'synthetic photo conversion and submit only',checks:lifecycleChecks,actualAccountUsed:false,artifacts:folder};}
+  else if(process.env.WEB_KAKAO_QA_ADVERSARIAL_ONLY==='1'){await checkAdversarialBrowser();summary={passed:true,scope:'synthetic adversarial browser only',checks:lifecycleChecks,actualAccountUsed:false,artifacts:folder};}
+  else if(process.env.WEB_KAKAO_QA_UI_ONLY==='1'){await checkMobileAndThemes();await checkThemeBrowser();await checkHeaderLayout();summary={passed:true,scope:'synthetic A UI theme and mobile only',checks:lifecycleChecks,actualAccountUsed:false,artifacts:folder};}
+  else if(process.env.WEB_KAKAO_QA_THEME_ONLY==='1'){await checkThemeBrowser();summary={passed:true,scope:'synthetic theme only',checks:lifecycleChecks,actualAccountUsed:false,artifacts:folder};}
+  else if(process.env.WEB_KAKAO_QA_CONFLICTS_ONLY==='1'){await checkConflicts();summary={passed:true,scope:'synthetic HTTP409 only',checks:lifecycleChecks,actualAccountUsed:false,artifacts:folder};}
+  else if(process.env.WEB_KAKAO_QA_HEADER_ONLY==='1'){await checkHeaderLayout();summary={passed:true,scope:'synthetic header layout only',checks:lifecycleChecks,actualAccountUsed:false,artifacts:folder};}
+  else if(process.env.WEB_KAKAO_QA_OPEN_EMPTY_ONLY==='1'){await checkEmptyOpenContext();summary={passed:true,scope:'synthetic empty open context only',checks:lifecycleChecks,actualAccountUsed:false,artifacts:folder};}
+  else if(process.env.WEB_KAKAO_QA_SELECTION_ONLY==='1'){await checkSelectionBusy();summary={passed:true,scope:'synthetic selection only',checks:lifecycleChecks,actualAccountUsed:false,artifacts:folder};}
+  else if(process.env.WEB_KAKAO_QA_CAPABILITIES_ONLY==='1'){await checkCapabilities();summary={passed:true,scope:'synthetic capabilities only',checks:lifecycleChecks,actualAccountUsed:false,artifacts:folder};}
+  else if(process.env.WEB_KAKAO_QA_LIFECYCLE_ONLY==='1'){await checkLifecycle();summary={passed:true,scope:'synthetic lifecycle only',checks:lifecycleChecks,actualAccountUsed:false,artifacts:folder};}
   else {
   // An initial default highlight is not an explicitly opened room or read intent.
   assert.equal(historyRooms.length,0);assert.equal(await evaluate('!userSelected && reconnectRoom===null'),true);
@@ -1290,12 +1289,16 @@ await check('closing the photo dialog disables download',async()=>{assert.equal(
     try{ui=await evaluate("({phase:lastState?.phase??null,stage:lastState?.stage??null,apiStatus:lastState?.apiStatus??null,attempts:lastState?.attempts??null,requests:lastState?.requests??null,busy,refreshing,pollTimerScheduled:pollTimer!==null,diagnosticHasTarget:el('diagnostic').textContent.includes('-151')})");}catch{ui={observationUnavailable:true};}
     writeFileSync(resolve(folder,'synthetic-final-qr.json'),JSON.stringify({passed:finalQrPassed,rejectNextQr,server:{phase:auth.phase,stage:auth.stage,apiStatus:auth.apiStatus,attempts:auth.attempts,requests:auth.requests,credentialInMemory:auth.credentialInMemory},ui,finalStartRequests:fixtureRequests.filter(row=>row.method==='POST' && row.path==='/api/start').length-finalStartBefore,statusRequestsDuringFinal:statusRequests-finalStatusBefore,pollRequestsDuringFinal:auth.requests.poll-finalQrBefore.requests.poll,finalMinus151Responses:auth.authEvents.filter(event=>event.operation==='poll' && event.status===-151).length,actualAccountUsed:false,rawValuesRecorded:false},null,2));
   }
-  console.log(JSON.stringify({passed:true,scope:'synthetic offline browser only',checks:['QR caching','room selection queue','DOM and scroll retention','hidden polling','text-only rendering','unread badge and total','local rename and reset','receipt count disappears on read','hidden/unfocused/scrolled room is not acknowledged','visible latest message acknowledgement','optional server read sync','IME Enter does not send','double-click sends once','unknown send preserves draft without retry','room pin ordering and filters retain selection and drafts','literal message search and result navigation','search does not acknowledge incoming messages','clipboard success and denial without OS clipboard access','pins survive transport reconnect and clear on account close','reconnect restores selected room and draft','offline messages fetched once without load button or read notification','cancel purges account data','QR -151 neutral message','all dialogs and account overlay block read and closing resumes eligible read','rejected photo draft is invalidated on reconnect','in-flight image preparation is canceled on reconnect and fresh selection remains usable','default automatic room does not become a reconnect target','changed and removed room targets stay isolated across reconnects','account close clears reconnect intent',...lifecycleChecks],visibleRequests,hiddenRequests,screenshot:folder+'/synthetic-reader.png',actualAccountUsed:false}));
+  summary={passed:true,scope:'synthetic offline browser only',checks:['QR caching','room selection queue','DOM and scroll retention','hidden polling','text-only rendering','unread badge and total','local rename and reset','receipt count disappears on read','hidden/unfocused/scrolled room is not acknowledged','visible latest message acknowledgement','optional server read sync','IME Enter does not send','double-click sends once','unknown send preserves draft without retry','room pin ordering and filters retain selection and drafts','literal message search and result navigation','search does not acknowledge incoming messages','clipboard success and denial without OS clipboard access','pins survive transport reconnect and clear on account close','reconnect restores selected room and draft','offline messages fetched once without load button or read notification','cancel purges account data','QR -151 neutral message','all dialogs and account overlay block read and closing resumes eligible read','rejected photo draft is invalidated on reconnect','in-flight image preparation is canceled on reconnect and fresh selection remains usable','default automatic room does not become a reconnect target','changed and removed room targets stay isolated across reconnects','account close clears reconnect intent',...lifecycleChecks],visibleRequests,hiddenRequests,screenshot:folder+'/synthetic-reader.png',actualAccountUsed:false};
   }
 }finally{
-  ws?.close();
+  for(const item of pending.values())clearTimeout(item.timer);pending.clear();ws?.close();
   let chromeExitObserved=Boolean(browser && (browser.exitCode!==null || browser.signalCode!==null));
   if(browser && !chromeExitObserved){const exited=new Promise(resolve=>browser.once('exit',()=>{chromeExitObserved=true;resolve();}));browser.kill();await Promise.race([exited,sleep(3000)]);}
   app.lab.cancel();app.server.closeAllConnections();await new Promise(resolve=>app.server.close(resolve));
-  writeFileSync(resolve(folder,'synthetic-cleanup.json'),JSON.stringify({actualAccountUsed:false,chromePid:browser?.pid ?? null,chromeExitObserved,chromeExitCode:browser?.exitCode ?? null,chromeSignalCode:browser?.signalCode ?? null,serverListening:app.server.listening,profile:resolve(folder,'profile')}));
+  const cleanup={actualAccountUsed:false,chromePid:browser?.pid??null,chromeExitObserved,chromeExitCode:browser?.exitCode??null,chromeSignalCode:browser?.signalCode??null,serverListening:app.server.listening,pending:pending.size,profile:resolve(folder,'profile')};
+  writeFileSync(resolve(folder,'synthetic-cleanup.json'),JSON.stringify(cleanup));
+  summary={...summary,passed:summary?.passed===true&&browserCleanupPassed(cleanup),cleanup,actualAccountUsed:false};
+  writeFileSync(resolve(folder,'synthetic-result.json'),JSON.stringify(summary));console.log(JSON.stringify(summary));
+  if(!summary.passed)process.exitCode=1;
 }

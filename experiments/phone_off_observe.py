@@ -36,6 +36,11 @@ def main():
 
     try:
         url, client, initial = connect()
+        if initial.get("build", 0) >= 8:
+            result["failure"] = "legacy_probe_unsupported_on_build8"
+            print(json.dumps({"passed": False, "reason": result["failure"],
+                              "message": "This legacy probe cannot use build8+ browser sessions; no history or read request was made."}))
+            return 1
         auth_counts = initial.get("requests", {})
         connected_at = initial.get("reader", {}).get("connectedAt")
 

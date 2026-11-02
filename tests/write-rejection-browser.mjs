@@ -1,10 +1,10 @@
 // Real UI/local HTTP, injected account-free auth/reader/preferences only.
 import {spawn} from 'node:child_process';
-import {existsSync,mkdirSync,readFileSync,writeFileSync} from 'node:fs';
+import {mkdirSync,writeFileSync} from 'node:fs';
 import {resolve} from 'node:path';
 import assert from 'node:assert/strict';
 import {createLocalServer} from '../experiments/local-web/server.mjs';
-import {testBrowser} from './browser-platform.mjs';
+import {testBrowser,browserDebugPort,browserCleanupPassed} from './browser-platform.mjs';
 const output=resolve(process.env.WEB_KAKAO_QA_OUTPUT_ROOT||'local-only/qr-openchat-20261018/qa/browser',String(Date.now()));mkdirSync(output,{recursive:true});
 const profile=resolve(output,'p'),sleep=ms=>new Promise(r=>setTimeout(r,ms));
 const chrome=testBrowser();assert.ok(chrome,'installed Chrome required');
@@ -43,8 +43,7 @@ let fatal=null,chromeExitObserved=false;
 try{
  const url=await app.listen(0);assert.notEqual(app.server.address().port,8787);await app.lab.start();const authEnd=Date.now()+4000;while(!app.lab.snapshot().credentialInMemory){if(Date.now()>authEnd)throw new Error('synthetic auth deadline');await sleep(20);}
  browser=spawn(chrome,['--headless=new','--no-first-run','--no-default-browser-check','--disable-extensions','--disable-background-networking','--disable-component-update','--disable-background-timer-throttling','--disable-renderer-backgrounding','--no-proxy-server','--remote-debugging-address=127.0.0.1','--remote-debugging-port=0','--user-data-dir='+profile,'--window-size=1100,900','about:blank'],{windowsHide:true,stdio:'ignore'});
- const file=resolve(profile,'DevToolsActivePort'),end=Date.now()+14000;while(!existsSync(file)){if(Date.now()>end)throw new Error('Chrome startup deadline');await sleep(40);}
- const port=Number(readFileSync(file,'utf8').split(/\r?\n/)[0]);assert.notEqual(port,8787);const pages=await(await fetch(`http://127.0.0.1:${port}/json/list`)).json();socket=new WebSocket(pages.find(p=>p.type==='page').webSocketDebuggerUrl);
+ const port=await browserDebugPort(resolve(profile,'DevToolsActivePort'),{timeout:14000});assert.notEqual(port,8787);const pages=await(await fetch(`http://127.0.0.1:${port}/json/list`)).json();socket=new WebSocket(pages.find(p=>p.type==='page').webSocketDebuggerUrl);
  await new Promise((resolve,reject)=>{socket.addEventListener('open',resolve,{once:true});socket.addEventListener('error',reject,{once:true});});socket.addEventListener('message',event=>{const r=JSON.parse(event.data),entry=pending.get(r.id);if(!entry)return;pending.delete(r.id);clearTimeout(entry.timer);r.error?entry.reject(new Error(r.error.message)):entry.resolve(r.result);});
  const issue=await fetch(url+'/api/local/launch',{method:'POST',headers:{Origin:url,'Content-Type':'application/json','X-Local-Control':app.controlToken},body:'{}'});assert.equal(issue.status,200);await command('Page.navigate',{url:url+'/launch#launch='+(await issue.json()).ticket});
  await until("location.pathname==='/'&&typeof lastState!=='undefined'&&lastState!==null&&roomsCache.length===2&&!busy&&!refreshing");await evaluate("clearTimeout(pollTimer);pollTimer=null;clearTimeout(queuedRefreshTimer);queuedRefreshTimer=null;refreshPending=false;Object.defineProperty(document,'hidden',{configurable:true,get:()=>false});document.hasFocus=()=>false;foregroundFocused=false;el('read-sync').checked=false");
@@ -71,5 +70,5 @@ try{
 finally{
  for(const item of pending.values())clearTimeout(item.timer);pending.clear();socket?.close();chromeExitObserved=Boolean(browser&&(browser.exitCode!==null||browser.signalCode!==null));if(browser&&!chromeExitObserved){const exit=new Promise(r=>browser.once('exit',()=>{chromeExitObserved=true;r();}));browser.kill();await Promise.race([exit,sleep(3000)]);}
  app.lab.cancel();app.server.closeAllConnections();await new Promise(r=>app.server.close(r));
- const result={checks,actualAccount:false,fatal,cleanup:{chromeExitObserved,serverListening:app.server.listening,pending:pending.size},profile,requests:requests.map(({kind,reply})=>({kind,reply})),readRequests:reads,acknowledgements:acks};writeFileSync(resolve(output,'result.json'),JSON.stringify(result,null,2));console.log(JSON.stringify({checks:checks.length,passed:checks.filter(c=>c.status==='passed').length,expectedRed:checks.filter(c=>c.status==='expected_red').length,fixtureErrors:checks.filter(c=>c.status==='fixture_error').length,fatal,cleanup:result.cleanup,output}));if(fatal||checks.some(c=>c.status!=='passed'))process.exitCode=1;
+ const result={checks,actualAccount:false,fatal,cleanup:{chromeExitObserved,serverListening:app.server.listening,pending:pending.size},profile,requests:requests.map(({kind,reply})=>({kind,reply})),readRequests:reads,acknowledgements:acks};writeFileSync(resolve(output,'result.json'),JSON.stringify(result,null,2));console.log(JSON.stringify({checks:checks.length,passed:checks.filter(c=>c.status==='passed').length,expectedRed:checks.filter(c=>c.status==='expected_red').length,fixtureErrors:checks.filter(c=>c.status==='fixture_error').length,fatal,cleanup:result.cleanup,output}));if(fatal||!browserCleanupPassed(result.cleanup)||checks.some(c=>c.status!=='passed'))process.exitCode=1;
 }

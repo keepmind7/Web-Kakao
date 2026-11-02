@@ -1,10 +1,10 @@
 // Real UI/server, synthetic OM/outbox/QR transport; new profile and ephemeral ports only.
 import {spawn} from 'node:child_process';
-import {existsSync,mkdirSync,readFileSync,writeFileSync} from 'node:fs';
+import {mkdirSync,writeFileSync} from 'node:fs';
 import {resolve} from 'node:path';
 import assert from 'node:assert/strict';
 import {createLocalServer} from '../experiments/local-web/server.mjs';
-import {testBrowser} from './browser-platform.mjs';
+import {testBrowser,browserDebugPort,browserCleanupPassed} from './browser-platform.mjs';
 const output=resolve(process.env.WEB_KAKAO_QA_OUTPUT_ROOT || 'local-only/qa-feedback-20261018/qa/browser',String(Date.now()));mkdirSync(output,{recursive:true});
 const profile=resolve(output,'p'),sleep=ms=>new Promise(r=>setTimeout(r,ms));
 const chrome=testBrowser();assert.ok(chrome,'Chrome required');
@@ -30,8 +30,7 @@ const warningGeometry="(()=>{const p=el('send-status'),b=el('send-reset'),r=p.ge
 let fatal=null,chromeExitObserved=false;
 try{
  browser=spawn(chrome,['--headless=new','--no-first-run','--no-default-browser-check','--disable-extensions','--disable-background-networking','--disable-background-timer-throttling','--disable-renderer-backgrounding','--no-proxy-server','--remote-debugging-address=127.0.0.1','--remote-debugging-port=0','--user-data-dir='+profile,'--window-size=1100,900','about:blank'],{windowsHide:true,stdio:'ignore'});
- const file=resolve(profile,'DevToolsActivePort'),end=Date.now()+14000;while(!existsSync(file)){if(Date.now()>end)throw new Error('Chrome startup deadline');await sleep(40);}
- const port=Number(readFileSync(file,'utf8').split(/\r?\n/)[0]),pages=await(await fetch(`http://127.0.0.1:${port}/json/list`)).json();socket=new WebSocket(pages.find(p=>p.type==='page').webSocketDebuggerUrl);await new Promise((resolve,reject)=>{socket.addEventListener('open',resolve,{once:true});socket.addEventListener('error',reject,{once:true});});socket.addEventListener('message',event=>{const r=JSON.parse(event.data),entry=pending.get(r.id);if(!entry)return;pending.delete(r.id);clearTimeout(entry.timer);r.error?entry.reject(new Error(r.error.message)):entry.resolve(r.result);});
+ const port=await browserDebugPort(resolve(profile,'DevToolsActivePort'),{timeout:14000}),pages=await(await fetch(`http://127.0.0.1:${port}/json/list`)).json();socket=new WebSocket(pages.find(p=>p.type==='page').webSocketDebuggerUrl);await new Promise((resolve,reject)=>{socket.addEventListener('open',resolve,{once:true});socket.addEventListener('error',reject,{once:true});});socket.addEventListener('message',event=>{const r=JSON.parse(event.data),entry=pending.get(r.id);if(!entry)return;pending.delete(r.id);clearTimeout(entry.timer);r.error?entry.reject(new Error(r.error.message)):entry.resolve(r.result);});
  await openApp();await evaluate('showAccount(true)');
  await check('QR initial count explains there is no local manual issue limit',async()=>{const v=await evaluate("({text:el('qr-attempts')?.textContent,hidden:el('qr-attempts')?.hidden})");assert.equal(v.text,'QR 발급 시도 0회 · 수동 발급 횟수 제한 없음');assert.equal(v.hidden,false);return v;});
  for(let n=1;n<=4;n++){await evaluate("el('start').click()");await until("lastState.phase==='waiting'&&!busy&&!refreshing");await evaluate("el('cancel').click()");await until("lastState.phase==='cancelled'&&!busy&&!refreshing");if(n>=2)await check('QR cancel retains '+n+' manual attempts with no local limit',async()=>{const v=await evaluate("({text:el('qr-attempts')?.textContent,disabled:el('start').disabled})");assert.equal(app.lab.snapshot().attempts,n);assert.equal(v.text,`QR 발급 시도 ${n}회 · 수동 발급 횟수 제한 없음`);assert.equal(v.disabled,false);return v;});}
@@ -69,5 +68,5 @@ try{
 }catch(e){fatal=String(e.stack);}
 finally{
  for(const item of pending.values())clearTimeout(item.timer);pending.clear();socket?.close();chromeExitObserved=Boolean(browser&&(browser.exitCode!==null||browser.signalCode!==null));if(browser&&!chromeExitObserved){const exit=new Promise(r=>browser.once('exit',()=>{chromeExitObserved=true;r();}));browser.kill();await Promise.race([exit,sleep(3000)]);}
- await closeApp();const result={checks,actualAccount:false,fatal,cleanup:{chromeExitObserved,servers:closed,pending:pending.size},profile};writeFileSync(resolve(output,'result.json'),JSON.stringify(result,null,2));console.log(JSON.stringify({checks:checks.length,passed:checks.filter(c=>c.status==='passed').length,expectedRed:checks.filter(c=>c.status==='expected_red').length,fixtureErrors:checks.filter(c=>c.status==='fixture_error').length,fatal,cleanup:result.cleanup,output}));if(fatal||checks.some(c=>c.status!=='passed'))process.exitCode=1;
+ await closeApp();const result={checks,actualAccount:false,fatal,cleanup:{chromeExitObserved,servers:closed,pending:pending.size},profile};writeFileSync(resolve(output,'result.json'),JSON.stringify(result,null,2));console.log(JSON.stringify({checks:checks.length,passed:checks.filter(c=>c.status==='passed').length,expectedRed:checks.filter(c=>c.status==='expected_red').length,fixtureErrors:checks.filter(c=>c.status==='fixture_error').length,fatal,cleanup:result.cleanup,output}));if(fatal||!browserCleanupPassed(result.cleanup)||checks.some(c=>c.status!=='passed'))process.exitCode=1;
 }

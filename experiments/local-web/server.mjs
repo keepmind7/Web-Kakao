@@ -60,6 +60,12 @@ export function createLocalServer({ transport, mode = 'mock', encode = encodeQr,
     if(!roomPreferenceScope || roomPreferenceScope.reader!==reader || roomPreferenceScope.attempts!==attempts || roomPreferenceScope.instanceId!==instanceId)roomPreferenceScope={reader,attempts,instanceId,issued:0,rooms:new Map()};
     return roomPreferenceScope;
   };
+  let settingsScope=null;
+  const currentSettingsScope=()=>{
+    const {attempts,instanceId}=reader.snapshot();
+    if(!settingsScope || settingsScope.reader!==reader || settingsScope.attempts!==attempts || settingsScope.instanceId!==instanceId)settingsScope={reader,attempts,instanceId};
+    return settingsScope;
+  };
   const forgetAccount=()=>{try{reader.close();}finally{try{clearPhotos();}finally{lab.cancel();}}};
   // Only internal cleanup may own onEmpty; options inject bounded clocks/timers for QA.
   const presence=createTabPresence({...presenceOptions,onEmpty:forgetAccount}),streams=new Map();
@@ -155,6 +161,7 @@ export function createLocalServer({ transport, mode = 'mock', encode = encodeQr,
     // Reconnects reuse instanceId, so both reader ownership and attempt matter.
     const viewRequest=req.url==='/api/reader/view'?{scope:currentViewScope(),order:++viewScope.issued}:null;
     const roomPreferenceRequest=req.url==='/api/preferences/room'?{scope:currentRoomPreferenceScope(),order:++roomPreferenceScope.issued}:null;
+    const settingsRequest=['/api/preferences','/api/preferences/forget'].includes(req.url)?currentSettingsScope():null;
     const imageRequest=req.url==='/api/reader/photo';
     if(imageRequest && (!messaging || !lab.snapshot().credentialInMemory || receivingImage))return reply(409,{error:'action_not_ready'});
     if(imageRequest)receivingImage=true;
@@ -272,13 +279,16 @@ export function createLocalServer({ transport, mode = 'mock', encode = encodeQr,
       if(!lab.snapshot().credentialInMemory)return reply(409,{error:'authentication_required'});
       if(req.url==='/api/notifications/claim')return reply(200,{notices:reader.claimNotifications?.() ?? []});
       const owner=reader;
-      // A validated explicit reset supersedes pre-reset aliases immediately,
+      if(currentSettingsScope()!==settingsRequest)return reply(409,{error:'reader_scope_changed'});
+      // A validated explicit reset supersedes pre-reset settings and aliases,
       // even if deletion later fails. Do not clear again after awaiting: a new
       // post-reset edit already belongs to the new scope and must remain valid.
-      if(req.url==='/api/preferences/forget')roomPreferenceScope=null;
-      let accepted=false;try{accepted=await(req.url==='/api/preferences'?owner.updateSettings?.(body):owner.forgetSettings?.());}catch{/* A rejected durable write is not a saved setting. */}
+      if(req.url==='/api/preferences/forget'){settingsScope=null;roomPreferenceScope=null;}
+      const scope=currentSettingsScope();
+      const isCurrent=()=>!disposed && !closing && reader===owner && currentSettingsScope()===scope && readerScopeMatches() && lab.snapshot().credentialInMemory;
+      let accepted=false;try{accepted=await(req.url==='/api/preferences'?owner.updateSettings?.(body,{isCurrent}):owner.forgetSettings?.({isCurrent}));}catch{/* A rejected durable write is not a saved setting. */}
       if(disposed || closing)return reply(503,{error:'server_closing'});
-      if(reader!==owner || !readerScopeMatches() || !lab.snapshot().credentialInMemory)return reply(409,{error:'reader_scope_changed'});
+      if(!isCurrent())return reply(409,{error:'reader_scope_changed'});
       return accepted?reply(200,{settings:owner.settingsSnapshot()}):reply(409,{error:'settings_unavailable'});
     }
     if(req.url==='/api/preferences/room'){

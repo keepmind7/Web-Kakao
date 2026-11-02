@@ -521,8 +521,10 @@ export function createReaderStore(body, ownUserId, salt=randomBytes(32),settings
         observeOwnRead('own_accepted');
         return ownReadUpdate(room,{release:!deferOwnRead});
       }
-      if(room.members && !room.members.has(user))room.receiptReady=false;
-      const previous=room.watermarks.get(user);if(!previous || BigInt(mark)>BigInt(previous))room.watermarks.set(user,mark);
+      // Only a validated, bounded snapshot establishes peer membership. Unknown
+      // peers invalidate exact counts without growing a long-lived room's Map.
+      if(!room.members?.has(user))room.receiptReady=false;
+      else {const previous=room.watermarks.get(user);if(!previous || BigInt(mark)>BigInt(previous))room.watermarks.set(user,mark);}
       observeOwnRead('peer_accepted');
       return {key,...view(key)};
     },

@@ -9,14 +9,16 @@ await import('../local-only/spikes/modern/node_modules/tsx/dist/loader.mjs');
 const {CarriageClient}=await import('../local-only/spikes/modern/src/kakao/forge-protocol.ts');
 const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 
-test('a refused pinned carriage connection settles immediately and leaves no delayed connection rejection',async()=>{
+test('a refused pinned carriage connection settles immediately and leaves no delayed connection rejection',{timeout:5000},async()=>{
   const reservation=net.createServer();reservation.listen(0,'127.0.0.1');await once(reservation,'listening');
   const port=reservation.address().port;assert.notEqual(port,8787);await new Promise(resolve=>reservation.close(resolve));
   const client=new (guardReaderClient(CarriageClient,null,{messaging:true}))();let settled=false,errors=0,closed=0;
   client.on('error',()=>{errors++;client.disconnect();});client.on('disconnected',()=>closed++);
   try{
     const waiting=client.connect('127.0.0.1',port,350).then(()=>({accepted:true}),()=>({accepted:false})).finally(()=>{settled=true;});
-    while(!errors)await sleep(2);
+    const deadline=performance.now()+1000;
+    while(!errors&&performance.now()<deadline)await sleep(2);
+    assert.ok(errors,'socket error event did not arrive within 1000ms');
     await new Promise(resolve=>setImmediate(resolve));
     assert.equal(settled,true,'socket error must settle before the configured 350ms deadline');
     assert.deepEqual(await waiting,{accepted:false});await sleep(370);

@@ -1,10 +1,10 @@
 // One bounded integration contract: real UI/server,300 synthetic rooms and delayed persistence.
 import {spawn} from 'node:child_process';
-import {existsSync,mkdirSync,readFileSync,writeFileSync} from 'node:fs';
+import {mkdirSync,writeFileSync} from 'node:fs';
 import {resolve} from 'node:path';
 import assert from 'node:assert/strict';
 import {createLocalServer} from '../experiments/local-web/server.mjs';
-import {testBrowser} from './browser-platform.mjs';
+import {testBrowser,browserDebugPort,browserCleanupPassed} from './browser-platform.mjs';
 const output=resolve(process.env.WEB_KAKAO_QA_OUTPUT_ROOT || 'local-only/perf-portability-20261018/qa/contracts/browser',String(Date.now()));mkdirSync(output,{recursive:true});
 const profile=resolve(output,'p'),sleep=ms=>new Promise(r=>setTimeout(r,ms));
 const chrome=testBrowser();assert.ok(chrome,'Chrome required');
@@ -21,8 +21,7 @@ async function until(expression){const end=Date.now()+7000;while(!await evaluate
 try{
   const url=await app.listen(0);assert.notEqual(app.server.address().port,8787);await app.lab.start();const end=Date.now()+4000;while(!app.lab.snapshot().credentialInMemory){if(Date.now()>end)throw new Error('synthetic auth deadline');await sleep(20);}
   browser=spawn(chrome,['--headless=new','--no-first-run','--no-default-browser-check','--disable-extensions','--disable-background-networking','--disable-background-timer-throttling','--disable-renderer-backgrounding','--no-proxy-server','--remote-debugging-address=127.0.0.1','--remote-debugging-port=0','--user-data-dir='+profile,'--window-size=1100,900','about:blank'],{windowsHide:true,stdio:'ignore'});
-  const file=resolve(profile,'DevToolsActivePort'),deadline=Date.now()+12000;while(!existsSync(file)){if(Date.now()>deadline)throw new Error('Chrome startup deadline');await sleep(40);}
-  const port=Number(readFileSync(file,'utf8').split(/\r?\n/)[0]),pages=await(await fetch(`http://127.0.0.1:${port}/json/list`)).json();socket=new WebSocket(pages.find(p=>p.type==='page').webSocketDebuggerUrl);
+  const port=await browserDebugPort(resolve(profile,'DevToolsActivePort'),{timeout:12000}),pages=await(await fetch(`http://127.0.0.1:${port}/json/list`)).json();socket=new WebSocket(pages.find(p=>p.type==='page').webSocketDebuggerUrl);
   await new Promise((resolve,reject)=>{socket.addEventListener('open',resolve,{once:true});socket.addEventListener('error',reject,{once:true});});socket.addEventListener('message',event=>{const r=JSON.parse(event.data),entry=pending.get(r.id);if(!entry)return;pending.delete(r.id);clearTimeout(entry.timer);r.error?entry.reject(new Error(r.error.message)):entry.resolve(r.result);});
   const issue=await fetch(url+'/api/local/launch',{method:'POST',headers:{Origin:url,'Content-Type':'application/json','X-Local-Control':app.controlToken},body:'{}'});const ticket=(await issue.json()).ticket;await command('Page.navigate',{url:url+'/launch#launch='+ticket});
   await until("typeof roomsCache!=='undefined'&&roomsCache.length===300&&!busy&&!refreshing&&personalSettings!==null");await evaluate("showAccount(true);clearTimeout(pollTimer);pollTimer=null;globalThis.heartbeat=0;globalThis.heartbeatTimer=setInterval(()=>heartbeat++,5)");
@@ -34,5 +33,5 @@ finally{
   release();for(const item of pending.values())clearTimeout(item.timer);pending.clear();socket?.close();
   chromeExitObserved=Boolean(browser&&(browser.exitCode!==null||browser.signalCode!==null));if(browser&&!chromeExitObserved){const exit=new Promise(r=>browser.once('exit',()=>{chromeExitObserved=true;r();}));browser.kill();await Promise.race([exit,sleep(3000)]);}
   app.lab.cancel();app.server.closeAllConnections();await new Promise(r=>app.server.close(r));
-  const result={checks:1,status:error?'failed':'passed',error,observed,actualAccount:false,cleanup:{chromeExitObserved,serverListening:app.server.listening,pending:pending.size},profile};writeFileSync(resolve(output,'result.json'),JSON.stringify(result,null,2));console.log(JSON.stringify({output,status:result.status,error,observed,cleanup:result.cleanup}));if(error)process.exitCode=1;
+  const cleanup={chromeExitObserved,serverListening:app.server.listening,pending:pending.size};const result={checks:1,status:error||!browserCleanupPassed(cleanup)?'failed':'passed',error,observed,actualAccount:false,cleanup,profile};writeFileSync(resolve(output,'result.json'),JSON.stringify(result,null,2));console.log(JSON.stringify({output,status:result.status,error,observed,cleanup:result.cleanup}));if(result.status!=='passed')process.exitCode=1;
 }

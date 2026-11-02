@@ -21,7 +21,7 @@ export function createReaderSession(credential,factory,emit) {
   const discoveryQueue=new Map(),discoveryAttempts=new Map();let discoveryPromise=null,discoveryInFlight=null,discoverTimer=null;
   const linkRepairs=new Map();let activeLinkRepair=null;
   const now=factory.now ?? (()=>performance.now());
-  let titleQueue=[],titlePromise=null,titleInFlight=null,titleChanged=false,aliveAt=-Infinity;
+  let titleQueue=[],titlePromise=null,titleChanged=false,aliveAt=-Infinity;
   const titleAttempts=new Set(),memberLookups=new Map(),metadataWaits=new Set();
   const visibleViews=new Map();
   const pendingOwnReads=new Set();
@@ -155,7 +155,11 @@ export function createReaderSession(credential,factory,emit) {
   }
   function selectTitle(key){
     if(closed || !store.titleMissing(key) || titleAttempts.has(key))return;
-    titleAttempts.add(key);titleQueue.push({...scope(key),selected:true});scheduleDiscovery();
+    // A queued selection reserves work, not a wire attempt. Discard stale
+    // reservations so a later explicit selection can still request its title.
+    titleQueue=titleQueue.filter(work=>!work.selected || currentScope(work));
+    if(titleQueue.some(work=>work.key===key))return;
+    titleQueue.push({...scope(key),selected:true});scheduleDiscovery();
   }
   const needsLinkRepair=key=>factory.messaging===true && store?.has(key) && store.isOpen(key) && store.missingOpenLinkIds(1,[key]).length>0;
   const eligibleLinkRepair=()=>[...linkRepairs].find(([key,attempt])=>attempt.ready && !attempt.terminal && attempt.count<3 && now()>=attempt.retryAt && needsLinkRepair(key));
@@ -204,11 +208,17 @@ export function createReaderSession(credential,factory,emit) {
       if(!next){
         const link=eligibleLinkRepair();
         if(link){discoveryPromise=repairLink(link[0]).finally(()=>{discoveryPromise=null;scheduleDiscovery();});return;}
-        const work=titleQueue.shift();if(!work)return;const {key}=work;titleInFlight=work;
+        const work=titleQueue.shift();if(!work)return;const {key}=work;
         titlePromise=Promise.resolve().then(async()=>{
-          if(closed || work.selected && (!currentScope(work) || !store.titleMissing(key)))return;
+          if(closed || titleAttempts.has(key) || !store?.has(key) || !store.titleMissing(key) || work.selected && !currentScope(work))return;
           try{
-            const request=()=>carriage.request('CHATINFO',{chatId:factory.toLong(store.serverRoomId(key))},3000,{optional:true});
+            const request=()=>{
+              const chatId=factory.toLong(store.serverRoomId(key));
+              // Refusal, timeout and late responses consume this one attempt;
+              // cancellation before this invocation does not.
+              titleAttempts.add(key);
+              return carriage.request('CHATINFO',{chatId},3000,{optional:true});
+            };
             const response=work.selected?await optionalMetadata(request,3000):await request();
             if(closed || work.selected && !currentScope(work) || responseStatus(response)!==0 || response?.method!==undefined && response.method!=='CHATINFO')return;
             if(store.recoverTitle(key,response.body))titleChanged=true;
@@ -217,7 +227,7 @@ export function createReaderSession(credential,factory,emit) {
             // error/close still reaches the existing transport listeners.
           }
         }).finally(()=>{
-          titlePromise=null;titleInFlight=null;
+          titlePromise=null;
           // One room list after the repair batch rather than one per recovered title.
           if(!closed && titleChanged && !titleQueue.length){titleChanged=false;emitRooms('push');}
           scheduleDiscovery();
@@ -263,7 +273,7 @@ export function createReaderSession(credential,factory,emit) {
         void probeRoomCount(credential,factory,async(client,body,earlyPush=[])=>{
           if(closed)return;
           carriage=client;store=createReaderStore(body,credential.userId,factory.sessionSalt,factory.settingsSecret,{observeOwnRead:reason=>observeOwnRead('classification',reason),onCacheEvicted:key=>{cursors.delete(key);gapProbes.delete(key);visibleViews.delete(key);emit({type:'reader-cache-evicted',key,cacheEpoch:store.cacheEpoch(key)});}});
-          titleQueue=store.unnamedRooms(8).map(key=>({key,selected:false}));for(const {key} of titleQueue)titleAttempts.add(key);
+          titleQueue=store.unnamedRooms(8).map(key=>({key,selected:false}));
           carriage.on('disconnected',()=>fail('disconnected'));
           carriage.on('error',()=>fail('transport'));
           const onPush=packet=>{
