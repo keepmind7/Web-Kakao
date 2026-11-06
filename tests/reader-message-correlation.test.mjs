@@ -110,6 +110,68 @@ test('read method fallback survives and an unrelated WRITE never resolves a pend
   client.finishPacket({packetId:900,method:'SYNCMSG',status:0,body:{chatLogs:[]}});assert.deepEqual((await read).body.chatLogs,[]);
 });
 
+const historyRequest=(method,room)=>method==='SYNCMSG'?{chatId:room}:{chatIds:[room],sinces:['0']};
+for(const method of ['SYNCMSG','MCHATLOGS'])for(const packetId of [1,900])test(method+' rejects explicit foreign history scope before '+(packetId===1?'exact':'fallback')+' completion',async()=>{
+  const wrong=[{chatId:'456',chatLogs:[{logId:'1'}]},{roomId:'456',logs:[]},{chatRoomId:'456',messages:[]},{chatInfo:{id:'456'},chatLogs:[]},
+    {chatId:'123',chatLogs:[{chatId:'456',logId:'1'}]},{chatLogs:[{chatId:'123',roomId:'456',logId:'1'}]},
+    {chatLogs:[{chatRoomId:'456',logId:'1'}]},{chatId:Number.MAX_SAFE_INTEGER+2,chatLogs:[]},
+    {chatLogs:[{chatId:'123',c:'456',logId:'1'}]},{chatLogs:[{c:'456',logId:'1'}]}];
+  for(const body of wrong){
+    const client=make(),waiting=client.request(method,historyRequest(method,'123'));
+    try{
+      client.finishPacket({packetId,method,status:0,body});assert.equal(client.pending.has(1),true);
+      client.finishPacket({packetId:1,method,status:0,body:{chatLogs:[{chatId:'123',logId:'2'}]}});
+      assert.equal((await waiting).body.chatLogs[0].logId,'2');
+    }finally{settleCorrelationPending(client);await waiting;}
+  }
+});
+
+for(const method of ['SYNCMSG','MCHATLOGS'])test(method+' requires a unique fallback candidate and preserves a single roomless fallback',async()=>{
+  const client=make(),first=client.request(method,historyRequest(method,'123')),second=client.request(method,historyRequest(method,'456'));
+  try{
+    client.finishPacket({packetId:900,method,status:0,body:{chatLogs:[]}});assert.equal(client.pending.size,2);
+    client.finishPacket({packetId:901,method,status:0,body:{chatLogs:[{chatId:'456',logId:'2'}]}});
+    assert.equal(client.pending.has(1),true);assert.equal(client.pending.has(2),false);await second;
+    client.finishPacket({packetId:900,method,status:0,body:{chatLogs:[]}});await first;assert.equal(client.pending.size,0);
+  }finally{settleCorrelationPending(client);await Promise.all([first,second]);}
+});
+
+for(const method of ['SYNCMSG','MCHATLOGS'])test(method+' explicit stale replies cannot cross A-B-A selections or become failure pushes',async()=>{
+  const client=make(),pushes=[];client.on('push',packet=>pushes.push(packet));
+  for(const [index,room] of ['123','456','123'].entries()){
+    const waiting=client.request(method,historyRequest(method,room)),id=index+1,foreign=room==='123'?'456':'123';
+    try{
+      client.finishPacket({packetId:900,method,status:-203,body:{chatId:foreign,status:-203}});
+      client.finishPacket({packetId:id,method,status:0,body:{chatLogs:[{chatId:foreign,logId:'1'}]}});
+      assert.equal(client.pending.has(id),true);assert.equal(pushes.length,0);
+      client.finishPacket({packetId:id,method,status:0,body:{chatLogs:[{chatId:room,logId:String(10+index)}]}});await waiting;
+      client.finishPacket({packetId:900,method,status:-203,body:{chatId:foreign,status:-203}});assert.equal(pushes.length,0);
+    }finally{settleCorrelationPending(client);await waiting;}
+  }
+});
+
+test('history room checks preserve signed int64 IDs, supported multi-room requests and unrelated count fields',async()=>{
+  const client=make(),room='9007199254740993';let waiting=client.request('SYNCMSG',{chatId:room});
+  try{
+    client.finishPacket({packetId:1,method:'SYNCMSG',status:0,body:{c:50,chatLogs:[{c:room,logId:'1'}]}});assert.equal((await waiting).body.chatLogs[0].c,room);
+    waiting=client.request('MCHATLOGS',{chatIds:[room,'456'],sinces:['0','0']});
+    client.finishPacket({packetId:2,method:'MCHATLOGS',status:0,body:{chatLogs:[{chatId:'789',logId:'1'}]}});assert.equal(client.pending.has(2),true);
+    client.finishPacket({packetId:2,method:'MCHATLOGS',status:0,body:{chatLogs:[{chatId:room,logId:'2'},{chatId:'456',logId:'3'}]}});await waiting;
+  }finally{settleCorrelationPending(client);await waiting;}
+});
+
+test('history single roomless compatibility retains repeated response numbers without retiring unrelated requests',async()=>{
+  const client=make(),ping=client.request('PING',{});
+  try{
+    for(const room of ['123','456','123']){
+      const waiting=client.request('SYNCMSG',{chatId:room});
+      client.finishPacket({packetId:900,method:'SYNCMSG',status:0,body:{isOK:true,chatLogs:[]}});await waiting;
+      assert.equal(client.pending.has(1),true);
+    }
+    client.finishPacket({packetId:1,method:'PING',status:0,body:{}});await ping;
+  }finally{settleCorrelationPending(client);await ping;}
+});
+
 test('completed response fingerprints remain bounded across many unique successful sends',async()=>{
   const client=make();for(let i=0;i<800;i++){const request=begin(client,'123',String(i+1));client.finishPacket(ack(request.packetId,{chatId:'123',msgId:String(i+1),logId:String(i+1000)}));await request.promise;}
   assert.ok(client.completedWrites.size<=2048);assert.equal(client.pending.size,0);
@@ -208,6 +270,26 @@ test('review: stale nonzero A entry/read replies leave B session connected until
 });
 
 function settleCorrelationPending(client){for(const [packetId,item] of client.pending){client.pending.delete(packetId);item.resolve({packetId,method:item.method,status:0,body:{}});}}
+
+test('explicit stale history replies leave the A-B-A session connected and publish only the requested room',async()=>{
+  const carriage=Object.assign(make(),{async connect(){},disconnect(){},stopPing(){},async loginList(){return {status:0,body:{chatDatas:[{c:'123',t:'DirectChat',title:'Synthetic A',ll:'10'},{c:'456',t:'DirectChat',title:'Synthetic B',ll:'20'}]}};}}),events=[];
+  const bootstrap=()=>Object.assign(new EventEmitter(),{async connect(){},disconnect(){},async request(){return {status:0,body:{ticket:{lsl:['synthetic.kakao.com']},wifi:{ports:[443]}}};},async checkin(){return {status:0,host:'synthetic.kakao.com',port:443};}});
+  const session=createReaderSession({userId:'999',accessToken:'SYNTHETIC',deviceUUID:'SYNTHETIC'},{booking:bootstrap,ticket:bootstrap,carriage:()=>carriage,toLong:String,resolve:async host=>host,every:()=>0},event=>events.push(event));let pending;
+  try{
+    await session.start();const rooms=events.find(event=>event.type==='reader-rooms').rooms;
+    for(const [index,which] of [0,1,0].entries()){
+      const room=which?'456':'123',key=rooms[which].key,foreign=which?'123':'456';
+      pending=session.history(key,index+1);await new Promise(resolve=>setImmediate(resolve));
+      const request=carriage.sent.findLast(packet=>packet.method==='SYNCMSG');assert.ok(request);
+      carriage.finishPacket({packetId:900,method:'SYNCMSG',status:-203,body:{chatId:foreign,status:-203}});
+      carriage.finishPacket({packetId:request.packetId,method:'SYNCMSG',status:0,body:{chatId:foreign,isOK:true,chatLogs:[{logId:'5',msg:'Synthetic foreign'}]}});
+      assert.equal(carriage.pending.has(request.packetId),true);assert.equal(events.some(event=>event.type==='reader-failed'),false);
+      carriage.finishPacket({packetId:request.packetId,method:'SYNCMSG',status:0,body:{chatId:room,isOK:true,chatLogs:[{chatId:room,logId:which?'20':'10',msg:'Synthetic current'}]}});assert.equal(await pending,true);
+      const result=events.findLast(event=>event.source==='history');assert.equal(result.key,key);assert.equal(result.messages.some(message=>message.text==='Synthetic foreign'),false);
+      carriage.finishPacket({packetId:900,method:'SYNCMSG',status:-203,body:{chatId:foreign,status:-203}});assert.equal(events.some(event=>event.type==='reader-failed'),false);
+    }
+  }finally{settleCorrelationPending(carriage);await pending;session.close();}
+});
 
 for(const method of ['CHATONROOM','CHATINFO','NOTIREAD']){
   for(const [name,body] of [

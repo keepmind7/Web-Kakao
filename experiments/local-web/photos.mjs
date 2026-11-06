@@ -109,9 +109,9 @@ export async function fetchPhoto(value,{signal,resolve=lookup,request=https.requ
   try{return await fetch(value,redirects);}finally{clearTimeout(timer);signal?.removeEventListener('abort',abort);controller.abort();for(const req of requests)req.destroy();requests.clear();}
 }
 export function createPhotoCache({fetcher=fetchPhoto}={}){
-  const entries=new Map(),pending=new Map(),running=new Set(),waiting=new Set();let bytes=0,epoch=0;
+  const entries=new Map(),pending=new Map(),running=new Set(),waiting=new Set();let bytes=0,epoch=0,consumerCount=0;
   const unavailable=()=>new Error('photo_unavailable');
-  const detach=consumer=>consumer.signal?.removeEventListener('abort',consumer.abort);
+  const detach=consumer=>{consumerCount--;consumer.signal?.removeEventListener('abort',consumer.abort);};
   function complete(job,error,item){
     for(const consumer of job.consumers){detach(consumer);(error?consumer.reject:consumer.resolve)(error || item);}
     job.consumers.clear();
@@ -143,6 +143,7 @@ export function createPhotoCache({fetcher=fetchPhoto}={}){
     async get(url,{signal}={}){
       if(signal?.aborted)throw unavailable();
       if(entries.has(url)){const item=entries.get(url);entries.delete(url);entries.set(url,item);return item;}
+      if(consumerCount>=512)throw new Error('photo_busy');
       let job=pending.get(url);
       if(!job){
         if(pending.size>=40)throw new Error('photo_busy');
@@ -151,7 +152,7 @@ export function createPhotoCache({fetcher=fetchPhoto}={}){
       const promise=new Promise((resolve,reject)=>{
         const consumer={resolve,reject,signal,abort:null};
         consumer.abort=()=>{if(!job.consumers.delete(consumer))return;detach(consumer);reject(unavailable());if(!job.consumers.size)abandon(job);};
-        job.consumers.add(consumer);signal?.addEventListener('abort',consumer.abort,{once:true});if(signal?.aborted)consumer.abort();
+        job.consumers.add(consumer);consumerCount++;signal?.addEventListener('abort',consumer.abort,{once:true});if(signal?.aborted)consumer.abort();
       });
       pump();return promise;
     },

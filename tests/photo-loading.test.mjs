@@ -197,7 +197,48 @@ test('a late old-generation cancellation failure cannot resume a newer failed ge
   try{
     f.loader.image(f.images[0],src(0),{eager:true});f.loader.clear();
     f.loader.image(f.images[1],src(1),{eager:true});f.loader.remove(f.images[1]);await settle();
-    ackB.resolve(false);await until(()=>errors===1);ackA.resolve(false);await until(()=>errors===2);
+    ackB.resolve(false);await until(()=>errors===1);ackA.resolve(false);
+    await until(()=>[...timers.values()].filter(row=>row.ms>2000).length===2);
+    assert.equal(errors,1,'an old cancellation failure must not annotate the new room');
     f.loader.image(f.images[2],src(2),{eager:true});await settle();assert.equal(f.images[2].src,undefined,'old epoch must not overwrite the current epoch failure watermark');
   }finally{ackA.resolve(true);ackB.resolve(true);for(const row of timers.values())row.callback();f.loader.clear();await settle();}
+});
+
+for(const event of ['load','error'])test('a throwing '+event+' callback cannot stall queued photos',()=>{
+  const f=fixture();
+  try{
+    f.loader.image(f.images[0],src(0),{eager:true,[event==='load'?'onLoad':'onError']:()=>{throw new Error('synthetic_image_callback');}});
+    f.loader.image(f.images[1],src(1),{eager:true});f.loader.image(f.images[2],src(2),{eager:true});
+    assert.equal(f.images[2].src,undefined);
+    assert.throws(()=>f.images[0].listeners.get(event)(),/synthetic_image_callback/);
+    assert.ok(f.images[2].src,'queue admission must continue after releasing a completed photo');
+  }finally{f.loader.clear();}
+});
+
+test('repeated cross-tab clear and late callbacks release every reservation',{timeout:15000},async()=>{
+  const acknowledgments=[],timers=new Set();
+  const clock={setTimeout:(fn,ms)=>{const id=setTimeout(()=>{timers.delete(id);fn();},ms);timers.add(id);return id;},clearTimeout:id=>{timers.delete(id);clearTimeout(id);}};
+  const first=fixture({locks:navigator.locks,clock,cancelRequest:()=>{const gate=deferred();acknowledgments.push(gate);return gate.promise;}});
+  const second=fixture({locks:navigator.locks,clock,cancelRequest:async()=>true});
+  try{
+    for(let round=0;round<24;round++){
+      const base=round*4;
+      first.images.slice(0,2).forEach((image,n)=>first.loader.image(image,src(base+n),{eager:true}));
+      await until(()=>first.images[1].src);
+      const late=first.images.slice(0,2).map(image=>image.listeners.get('load'));
+      second.images.slice(0,2).forEach((image,n)=>second.loader.image(image,src(base+n+2),{eager:true}));
+      first.loader.clear();await settle();assert.ok(second.images.slice(0,2).every(image=>!image.src));
+      late.forEach(callback=>callback());await settle();assert.ok(second.images.slice(0,2).every(image=>!image.src));
+      for(const gate of acknowledgments.splice(0).reverse())gate.resolve(true);
+      await until(()=>second.images[1].src);
+      assert.equal((await navigator.locks.query()).held.filter(row=>row.name.startsWith('web-kakao-photo-')).length,2);
+      second.loader.clear();
+      await until(async()=>{const locks=await navigator.locks.query();return ![...locks.held,...locks.pending].some(row=>row.name.startsWith('web-kakao-photo-'));});
+      assert.equal(timers.size,0,'each generation must release active and cancellation deadlines');
+    }
+  }finally{
+    for(const gate of acknowledgments)gate.resolve(true);
+    first.loader.clear();second.loader.clear();await settle();
+    for(const id of timers)clearTimeout(id);
+  }
 });

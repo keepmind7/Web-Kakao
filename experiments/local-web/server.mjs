@@ -114,8 +114,9 @@ export function createLocalServer({ transport, mode = 'mock', encode = encodeQr,
     if (req.method === 'GET' && req.url === '/api/status') return reply(200, { app: APP, csrf, ...snapshot() });
     let requestUrl;try{requestUrl=new URL(req.url,origin);}catch{return reply(400,{error:'invalid_url'});}
     const accountPath=/^\/api\/(?:reader|preferences|notifications)(?:\/|$)/.test(requestUrl.pathname);
-    // Omitted headers retain authenticated operator/legacy compatibility.
-    const readerScopeMatches=()=>{presence.snapshot();const expected=req.headers['x-reader-instance'];return expected===undefined || typeof expected==='string' && /^[a-f0-9]{24}$/.test(expected) && expected===reader.snapshot().instanceId;};
+    const requestReader=reader,{attempts:requestAttempts,instanceId:requestInstanceId}=reader.snapshot();
+    // Even headerless operator requests belong to the connection at arrival.
+    const readerScopeMatches=()=>{presence.snapshot();const expected=req.headers['x-reader-instance'],current=reader.snapshot();return reader===requestReader && current.attempts===requestAttempts && current.instanceId===requestInstanceId && (expected===undefined || typeof expected==='string' && /^[a-f0-9]{24}$/.test(expected) && expected===current.instanceId);};
     if(req.method==='GET' && accountPath && !readerScopeMatches())return reply(409,{error:'reader_scope_changed'});
     if(req.method==='GET' && requestUrl.pathname==='/api/reader/outbox'){
       if(!lab.snapshot().credentialInMemory)return reply(409,{error:'authentication_required'});

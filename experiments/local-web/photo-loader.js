@@ -45,19 +45,23 @@ globalThis.createPhotoLoader=function({root,locks=globalThis.navigator?.locks,ca
       if(result!==true && result?.canceled!==true && result?.accepted!==true)throw new Error('photo_cancel_unconfirmed');
       clearTimeout(timer);retire();
     }).catch(()=>{
-      clearTimeout(timer);if(job.epoch===epoch)failedEpoch=epoch;
+      clearTimeout(timer);
       // Fail closed for this generation. The server bounds every photo HTTP
       // response to 15s; a failed control path gets a 30s retirement bound,
       // rather than leaking the origin lock forever or immediately reusing it.
       setTimeout(retire,Math.max(0,job.startedAt+30000-Date.now()));
-      try{onTransportError?.(new Error('photo_cancel_unconfirmed'));}catch{/* Notification failure must not leak a transport reservation. */}
+      if(job.epoch===epoch){
+        failedEpoch=epoch;
+        try{onTransportError?.(new Error('photo_cancel_unconfirmed'));}catch{/* Notification failure must not leak a transport reservation. */}
+      }
     });
   }
   function finish(job,error,value){
     if(!['active','locking'].includes(job.state))return;
     active.delete(job);unobserve(job);detach(job);clearTimeout(job.timer);job.signal?.removeEventListener('abort',job.abort);job.state='done';release(job,Boolean(error));
-    if(job.epoch===epoch){if(job.image)(error?job.onError:job.onLoad)?.();else(error?job.reject:job.resolve)(error || value);}
-    pump();
+    try{
+      if(job.epoch===epoch){if(job.image)(error?job.onError:job.onLoad)?.();else(error?job.reject:job.resolve)(error || value);}
+    }finally{pump();}
   }
   function cancel(job){
     if(job.state==='canceled')return;

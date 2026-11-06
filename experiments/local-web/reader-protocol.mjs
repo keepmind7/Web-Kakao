@@ -1,10 +1,11 @@
 import { allowedReaderMethod } from './reader-session.mjs';
 import { normalizedResponse } from './reader-response.mjs';
-import { serverId } from './reader-data.mjs';
+import { logArray,serverId } from './reader-data.mjs';
 import { Socket } from 'node:net';
 
 const WRITE_RESPONSE_LIMIT=2048;
 const ROOM_RESPONSES=new Set(['CHATONROOM','CHATINFO','NOTIREAD']);
+const HISTORY_RESPONSES=new Set(['SYNCMSG','MCHATLOGS']);
 const EXACT_RESPONSES=new Set(['SYNCLINK','INFOLINK','MEMBER']);
 const RECOVERABLE_METHODS=new Set(['CHATONROOM','NOTIREAD','SHIP','PING']);
 const OPTIONAL_METHODS=new Set(['CHATINFO','SYNCLINK','INFOLINK','MEMBER']);
@@ -23,6 +24,11 @@ function roomMatches(packet,request,{fallback=false}={}){
   const rooms=roomValues(packet.body);
   return Boolean(request?.chatId) && rooms.every(value=>serverId(value)===request.chatId) && (!fallback || rooms.length>0);
 }
+function historyMatches(packet,rooms){
+  const nodes=[packet.body,packet.body?.chatInfo,...(logArray(packet.body) ?? [])];
+  return nodes.every((node,index)=>['chatId','roomId','chatRoomId',...(index===1?['id']:index>1?['c']:[])].every(name=>
+    !node || !Object.hasOwn(node,name) || rooms?.has(serverId(node[name]))===true));
+}
 function writeFingerprints(packet,request){
   const ids=values(packet.body,['msgId']).map(serverId).filter(Boolean);
   const log=serverId(packet.body?.chatLog?.logId ?? packet.body?.log?.logId ?? packet.body?.logId);
@@ -40,6 +46,7 @@ export function guardReaderClient(Client,diagnostic,{messaging=false,media=false
   return class extends Client{
     writeRequests=new WeakMap();
     roomRequests=new WeakMap();
+    historyRequests=new WeakMap();
     completedWrites=new Set();
     completedRoomPackets=new Set();
     optionalRequests=new WeakSet();
@@ -87,14 +94,15 @@ export function guardReaderClient(Client,diagnostic,{messaging=false,media=false
       if(method==='WRITE' && this.cancelledWrites.has(`${serverId(body?.chatId)}:${serverId(body?.msgId)}`))throw new Error('cancelled_write_identity_reuse');
       if(media?!(messaging && method==='POST'):!allowedReaderMethod(method,{messaging}))throw new Error('read_only_required');
       diagnostic?.note('request',{method});
-      const scoped=ROOM_RESPONSES.has(method);
-      const previous=method==='WRITE' || scoped || optional || recoverable?new Set(this.pending.keys()):null;
+      const scoped=ROOM_RESPONSES.has(method),history=HISTORY_RESPONSES.has(method);
+      const previous=method==='WRITE' || scoped || history || optional || recoverable?new Set(this.pending.keys()):null;
       const waiting=super.request(method,body,timeoutMs);let replacement=null,onAbort=null;
       if(previous){
         const added=[...this.pending.entries()].filter(([id,item])=>!previous.has(id) && item.method===method);
         if(added.length===1){
           const [id,item]=added[0];
           if(scoped || method==='WRITE')(scoped?this.roomRequests:this.writeRequests).set(item,{chatId:serverId(body?.chatId),msgId:serverId(body?.msgId)});
+          if(history)this.historyRequests.set(item,new Set((method==='MCHATLOGS' && Array.isArray(body?.chatIds)?body.chatIds:[body?.chatId]).map(serverId).filter(Boolean)));
           if(signal){
             // An explicitly cancelled experimental WRITE remains unknown to its
             // caller. Retire just this request so its original SDK timer cannot
@@ -158,6 +166,14 @@ export function guardReaderClient(Client,diagnostic,{messaging=false,media=false
           const matches=[...this.pending.entries()].filter(([,item])=>item.method===packet.method && !this.optionalRequests.has(item) && roomMatches(packet,this.roomRequests.get(item),{fallback:true}) && !this.completedRoomPackets.has(`${packet.method}:${this.roomRequests.get(item)?.chatId}:${String(packet.packetId)}`));
           if(matches.length===1)entry=matches[0];
         }
+      }else if(HISTORY_RESPONSES.has(packet.method)){
+        if(entry && !historyMatches(packet,this.historyRequests.get(entry[1])))entry=null;
+        if(!entry){
+          // The pinned SDK allows roomless method fallback; never choose
+          // arbitrarily between more than one matching pending request.
+          const matches=[...this.pending.entries()].filter(([,item])=>item.method===packet.method && historyMatches(packet,this.historyRequests.get(item)));
+          if(matches.length===1)entry=matches[0];
+        }
       }else if(!entry && !EXACT_RESPONSES.has(packet.method))entry=[...this.pending.entries()].find(([,item])=>item.method===packet.method);
       if(entry){
         if(ROOM_RESPONSES.has(packet.method)){
@@ -175,7 +191,7 @@ export function guardReaderClient(Client,diagnostic,{messaging=false,media=false
       }
       // An uncorrelated WRITE is neither another request's acknowledgement nor
       // an incoming message. Leave its pending request to time out as unknown.
-      if(packet.method==='WRITE' || ROOM_RESPONSES.has(packet.method) || EXACT_RESPONSES.has(packet.method)){observeOwnRead('scoped_drop',packet.method);diagnostic?.packet('push',packet);return;}
+      if(packet.method==='WRITE' || ROOM_RESPONSES.has(packet.method) || HISTORY_RESPONSES.has(packet.method) || EXACT_RESPONSES.has(packet.method)){observeOwnRead('scoped_drop',packet.method);diagnostic?.packet('push',packet);return;}
       observeOwnRead('forwarded',packet.method);diagnostic?.packet('push',packet);this.emit('push',normalizedResponse(packet));
     }
   };

@@ -210,6 +210,19 @@ test('real pinned SDK ordinary required timeout retains its destructive socket p
   }finally{await f.close();}
 });
 
+for(const method of ['SYNCMSG','MCHATLOGS'])test('real pinned SDK '+method+' ignores explicit foreign history before accepting a fresh response',async t=>{
+  const f=await realPeer(t);let waiting;const pushes=[];f.client.on('push',packet=>pushes.push(packet));
+  try{
+    waiting=f.client.request(method,method==='SYNCMSG'?{chatId:toLong('456')}:{chatIds:[toLong('456')],sinces:[toLong('0')]},500);
+    await until(()=>f.requests.length===1);const request=f.requests[0];
+    f.reply({...request,packetId:900},{chatId:toLong('123'),status:-203});
+    f.reply(request,{chatId:toLong('123'),chatLogs:[{logId:toLong('1'),msg:'Synthetic foreign'}]});await sleep(15);
+    assert.equal(f.client.pending.has(request.packetId),true);assert.equal(pushes.length,0);assert.equal(f.client.socket.destroyed,false);
+    f.reply(request,{chatId:toLong('456'),chatLogs:[{chatId:toLong('456'),logId:toLong('2'),msg:'Synthetic current'}]});
+    assert.equal(String((await waiting).body.chatLogs[0].logId),'2');assert.equal(f.client.pending.size,0);assert.equal(f.errors.length,0);
+  }finally{await f.close();await waiting?.catch(()=>{});}
+});
+
 function slowHistory(elapsed,{gapProbe=false,complete=false}={}){
   const clock={value:0};return sessionFixture({clock,gapProbe,reply:(method,body)=>{
     if(method!=='SYNCMSG')return undefined;clock.value+=elapsed;const id=String(BigInt(String(body.cur))+1n);
